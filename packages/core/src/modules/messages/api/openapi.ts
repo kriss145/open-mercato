@@ -62,9 +62,12 @@ export const messageThreadItemSchema = z.object({
 
 export const messageDetailResponseSchema = z.object({
   id: z.string().uuid(),
+  updatedAt: z.string().nullable().optional(),
   type: z.string(),
   isDraft: z.boolean(),
   canEditDraft: z.boolean(),
+  canArchive: z.boolean(),
+  isArchived: z.boolean(),
   visibility: z.enum(['public', 'internal']).nullable().optional(),
   sourceEntityType: z.string().nullable().optional(),
   sourceEntityId: z.string().uuid().nullable().optional(),
@@ -121,9 +124,11 @@ export const messageDetailResponseSchema = z.object({
   })),
   thread: z.array(messageThreadItemSchema),
   isRead: z.boolean(),
+  conversationArchived: z.boolean(),
+  conversationAllUnread: z.boolean(),
 })
 
-export const messageTokenResponseSchema = z.object({
+export const messageTokenDetailResponseSchema = z.object({
   id: z.string().uuid(),
   type: z.string(),
   subject: z.string(),
@@ -149,6 +154,15 @@ export const messageTokenResponseSchema = z.object({
   requiresAuth: z.boolean(),
   recipientUserId: z.string().uuid(),
 })
+
+export const messageTokenPreflightResponseSchema = z.object({
+  requiresAuth: z.literal(true),
+})
+
+export const messageTokenResponseSchema = z.union([
+  messageTokenDetailResponseSchema,
+  messageTokenPreflightResponseSchema,
+])
 
 export const unreadCountResponseSchema = z.object({
   unreadCount: z.number(),
@@ -197,6 +211,7 @@ export const okResponseSchema = z.object({
 })
 
 export const errorResponseSchema = z.object({
+  code: z.string().optional(),
   error: z.string(),
 })
 

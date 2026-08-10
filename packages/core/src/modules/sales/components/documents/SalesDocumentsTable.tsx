@@ -5,11 +5,12 @@ import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import type { ColumnDef, SortingState } from '@tanstack/react-table'
 import { Page, PageBody } from '@open-mercato/ui/backend/Page'
-import { DataTable, type DataTableExportFormat } from '@open-mercato/ui/backend/DataTable'
+import { DataTable, type DataTableExportFormat, withDataTableNamespaces } from '@open-mercato/ui/backend/DataTable'
 import type { FilterDef, FilterValues } from '@open-mercato/ui/backend/FilterBar'
 import { RowActions } from '@open-mercato/ui/backend/RowActions'
 import { Button } from '@open-mercato/ui/primitives/button'
-import { apiCall } from '@open-mercato/ui/backend/utils/apiCall'
+import { apiCall, withScopedApiRequestHeaders } from '@open-mercato/ui/backend/utils/apiCall'
+import { buildOptimisticLockHeader } from '@open-mercato/ui/backend/utils/optimisticLock'
 import { buildCrudExportUrl, deleteCrud } from '@open-mercato/ui/backend/utils/crud'
 import { flash } from '@open-mercato/ui/backend/FlashMessages'
 import { useOrganizationScopeVersion } from '@open-mercato/shared/lib/frontend/useOrganizationScope'
@@ -22,10 +23,15 @@ import {
   createDictionaryMap,
   normalizeDictionaryEntries,
 } from '@open-mercato/core/modules/dictionaries/components/dictionaryAppearance'
+import { SALES_DOCUMENT_NUMBER_COLUMN_META } from './salesDocumentsColumns'
+import { useSalesChannelsEnabled } from '../useSalesChannelsEnabled'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('sales')
 
 type SalesDocumentKind = 'order' | 'quote'
 
-type FilterOption = { value: string; label: string }
+type FilterOption = { value: string; label: string; description?: string | null }
 
 type CustomerSnapshot = {
   customer?: {
@@ -76,6 +82,7 @@ type SalesDocumentRow = {
   totalGross?: number | null
   currency?: string | null
   date?: string | null
+  updatedAt?: string | null
 }
 
 const PAGE_SIZE = 20
@@ -140,6 +147,7 @@ function normalizeNumberInput(value: unknown): number | null {
 
 export function SalesDocumentsTable({ kind }: { kind: SalesDocumentKind }) {
   const t = useT()
+  const { enabled: channelsEnabled } = useSalesChannelsEnabled()
   const router = useRouter()
   const scopeVersion = useOrganizationScopeVersion()
   const { confirm, ConfirmDialogElement } = useConfirmDialog()
@@ -200,7 +208,8 @@ export function SalesDocumentsTable({ kind }: { kind: SalesDocumentKind }) {
           const id = typeof item?.id === 'string' ? item.id : null
           const label = typeof item?.label === 'string' ? item.label : null
           if (!id || !label) return null
-          return { value: id, label }
+          const description = typeof item?.description === 'string' ? item.description : null
+          return { value: id, label, description }
         })
         .filter((opt): opt is FilterOption => opt !== null)
     } catch {
@@ -232,7 +241,7 @@ export function SalesDocumentsTable({ kind }: { kind: SalesDocumentKind }) {
             ? item.primary_email.trim()
             : null
         const label = email ? `${name} (${email})` : name
-        return { value: id, label: kind === 'company' ? label : label }
+        return { value: id, label }
       }
       const options = [...peopleItems.map((i) => parseOption(i, 'person')), ...companyItems.map((i) => parseOption(i, 'company'))]
         .filter((opt): opt is FilterOption => !!opt)
@@ -250,10 +259,10 @@ export function SalesDocumentsTable({ kind }: { kind: SalesDocumentKind }) {
         undefined,
         { fallback: { items: [] } }
       )
-      const entries = normalizeDictionaryEntries(response.result?.items ?? [])
+      const entries = normalizeDictionaryEntries(response.result?.items ?? [], { sort: false })
       setStatusMap(createDictionaryMap(entries))
     } catch (err) {
-      console.error('sales.documents.statuses.load', err)
+      logger.error('sales.documents.statuses.load', { err })
       setStatusMap({})
     }
   }, [])
@@ -286,20 +295,20 @@ export function SalesDocumentsTable({ kind }: { kind: SalesDocumentKind }) {
   )
 
   React.useEffect(() => {
-    loadChannelOptions().catch(() => {})
+    if (channelsEnabled) loadChannelOptions().catch(() => {})
     loadTagOptions().catch(() => {})
     loadCustomerOptions().catch(() => {})
     loadStatusMap().catch(() => setStatusMap({}))
-  }, [loadChannelOptions, loadCustomerOptions, loadStatusMap, loadTagOptions, scopeVersion])
+  }, [channelsEnabled, loadChannelOptions, loadCustomerOptions, loadStatusMap, loadTagOptions, scopeVersion])
 
   const filters = React.useMemo<FilterDef[]>(() => [
-    {
+    ...(channelsEnabled ? [{
       id: 'channelId',
       label: t('sales.documents.list.filters.channel', 'Channel'),
       type: 'select',
       options: channelOptions,
       loadOptions: loadChannelOptions,
-    },
+    } satisfies FilterDef] : []),
     {
       id: 'date',
       label: t('sales.documents.list.filters.date', 'Date'),
@@ -353,8 +362,10 @@ export function SalesDocumentsTable({ kind }: { kind: SalesDocumentKind }) {
       type: 'tags',
       options: tagOptions,
       loadOptions: loadTagOptions,
+      formatValue: (val: string) => tagOptions.find((o) => o.value === val)?.label ?? val,
+      formatDescription: (val: string) => tagOptions.find((o) => o.value === val)?.description ?? null,
     },
-  ], [channelOptions, loadChannelOptions, loadTagOptions, tagOptions, t])
+  ], [channelsEnabled, channelOptions, loadChannelOptions, customerOptions, loadCustomerOptions, loadTagOptions, tagOptions, t])
 
   const queryParams = React.useMemo(() => {
     const params = new URLSearchParams()
@@ -449,7 +460,7 @@ export function SalesDocumentsTable({ kind }: { kind: SalesDocumentKind }) {
       const validUntil = doc.validUntil ?? null
       const createdAt = doc.createdAt ?? null
       const date = placedAt ?? validUntil ?? createdAt ?? null
-      return {
+      return withDataTableNamespaces({
         id,
         number,
         status: doc.status ?? null,
@@ -461,7 +472,8 @@ export function SalesDocumentsTable({ kind }: { kind: SalesDocumentKind }) {
         totalGross,
         currency: doc.currencyCode ?? null,
         date,
-      }
+        updatedAt: doc.updatedAt ?? null,
+      }, item)
     },
     [kind]
   )
@@ -489,7 +501,7 @@ export function SalesDocumentsTable({ kind }: { kind: SalesDocumentKind }) {
       setTotalPages(pages)
       setCacheStatus(call.cacheStatus ?? null)
     } catch (err) {
-      console.error('sales.documents.list', err)
+      logger.error('sales.documents.list', { err })
       flash(t('sales.documents.list.errors.load', 'Failed to load documents.'), 'error')
     } finally {
       setLoading(false)
@@ -537,9 +549,13 @@ export function SalesDocumentsTable({ kind }: { kind: SalesDocumentKind }) {
       })
       if (!confirmed) return
       try {
-        const result = await deleteCrud(`sales/${resource}`, row.id, {
-          errorMessage: t('sales.documents.list.table.deleteError', 'Failed to delete document.'),
-        })
+        const result = await withScopedApiRequestHeaders(
+          buildOptimisticLockHeader(row.updatedAt),
+          () =>
+            deleteCrud(`sales/${resource}`, row.id, {
+              errorMessage: t('sales.documents.list.table.deleteError', 'Failed to delete document.'),
+            }),
+        )
         if (result.ok) {
           flash(
             kind === 'order'
@@ -550,7 +566,7 @@ export function SalesDocumentsTable({ kind }: { kind: SalesDocumentKind }) {
           handleRefresh()
         }
       } catch (err) {
-        console.error('sales.documents.delete', err)
+        logger.error('sales.documents.delete', { err })
         flash(t('sales.documents.list.table.deleteError', 'Failed to delete document.'), 'error')
       }
     },
@@ -584,7 +600,7 @@ export function SalesDocumentsTable({ kind }: { kind: SalesDocumentKind }) {
           ) : null}
         </div>
       ),
-      meta: { sticky: true },
+      meta: SALES_DOCUMENT_NUMBER_COLUMN_META,
     },
     {
       accessorKey: 'customerName',
@@ -601,7 +617,7 @@ export function SalesDocumentsTable({ kind }: { kind: SalesDocumentKind }) {
       ),
       enableSorting: false,
     },
-    {
+    ...(channelsEnabled ? [{
       accessorKey: 'channelId',
       header: t('sales.documents.list.table.channel', 'Channel'),
       cell: ({ row }) => {
@@ -613,7 +629,7 @@ export function SalesDocumentsTable({ kind }: { kind: SalesDocumentKind }) {
         )
       },
       enableSorting: false,
-    },
+    } satisfies ColumnDef<SalesDocumentRow>] : []),
     {
       id: 'lineItemCount',
       accessorKey: 'lineItemCount',
@@ -647,7 +663,7 @@ export function SalesDocumentsTable({ kind }: { kind: SalesDocumentKind }) {
           ? <span className="text-xs text-muted-foreground">{new Date(row.original.date).toLocaleString()}</span>
           : <span className="text-xs text-muted-foreground">—</span>,
     },
-  ], [channelOptions, kind, statusMap, t])
+  ], [channelsEnabled, channelOptions, kind, statusMap, t])
 
   const emptyLabel = kind === 'order'
     ? t('sales.documents.list.table.emptyOrders', 'No orders yet.')
@@ -657,6 +673,8 @@ export function SalesDocumentsTable({ kind }: { kind: SalesDocumentKind }) {
     <Page>
       <PageBody>
         <DataTable<SalesDocumentRow>
+          stickyFirstColumn
+          stickyActionsColumn
           title={(
             <div className="flex flex-col">
               <span>{title}</span>
@@ -720,6 +738,7 @@ export function SalesDocumentsTable({ kind }: { kind: SalesDocumentKind }) {
               ]}
             />
           )}
+          perspective={{ tableId: kind === 'order' ? 'sales.orders' : 'sales.quotes' }}
           onRowClick={handleRowClick}
           emptyState={
             <div className="py-10 text-center text-sm text-muted-foreground">

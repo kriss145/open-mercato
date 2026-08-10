@@ -1,23 +1,17 @@
-import { modules } from '@/.mercato/generated/modules.generated'
-import { buildOpenApiDocument, generateMarkdownFromOpenApi, sanitizeOpenApiDocument } from '@open-mercato/shared/lib/openapi'
+import { modules } from '@/.mercato/generated/modules.runtime.generated'
+import { apiRoutes } from '@/.mercato/generated/api-routes.generated'
+import { resolveApiDocsBaseUrl } from '@open-mercato/core/modules/api_docs/lib/resources'
+import { attachOpenApiDocsToModules, buildOpenApiDocument, generateMarkdownFromOpenApi, sanitizeOpenApiDocument } from '@open-mercato/shared/lib/openapi'
 import { resolveTranslations } from '@open-mercato/shared/lib/i18n/server'
 import { APP_VERSION } from '@open-mercato/shared/lib/version'
 
 export const dynamic = 'force-dynamic'
 
-function resolveBaseUrl() {
-  return (
-    process.env.NEXT_PUBLIC_API_BASE_URL ||
-    process.env.NEXT_PUBLIC_APP_URL ||
-    process.env.APP_URL ||
-    'http://localhost:3000'
-  )
-}
-
 export async function GET() {
   const { t } = await resolveTranslations()
-  const baseUrl = resolveBaseUrl()
-  const rawDoc = buildOpenApiDocument(modules, {
+  const baseUrl = resolveApiDocsBaseUrl()
+  const docModules = await attachOpenApiDocsToModules(modules, apiRoutes)
+  const rawDoc = buildOpenApiDocument(docModules, {
     title: t('api.docs.title', 'Open Mercato API'),
     version: APP_VERSION,
     description: t('api.docs.description', 'Auto-generated OpenAPI definition for all enabled modules.'),

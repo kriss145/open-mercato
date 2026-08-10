@@ -6,6 +6,7 @@ import { CrudHttpError } from '@open-mercato/shared/lib/crud/errors'
 import { getAuthFromRequest } from '@open-mercato/shared/lib/auth/server'
 import { createRequestContainer } from '@open-mercato/shared/lib/di/container'
 import { resolveOrganizationScopeForRequest } from '@open-mercato/core/modules/directory/utils/organizationScope'
+import { resolveOrganizationScopeFilter } from '@open-mercato/core/modules/directory/utils/organizationScopeFilter'
 import { resolveTranslations } from '@open-mercato/shared/lib/i18n/server'
 import { loadCustomFieldValues } from '@open-mercato/shared/lib/crud/custom-fields'
 import { E } from '#generated/entities.ids.generated'
@@ -99,7 +100,8 @@ type ManageCategoryRow = {
   childCount: number
   descendantCount: number
   isActive: boolean
-  organizationId: string
+  updatedAt: string | null
+  organizationId: string | null
   tenantId: string
 }
 
@@ -158,20 +160,17 @@ export async function GET(req: Request) {
     )
   }
 
-  const allowed = scope?.filterIds ?? scope?.allowedIds ?? (auth.orgId ? [auth.orgId] : null)
-  const preferredOrg = scope?.selectedId ?? auth.orgId ?? null
-  const organizationId = preferredOrg ?? (Array.isArray(allowed) && allowed.length ? allowed[0]! : null)
-
-  if (!organizationId || (Array.isArray(allowed) && allowed.length && !allowed.includes(organizationId))) {
-    return NextResponse.json(
-      { items: [], error: translate('catalog.errors.organization_required', 'Organization context is required.') },
-      { status: 400 }
-    )
-  }
+  // Scope by the caller's visible organizations. Under "All organizations"
+  // (super-admin) `where` is empty, so the tree scopes by tenant only instead
+  // of 400-ing; restricted callers get their `filterIds` `$in` guard.
+  const orgFilter = resolveOrganizationScopeFilter(scope, auth)
+  // Caller's resolved org echoed at the top level; null under "All organizations"
+  // where the tree spans orgs and each row carries its own org instead.
+  const responseOrganizationId = orgFilter.rbacOrganizationId ?? null
 
   const categories = await em.find(
     CatalogProductCategory,
-    { organizationId, tenantId, deletedAt: null },
+    { ...orgFilter.where, tenantId, deletedAt: null },
     { orderBy: { name: 'ASC' } }
   )
   const categoryMap = new Map(categories.map((cat) => [String(cat.id), cat]))
@@ -232,7 +231,7 @@ export async function GET(req: Request) {
   const organizationIdByRecord: Record<string, string | null> = {}
   for (const id of recordIds) {
     tenantIdByRecord[id] = tenantId
-    organizationIdByRecord[id] = organizationId
+    organizationIdByRecord[id] = categoryMap.get(id)?.organizationId ?? null
   }
   const cfValues = recordIds.length
     ? await loadCustomFieldValues({
@@ -262,7 +261,8 @@ export async function GET(req: Request) {
       childCount: node.childIds.length,
       descendantCount: node.descendantIds.length,
       isActive: node.isActive,
-      organizationId,
+      updatedAt: category?.updatedAt ? new Date(category.updatedAt).toISOString() : null,
+      organizationId: category?.organizationId ?? null,
       tenantId,
       ...(cfValues[recordId] ?? {}),
     }
@@ -275,7 +275,7 @@ export async function GET(req: Request) {
     page,
     pageSize,
     totalPages,
-    organizationId,
+    organizationId: responseOrganizationId,
     tenantId,
   })
 }
@@ -297,7 +297,8 @@ const categoryListItemSchema = z.object({
   childCount: z.number(),
   descendantCount: z.number(),
   isActive: z.boolean(),
-  organizationId: z.string().uuid(),
+  updatedAt: z.string().nullable().optional(),
+  organizationId: z.string().uuid().nullable(),
   tenantId: z.string().uuid(),
 })
 

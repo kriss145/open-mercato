@@ -4,8 +4,10 @@ import * as React from 'react'
 import type { ColumnDef } from '@tanstack/react-table'
 import { DataTable } from '@open-mercato/ui/backend/DataTable'
 import { LoadingMessage, ErrorMessage, TabEmptyState } from '@open-mercato/ui/backend/detail'
-import { apiCall } from '@open-mercato/ui/backend/utils/apiCall'
+import { apiCall, withScopedApiRequestHeaders } from '@open-mercato/ui/backend/utils/apiCall'
+import { buildOptimisticLockHeader } from '@open-mercato/ui/backend/utils/optimisticLock'
 import { deleteCrud } from '@open-mercato/ui/backend/utils/crud'
+import { handleSectionMutationError, readRowUpdatedAt } from './optimisticLock'
 import type { SectionAction } from '@open-mercato/ui/backend/detail'
 import { RowActions } from '@open-mercato/ui/backend/RowActions'
 import { Button } from '@open-mercato/ui/primitives/button'
@@ -16,9 +18,13 @@ import { emitSalesDocumentTotalsRefresh } from '@open-mercato/core/modules/sales
 import { PaymentDialog, type PaymentFormData, type PaymentTotals } from './PaymentDialog'
 import { extractCustomFieldValues } from './customFieldHelpers'
 import { Plus } from 'lucide-react'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('sales')
 
 type PaymentRow = {
   id: string
+  updatedAt: string | null
   paymentReference: string | null
   paymentMethodId: string | null
   paymentMethodName: string | null
@@ -38,8 +44,9 @@ type SalesDocumentPaymentsSectionProps = {
   currencyCode: string | null | undefined
   organizationId?: string | null
   tenantId?: string | null
+  documentUpdatedAt?: string | null
   onActionChange?: (action: SectionAction | null) => void
-  onTotalsChange?: (totals: PaymentTotals) => void
+  onTotalsChange?: () => void
   onPaymentsChange?: (payments: PaymentRow[]) => void
 }
 
@@ -66,6 +73,7 @@ export function SalesDocumentPaymentsSection({
   currencyCode,
   organizationId: orgFromProps,
   tenantId: tenantFromProps,
+  documentUpdatedAt,
   onActionChange,
   onTotalsChange,
   onPaymentsChange,
@@ -108,6 +116,7 @@ export function SalesDocumentPaymentsSection({
               : {}
           const record: PaymentRow = {
             id: item.id,
+            updatedAt: readRowUpdatedAt(item),
             paymentReference: typeof item.payment_reference === 'string' ? item.payment_reference : null,
             paymentMethodId: typeof item.payment_method_id === 'string' ? item.payment_method_id : null,
             paymentMethodName:
@@ -155,7 +164,7 @@ export function SalesDocumentPaymentsSection({
         onPaymentsChangeRef.current?.([])
       }
     } catch (err) {
-      console.error('sales.payments.list', err)
+      logger.error('sales.payments.list', { err })
       setError(t('sales.documents.payments.errorLoad', 'Failed to load payments.'))
       onPaymentsChangeRef.current?.([])
     } finally {
@@ -183,6 +192,7 @@ export function SalesDocumentPaymentsSection({
     (record: PaymentRow) => {
       setEditingPayment({
         id: record.id,
+        updatedAt: record.updatedAt ?? null,
         amount: record.amount ?? '',
         paymentMethodId: record.paymentMethodId ?? '',
         paymentReference: record.paymentReference ?? '',
@@ -198,10 +208,8 @@ export function SalesDocumentPaymentsSection({
   )
 
   const handlePaymentSaved = React.useCallback(
-    async (totals?: PaymentTotals | null) => {
-      if (totals && onTotalsChange) {
-        onTotalsChange(totals)
-      }
+    async (_totals?: PaymentTotals | null) => {
+      onTotalsChange?.()
       await loadPayments()
       emitSalesDocumentTotalsRefresh({ documentId: orderId, kind: 'order' })
       handleDialogChange(false)
@@ -212,45 +220,47 @@ export function SalesDocumentPaymentsSection({
   const handleDelete = React.useCallback(
     async (row: PaymentRow) => {
       try {
-        const result = await deleteCrud<{ orderTotals?: PaymentTotals | null }>('sales/payments', {
-          body: {
-            id: row.id,
-            orderId,
-            organizationId: resolvedOrganizationId ?? undefined,
-            tenantId: resolvedTenantId ?? undefined,
-          },
-          errorMessage: t('sales.documents.payments.errorDelete', 'Failed to delete payment.'),
-        })
+        const result = await withScopedApiRequestHeaders(
+          // The server guards the PARENT order's aggregate version (Gap A), so
+          // send the order's `updated_at`, not the payment row's.
+          buildOptimisticLockHeader(documentUpdatedAt ?? undefined),
+          () =>
+            deleteCrud<{ orderTotals?: PaymentTotals | null }>('sales/payments', {
+              body: {
+                id: row.id,
+                orderId,
+                organizationId: resolvedOrganizationId ?? undefined,
+                tenantId: resolvedTenantId ?? undefined,
+              },
+              errorMessage: t('sales.documents.payments.errorDelete', 'Failed to delete payment.'),
+            })
+        )
         if (result.ok) {
-          const totals = result.result?.orderTotals ?? null
-          if (totals && onTotalsChange) {
-            onTotalsChange(totals)
-          }
+          onTotalsChange?.()
           flash(t('sales.documents.payments.deleted', 'Payment deleted.'), 'success')
           await loadPayments()
           emitSalesDocumentTotalsRefresh({ documentId: orderId, kind: 'order' })
         }
       } catch (err) {
-        console.error('sales.payments.delete', err)
+        if (handleSectionMutationError(err, t, () => void loadPayments())) {
+          return
+        }
+        logger.error('sales.payments.delete', { err })
         flash(t('sales.documents.payments.errorDelete', 'Failed to delete payment.'), 'error')
       }
     },
-    [loadPayments, onTotalsChange, orderId, resolvedOrganizationId, resolvedTenantId, t]
+    [documentUpdatedAt, loadPayments, onTotalsChange, orderId, resolvedOrganizationId, resolvedTenantId, t]
   )
 
   React.useEffect(() => {
     if (!onActionChange) return
-    if (payments.length === 0) {
-      onActionChange(null)
-      return
-    }
     onActionChange({
       label: addActionLabel,
       onClick: openCreate,
-      disabled: loading,
+      disabled: false,
     })
     return () => onActionChange(null)
-  }, [addActionLabel, loading, onActionChange, openCreate, payments.length])
+  }, [addActionLabel, onActionChange, openCreate])
 
   const columns = React.useMemo<ColumnDef<PaymentRow>[]>(
     () => [
@@ -287,6 +297,10 @@ export function SalesDocumentPaymentsSection({
         header: t('sales.documents.payments.createdAt', 'Created'),
         cell: ({ row }) =>
           row.original.createdAt ? new Date(row.original.createdAt).toLocaleString() : '—',
+        meta: {
+          tooltipContent: (row: PaymentRow) =>
+            row.createdAt ? new Date(row.createdAt).toLocaleString() : undefined,
+        },
       },
       {
         id: 'actions',
@@ -362,6 +376,7 @@ export function SalesDocumentPaymentsSection({
         orderId={orderId}
         organizationId={resolvedOrganizationId}
         tenantId={resolvedTenantId}
+        documentUpdatedAt={documentUpdatedAt ?? null}
         onSaved={handlePaymentSaved}
       />
     </div>

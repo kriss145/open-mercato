@@ -5,12 +5,16 @@ import {
   sanitizeDictionaryColor,
   sanitizeDictionaryIcon,
 } from '@open-mercato/core/modules/dictionaries/lib/utils'
+import { runWithCacheTenant } from '@open-mercato/cache'
+import type { CacheStrategy } from '@open-mercato/cache'
+import { buildRecordTag } from '@open-mercato/shared/lib/crud/cache'
 
 export type SalesDictionaryKind =
   | 'order-status'
   | 'order-line-status'
   | 'shipment-status'
   | 'payment-status'
+  | 'deal-loss-reasons'
   | 'adjustment-kind'
 
 type SalesDictionaryDefinition = {
@@ -54,6 +58,14 @@ const DEFINITIONS: Record<SalesDictionaryKind, SalesDictionaryDefinition> = {
     description: 'Configurable set of statuses used by payments.',
     resourceKind: 'sales.payment-status',
     commandPrefix: 'sales.payment-statuses',
+  },
+  'deal-loss-reasons': {
+    key: 'sales.deal_loss_reason',
+    name: 'Deal loss reasons',
+    singular: 'Deal loss reason',
+    description: 'Reusable reasons used when closing deals as lost.',
+    resourceKind: 'sales.deal-loss-reason',
+    commandPrefix: 'sales.deal-loss-reasons',
   },
   'adjustment-kind': {
     key: 'sales.adjustment_kind',
@@ -104,12 +116,49 @@ export async function ensureSalesDictionary(params: {
 
 export async function resolveDictionaryEntryValue(
   em: EntityManager,
-  entryId: string | null | undefined
+  entryId: string | null | undefined,
+  scope: { tenantId: string }
 ): Promise<string | null> {
   if (!entryId) return null
-  const entry = await em.findOne(DictionaryEntry, entryId)
-  if (!entry) return null
-  return entry.value?.trim() || null
+  const entry = await em.findOne(DictionaryEntry, { id: entryId, tenantId: scope.tenantId })
+  return entry?.value?.trim() || null
+}
+
+// Read-through cache in front of `resolveDictionaryEntryValue`, for the hot order-write path: the same
+// few status / fulfillment / payment entry ids are re-resolved for EVERY order, so a bulk import
+// re-reads them per order — a measured N+1 that dominates once the aggregate write itself is cheap.
+// The value is non-PII config, tenant-scoped via `runWithCacheTenant` and short-TTL'd. It is tagged with
+// the platform CRUD record tag for `dictionaries.entry`, so the command bus's own `invalidateCrudCache`
+// (fired on every entry create/update/delete) drops this entry on edit — the 60s TTL is only a backstop.
+// Callers pass the (soft-resolved) cache; `undefined` reads straight through.
+const DICTIONARY_ENTRY_VALUE_CACHE_TTL_MS = 60_000
+const DICTIONARY_ENTRY_RESOURCE_KIND = 'dictionaries.entry'
+const dictionaryEntryValueCacheKey = (entryId: string): string => `sales:dictionary-entry-value:${entryId}`
+const dictionaryEntryValueCacheTags = (entryId: string, tenantId: string): string[] => [
+  buildRecordTag(DICTIONARY_ENTRY_RESOURCE_KIND, tenantId, entryId),
+]
+
+export async function resolveCachedDictionaryEntryValue(
+  em: EntityManager,
+  entryId: string | null | undefined,
+  scope: { tenantId: string },
+  cache: CacheStrategy | undefined
+): Promise<string | null> {
+  if (!entryId) return null
+  if (!cache) return resolveDictionaryEntryValue(em, entryId, scope)
+  return runWithCacheTenant(scope.tenantId, async () => {
+    const cacheKey = dictionaryEntryValueCacheKey(entryId)
+    const cached = await cache.get(cacheKey)
+    if (typeof cached === 'string') return cached
+    const value = await resolveDictionaryEntryValue(em, entryId, scope)
+    if (value != null) {
+      await cache.set(cacheKey, value, {
+        ttl: DICTIONARY_ENTRY_VALUE_CACHE_TTL_MS,
+        tags: dictionaryEntryValueCacheTags(entryId, scope.tenantId),
+      })
+    }
+    return value
+  })
 }
 
 export { normalizeDictionaryValue, sanitizeDictionaryColor, sanitizeDictionaryIcon }
@@ -122,6 +171,14 @@ type SalesDictionarySeed = {
 }
 
 type SeedScope = { tenantId: string; organizationId: string }
+
+export type BackfillDealLossReasonDictionaryResult = {
+  dictionaryId: string
+  createdDictionary: boolean
+  copiedLegacyEntries: number
+  seededDefaultEntries: number
+  existingEntries: number
+}
 
 const ORDER_STATUS_DEFAULTS: SalesDictionarySeed[] = [
   { value: 'draft', label: 'Draft', color: '#94a3b8', icon: 'lucide:file-pen-line' },
@@ -173,6 +230,7 @@ const ADJUSTMENT_KIND_DEFAULTS: SalesDictionarySeed[] = [
   { value: 'tax', label: 'Tax' },
   { value: 'shipping', label: 'Shipping' },
   { value: 'surcharge', label: 'Surcharge' },
+  { value: 'return', label: 'Return' },
   { value: 'custom', label: 'Custom' },
 ]
 
@@ -243,6 +301,96 @@ async function seedSalesDictionary(
   }
 }
 
+const DEAL_LOSS_REASON_DEFAULTS: SalesDictionarySeed[] = [
+  { value: 'lost_to_competitor', label: 'Lost to competitor', color: '#ef4444', icon: 'lucide:users' },
+  { value: 'no_budget', label: 'No budget', color: '#f59e0b', icon: 'lucide:wallet' },
+  { value: 'no_decision', label: 'No decision made', color: '#94a3b8', icon: 'lucide:help-circle' },
+  { value: 'timing', label: 'Bad timing', color: '#6366f1', icon: 'lucide:clock' },
+  { value: 'other', label: 'Other', color: '#71717a', icon: 'lucide:minus-circle' },
+]
+
+export async function backfillDealLossReasonDictionary(
+  em: EntityManager,
+  scope: SeedScope
+): Promise<BackfillDealLossReasonDictionaryResult> {
+  const definition = getSalesDictionaryDefinition('deal-loss-reasons')
+  const existingDictionary = await em.findOne(Dictionary, {
+    tenantId: scope.tenantId,
+    organizationId: scope.organizationId,
+    key: definition.key,
+    deletedAt: null,
+  })
+  const dictionary = existingDictionary ?? await ensureSalesDictionary({
+    em,
+    tenantId: scope.tenantId,
+    organizationId: scope.organizationId,
+    kind: 'deal-loss-reasons',
+  })
+  const targetEntries = await em.find(DictionaryEntry, {
+    dictionary,
+    tenantId: scope.tenantId,
+    organizationId: scope.organizationId,
+  })
+
+  if (targetEntries.length > 0) {
+    return {
+      dictionaryId: dictionary.id,
+      createdDictionary: !existingDictionary,
+      copiedLegacyEntries: 0,
+      seededDefaultEntries: 0,
+      existingEntries: targetEntries.length,
+    }
+  }
+
+  const legacyDictionary = await em.findOne(Dictionary, {
+    tenantId: scope.tenantId,
+    organizationId: scope.organizationId,
+    key: 'customer_lost_reason',
+    deletedAt: null,
+  })
+  const legacyEntries = legacyDictionary
+    ? await em.find(
+      DictionaryEntry,
+      {
+        dictionary: legacyDictionary,
+        tenantId: scope.tenantId,
+        organizationId: scope.organizationId,
+      },
+      { orderBy: { position: 'asc', label: 'asc' } },
+    )
+    : []
+
+  let copiedLegacyEntries = 0
+  let seededDefaultEntries = 0
+  const processedValues = new Set<string>()
+  const seeds = legacyEntries.length
+    ? legacyEntries.map((entry) => ({
+      value: entry.value,
+      label: entry.label,
+      color: entry.color,
+      icon: entry.icon,
+    }))
+    : DEAL_LOSS_REASON_DEFAULTS
+
+  for (const seed of seeds) {
+    const normalizedValue = normalizeDictionaryValue(seed.value ?? '')
+    if (!normalizedValue || processedValues.has(normalizedValue)) continue
+    const entry = await ensureSalesDictionaryEntry(em, scope, 'deal-loss-reasons', seed)
+    if (!entry) continue
+    processedValues.add(normalizedValue)
+    if (legacyEntries.length) copiedLegacyEntries += 1
+    else seededDefaultEntries += 1
+  }
+
+  return {
+    dictionaryId: dictionary.id,
+    createdDictionary: !existingDictionary,
+    copiedLegacyEntries,
+    seededDefaultEntries,
+    existingEntries: 0,
+  }
+}
+
 export async function seedSalesStatusDictionaries(
   em: EntityManager,
   scope: SeedScope
@@ -251,6 +399,7 @@ export async function seedSalesStatusDictionaries(
   await seedSalesDictionary(em, scope, 'order-line-status', ORDER_LINE_STATUS_DEFAULTS)
   await seedSalesDictionary(em, scope, 'shipment-status', SHIPMENT_STATUS_DEFAULTS)
   await seedSalesDictionary(em, scope, 'payment-status', PAYMENT_STATUS_DEFAULTS)
+  await seedSalesDictionary(em, scope, 'deal-loss-reasons', DEAL_LOSS_REASON_DEFAULTS)
 }
 
 export async function seedSalesAdjustmentKinds(

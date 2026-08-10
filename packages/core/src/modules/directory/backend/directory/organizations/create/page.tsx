@@ -124,13 +124,20 @@ export default function CreateOrganizationPage() {
               setSelectedTenantId(normalized)
               setValue(normalized)
             }}
-            includeEmptyOption={false}
+            includeEmptyOption
+            emptyOptionLabel={t('directory.organizations.form.tenant.select', 'Select tenant')}
             className="w-full h-9 rounded border px-2 text-sm"
           />
         ),
       } as CrudField,
     ] : []),
     { id: 'name', label: t('directory.organizations.form.field.name', 'Name'), type: 'text', required: true },
+    {
+      id: 'slug',
+      label: t('directory.organizations.form.field.slug', 'Slug'),
+      type: 'text',
+      description: t('directory.organizations.form.field.slug.description', 'URL-safe identifier used for the customer portal (lowercase letters, numbers, hyphens, underscores). Generated from the name when left blank.'),
+    },
     {
       id: 'parentId',
       label: t('directory.organizations.form.field.parent', 'Parent'),
@@ -165,8 +172,8 @@ export default function CreateOrganizationPage() {
 
   const detailFields = React.useMemo(() => (
     actorIsSuperAdmin
-      ? ['tenantId', 'name', 'parentId', 'childIds', 'isActive']
-      : ['name', 'parentId', 'childIds', 'isActive']
+      ? ['tenantId', 'name', 'slug', 'parentId', 'childIds', 'isActive']
+      : ['name', 'slug', 'parentId', 'childIds', 'isActive']
   ), [actorIsSuperAdmin])
 
   const groups: CrudFormGroup[] = React.useMemo(() => ([
@@ -185,7 +192,7 @@ export default function CreateOrganizationPage() {
           fields={fields}
           groups={groups}
           entityId={E.directory.organization}
-          initialValues={{ tenantId: selectedTenantId ?? null, name: '', parentId: '', childIds: [], isActive: true }}
+          initialValues={{ tenantId: selectedTenantId ?? null, name: '', slug: '', parentId: '', childIds: [], isActive: true }}
           submitLabel={t('directory.organizations.form.action.create', 'Create')}
           cancelHref="/backend/directory/organizations"
           successRedirect={`/backend/directory/organizations?flash=${successMessage}&type=success`}
@@ -207,6 +214,7 @@ export default function CreateOrganizationPage() {
 
 type CreateOrganizationPayload = {
   name: string
+  slug?: string | null
   isActive: boolean
   parentId: string | null
   childIds: string[]
@@ -258,6 +266,11 @@ export async function submitCreateOrganization(options: {
       ? values.parentId
       : null,
     childIds: Array.isArray(values.childIds) ? values.childIds.filter((id): id is string => typeof id === 'string') : [],
+  }
+
+  if (typeof values.slug === 'string') {
+    const trimmedSlug = values.slug.trim()
+    if (trimmedSlug.length) payload.slug = trimmedSlug
   }
 
   if (tenantValue) payload.tenantId = tenantValue

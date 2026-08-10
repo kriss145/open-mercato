@@ -1,8 +1,11 @@
 import { NextResponse } from 'next/server'
 import { z } from 'zod'
 import { Dictionary, DictionaryEntry } from '@open-mercato/core/modules/dictionaries/data/entities'
-import { CrudHttpError } from '@open-mercato/shared/lib/crud/errors'
+import { CrudHttpError, isCrudHttpError } from '@open-mercato/shared/lib/crud/errors'
 import type { OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('customers')
 
 export const metadata = {
   GET: { requireAuth: true, requireFeatures: ['customers.people.view'] },
@@ -62,10 +65,10 @@ export async function GET(req: Request) {
       })),
     })
   } catch (err) {
-    if (err instanceof CrudHttpError) {
+    if (isCrudHttpError(err)) {
       return NextResponse.json(err.body, { status: err.status })
     }
-    console.error('[customers.currencyDictionary.GET] Unexpected error', err)
+    logger.error('Unexpected error', { component: 'currencyDictionary.GET', err })
     return NextResponse.json({ error: 'Failed to load currency dictionary.' }, { status: 500 })
   }
 }

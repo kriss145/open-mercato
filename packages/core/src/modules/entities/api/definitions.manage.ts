@@ -5,6 +5,8 @@ import { getAuthFromRequest } from '@open-mercato/shared/lib/auth/server'
 import { CustomFieldDef } from '@open-mercato/core/modules/entities/data/entities'
 import type { OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
 import { loadEntityFieldsetConfigs } from '../lib/fieldsets'
+import { resolveDefinitionMutationScope } from '../lib/definition-scope'
+import { resolveEntityDefinitionsVersion } from '../lib/definitions-version'
 
 export const metadata = {
   GET: { requireAuth: true, requireFeatures: ['entities.definitions.manage'] },
@@ -17,29 +19,39 @@ export async function GET(req: Request) {
   const auth = await getAuthFromRequest(req)
   if (!auth || !auth.tenantId || (!auth.orgId && !auth.isSuperAdmin)) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
-  const { resolve } = await createRequestContainer()
+  const container = await createRequestContainer()
+  const { resolve } = container
   const em = resolve('em') as any
+  // Resolve the same definition scope the mutating endpoints use so the version
+  // token round-trips consistently (issue #3152).
+  const versionScope = await resolveDefinitionMutationScope({ auth, container, request: req })
   // Load all scoped records (active/inactive/deleted) so that per-scope tombstones
   // can shadow global definitions. We'll filter out deleted winners later.
-  const defs = await em.find(CustomFieldDef, {
-    entityId,
-    deletedAt: null,
-    isActive: true,
-    $and: [
-      { $or: [ { organizationId: auth.orgId ?? undefined as any }, { organizationId: null } ] },
-      { $or: [ { tenantId: auth.tenantId ?? undefined as any }, { tenantId: null } ] },
-    ],
-  }, { orderBy: { key: 'asc' } as any })
-
-  // Also load tombstones to shadow lower-scope/global entries with the same key
-  const tombstones = await em.find(CustomFieldDef, {
-    entityId,
-    deletedAt: { $ne: null } as any,
-    $and: [
-      { $or: [ { organizationId: auth.orgId ?? undefined as any }, { organizationId: null } ] },
-      { $or: [ { tenantId: auth.tenantId ?? undefined as any }, { tenantId: null } ] },
-    ],
-  })
+  const [defs, tombstones, configMap] = await Promise.all([
+    em.find(CustomFieldDef, {
+      entityId,
+      deletedAt: null,
+      isActive: true,
+      $and: [
+        { $or: [ { organizationId: auth.orgId ?? undefined as any }, { organizationId: null } ] },
+        { $or: [ { tenantId: auth.tenantId ?? undefined as any }, { tenantId: null } ] },
+      ],
+    }, { orderBy: { key: 'asc' } as any }),
+    em.find(CustomFieldDef, {
+      entityId,
+      deletedAt: { $ne: null } as any,
+      $and: [
+        { $or: [ { organizationId: auth.orgId ?? undefined as any }, { organizationId: null } ] },
+        { $or: [ { tenantId: auth.tenantId ?? undefined as any }, { tenantId: null } ] },
+      ],
+    }),
+    loadEntityFieldsetConfigs(em, {
+      entityIds: [entityId],
+      tenantId: auth.tenantId ?? null,
+      organizationId: auth.orgId ?? null,
+      mode: 'manage',
+    }),
+  ])
   const tombstonedKeys = new Set<string>((tombstones as any[]).map((d: any) => d.key))
 
   // Deduplicate by key, with clear precedence that allows higher-scope tombstones
@@ -77,18 +89,18 @@ export async function GET(req: Request) {
     tenantId: d.tenantId ?? null,
   }))
   const deletedKeys = Array.from(tombstonedKeys)
-  const configMap = await loadEntityFieldsetConfigs(em, {
-    entityIds: [entityId],
-    tenantId: auth.tenantId ?? null,
-    organizationId: auth.orgId ?? null,
-    mode: 'manage',
-  })
   const cfg = configMap.get(entityId) ?? { fieldsets: [], singleFieldsetPerRecord: true }
+  const version = await resolveEntityDefinitionsVersion(em, {
+    entityId,
+    tenantId: versionScope.tenantId,
+    organizationId: versionScope.organizationId,
+  })
   return NextResponse.json({
     items,
     deletedKeys,
     fieldsets: cfg.fieldsets,
     settings: { singleFieldsetPerRecord: cfg.singleFieldsetPerRecord },
+    version,
   })
 }
 
@@ -125,6 +137,7 @@ const definitionsManageResponseSchema = z.object({
   deletedKeys: z.array(z.string()),
   fieldsets: z.array(manageFieldsetSchema).optional(),
   settings: z.object({ singleFieldsetPerRecord: z.boolean().optional() }).optional(),
+  version: z.string().nullable().optional(),
 })
 
 export const openApi: OpenApiRouteDoc = {

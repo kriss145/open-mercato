@@ -1,7 +1,5 @@
 import type { GeneratorResult } from '../../utils'
 
-// Note: Some generators import ESM-only packages (like openapi-typescript)
-// which don't work well with Jest's CommonJS environment.
 // We test the generator interfaces and expected behavior patterns here.
 
 describe('generators', () => {
@@ -16,6 +14,16 @@ describe('generators', () => {
       expect(typeof module.generateModuleRegistry).toBe('function')
     })
 
+    it('should export generateModuleRegistryApp', async () => {
+      const module = await import('../module-registry')
+      expect(typeof module.generateModuleRegistryApp).toBe('function')
+    })
+
+    it('should export generateModuleRegistries', async () => {
+      const module = await import('../module-registry')
+      expect(typeof module.generateModuleRegistries).toBe('function')
+    })
+
     it('should export generateModuleEntities', async () => {
       const module = await import('../module-entities')
       expect(typeof module.generateModuleEntities).toBe('function')
@@ -26,11 +34,14 @@ describe('generators', () => {
       expect(typeof module.generateModuleDi).toBe('function')
     })
 
-    // Note: api-client uses openapi-typescript which is ESM-only
-    // and doesn't work with Jest's CommonJS environment
-    it.skip('should export generateApiClient', async () => {
-      const module = await import('../api-client')
-      expect(typeof module.generateApiClient).toBe('function')
+    it('should export generateModulePackageSources', async () => {
+      const module = await import('../module-package-sources')
+      expect(typeof module.generateModulePackageSources).toBe('function')
+    })
+
+    it('should export generateOpenApi', async () => {
+      const module = await import('../openapi')
+      expect(typeof module.generateOpenApi).toBe('function')
     })
   })
 
@@ -160,6 +171,12 @@ describe('generator file output patterns', () => {
       expect(expectedPath).toContain('modules.generated.ts')
     })
 
+    it('should output to modules.app.generated.ts', () => {
+      const outputDir = '/project/generated'
+      const expectedPath = `${outputDir}/modules.app.generated.ts`
+      expect(expectedPath).toContain('modules.app.generated.ts')
+    })
+
     it('should output dashboard widgets', () => {
       const outputDir = '/project/generated'
       const expectedPath = `${outputDir}/dashboard-widgets.generated.ts`
@@ -170,6 +187,12 @@ describe('generator file output patterns', () => {
       const outputDir = '/project/generated'
       const expectedPath = `${outputDir}/injection-widgets.generated.ts`
       expect(expectedPath).toContain('injection-widgets.generated.ts')
+    })
+
+    it('should output module package CSS sources', () => {
+      const outputDir = '/project/generated'
+      const expectedPath = `${outputDir}/module-package-sources.css`
+      expect(expectedPath).toContain('module-package-sources.css')
     })
 
     it('should output search config', () => {

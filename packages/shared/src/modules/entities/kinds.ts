@@ -9,6 +9,9 @@ export const CUSTOM_FIELD_KINDS = [
   'relation',
   'attachment',
   'dictionary',
+  'phone',
+  'date',
+  'datetime',
 ] as const
 
 export type CustomFieldKind = typeof CUSTOM_FIELD_KINDS[number]

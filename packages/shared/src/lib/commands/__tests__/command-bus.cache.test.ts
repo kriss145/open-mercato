@@ -25,6 +25,8 @@ describe('CommandBus cache invalidation for sales documents', () => {
 
   afterEach(() => {
     unregisterCommand('sales.orders.update')
+    unregisterCommand('sales.orders.noop-update')
+    unregisterCommand('wms.warehouses.create')
     invalidateMock.mockClear()
   })
 
@@ -60,6 +62,8 @@ describe('CommandBus cache invalidation for sales documents', () => {
       actionLogService: asValue({
         log: logMock,
         findByUndoToken: jest.fn(async () => logRecord),
+        claimForUndo: jest.fn(async () => true),
+        releaseUndoClaim: jest.fn(async () => true),
         markUndone: jest.fn(async () => {}),
       }),
       dataEngine: asValue({ flushOrmEntityChanges: jest.fn() }),
@@ -94,6 +98,145 @@ describe('CommandBus cache invalidation for sales documents', () => {
       { id: 'order-1', organizationId: 'org-1', tenantId: 'tenant-1' },
       'tenant-1',
       'command:sales.orders.update:undo',
+      expect.any(Array)
+    )
+  })
+
+  it('skips execute-time cache invalidation when explicitly requested', async () => {
+    const logMock = jest.fn(async () => ({ id: 'log-entry' }))
+
+    registerCommand({
+      id: 'sales.orders.update',
+      execute: jest.fn(async () => ({ id: 'order-1', tenantId: 'tenant-1', organizationId: 'org-1' })),
+      buildLog: jest.fn(() => ({
+        actionLabel: 'Update sales order',
+        resourceKind: 'sales.order',
+        resourceId: 'order-1',
+        tenantId: 'tenant-1',
+        organizationId: 'org-1',
+      })),
+    })
+
+    const container = createContainer({ injectionMode: InjectionMode.CLASSIC })
+    container.register({
+      actionLogService: asValue({
+        log: logMock,
+        findByUndoToken: jest.fn(async () => null),
+        markUndone: jest.fn(async () => {}),
+      }),
+      dataEngine: asValue({ flushOrmEntityChanges: jest.fn() }),
+    })
+
+    const bus = new CommandBus()
+    const ctx = {
+      container,
+      auth: { sub: 'user-1', tenantId: 'tenant-1', orgId: 'org-1' },
+      organizationScope: null,
+      selectedOrganizationId: 'org-1',
+      organizationIds: null,
+    }
+
+    await bus.execute('sales.orders.update', {
+      input: {},
+      ctx,
+      skipCacheInvalidation: true,
+    })
+
+    expect(invalidateMock).not.toHaveBeenCalled()
+  })
+
+  it('skips audit logging when buildLog marks a no-op update while still invalidating cache', async () => {
+    const logMock = jest.fn(async () => ({ id: 'log-entry' }))
+
+    registerCommand({
+      id: 'sales.orders.noop-update',
+      execute: jest.fn(async () => ({ id: 'order-1', tenantId: 'tenant-1', organizationId: 'org-1' })),
+      buildLog: jest.fn(() => ({ skipLog: true })),
+    })
+
+    const container = createContainer({ injectionMode: InjectionMode.CLASSIC })
+    container.register({
+      actionLogService: asValue({
+        log: logMock,
+        findByUndoToken: jest.fn(async () => null),
+        markUndone: jest.fn(async () => {}),
+      }),
+      dataEngine: asValue({ flushOrmEntityChanges: jest.fn() }),
+    })
+
+    const bus = new CommandBus()
+    const ctx = {
+      container,
+      auth: { sub: 'user-1', tenantId: 'tenant-1', orgId: 'org-1' },
+      organizationScope: null,
+      selectedOrganizationId: 'org-1',
+      organizationIds: null,
+    }
+
+    const execution = await bus.execute('sales.orders.noop-update', {
+      input: {},
+      ctx,
+      metadata: {
+        resourceKind: 'sales.order',
+        resourceId: 'order-1',
+        tenantId: 'tenant-1',
+        organizationId: 'org-1',
+      },
+    })
+
+    expect(logMock).not.toHaveBeenCalled()
+    expect(execution.logEntry).toBeNull()
+    expect(invalidateMock).toHaveBeenCalledWith(
+      container,
+      'sales.order',
+      { id: 'order-1', organizationId: 'org-1', tenantId: 'tenant-1' },
+      'tenant-1',
+      'command:sales.orders.noop-update:execute',
+      expect.any(Array)
+    )
+  })
+
+  it('resolves record id from warehouseId-style command results for cache tags', async () => {
+    const logMock = jest.fn(async () => ({ id: 'log-entry' }))
+
+    registerCommand({
+      id: 'wms.warehouses.create',
+      execute: jest.fn(async () => ({ warehouseId: 'warehouse-uuid-1' })),
+      buildLog: jest.fn(() => ({
+        actionLabel: 'Create warehouse',
+        resourceKind: 'wms.warehouse',
+        tenantId: 'tenant-1',
+        organizationId: 'org-1',
+      })),
+    })
+
+    const container = createContainer({ injectionMode: InjectionMode.CLASSIC })
+    container.register({
+      actionLogService: asValue({
+        log: logMock,
+        findByUndoToken: jest.fn(async () => null),
+        markUndone: jest.fn(async () => {}),
+      }),
+      dataEngine: asValue({ flushOrmEntityChanges: jest.fn() }),
+    })
+
+    const bus = new CommandBus()
+    const ctx = {
+      container,
+      auth: { sub: 'user-1', tenantId: 'tenant-1', orgId: 'org-1' },
+      organizationScope: null,
+      selectedOrganizationId: 'org-1',
+      organizationIds: null,
+    }
+
+    await bus.execute('wms.warehouses.create', { input: {}, ctx })
+
+    expect(invalidateMock).toHaveBeenCalledWith(
+      container,
+      'wms.warehouse',
+      { id: 'warehouse-uuid-1', organizationId: 'org-1', tenantId: 'tenant-1' },
+      'tenant-1',
+      'command:wms.warehouses.create:execute',
       expect.any(Array)
     )
   })

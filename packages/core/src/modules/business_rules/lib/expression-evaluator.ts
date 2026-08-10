@@ -1,5 +1,9 @@
 import type { ComparisonOperator, LogicalOperator } from '../data/validators'
+import { testLinearRegex } from '@open-mercato/shared/lib/regex/linear'
 import { getNestedValue, resolveSpecialValue } from './value-resolver'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('business_rules').child({ component: 'expression-evaluator' })
 
 /**
  * Type definitions for condition expressions
@@ -82,14 +86,13 @@ function evaluateSimpleCondition(
 
   const result = applyOperator(leftValue, condition.operator, rightValue)
 
-  // Detailed logging for debugging
-  console.log('[RULE EVAL] Simple condition:', {
+  logger.debug('Simple condition evaluated', {
     field: condition.field,
     operator: condition.operator,
     expectedValue: rightValue,
     actualValue: leftValue,
     actualValueType: typeof leftValue,
-    result: result ? '✓ PASS' : '✗ FAIL',
+    passed: result,
   })
 
   return result
@@ -109,7 +112,7 @@ function evaluateGroupCondition(
     return true
   }
 
-  console.log(`[RULE EVAL] Group condition: ${operator} with ${rules.length} rules`)
+  logger.debug('Group condition evaluating', { operator, ruleCount: rules.length })
 
   let result: boolean
 
@@ -136,7 +139,7 @@ function evaluateGroupCondition(
       throw new Error(`Unknown logical operator: ${operator}`)
   }
 
-  console.log(`[RULE EVAL] Group ${operator} result: ${result ? '✓ PASS' : '✗ FAIL'}`)
+  logger.debug('Group condition evaluated', { operator, passed: result })
 
   return result
 }
@@ -319,11 +322,8 @@ function endsWith(str: any, suffix: any): boolean {
   return String(str).endsWith(String(suffix))
 }
 
-/**
- * Security limits for regex operations
- */
-const REGEX_TIMEOUT_MS = 100
 const MAX_REGEX_LENGTH = 200
+const MAX_REGEX_INPUT_LENGTH = 10_000
 
 /**
  * Check if string matches regex pattern (with ReDoS protection)
@@ -345,23 +345,21 @@ function matches(str: any, pattern: any): boolean {
       return false
     }
 
-    const regex = new RegExp(patternStr)
     const testStr = String(str)
-
-    // Use a simple timeout mechanism
-    const startTime = Date.now()
-    const result = regex.test(testStr)
-
-    if (Date.now() - startTime > REGEX_TIMEOUT_MS) {
-      throw new Error('Regex execution timeout - potential ReDoS pattern detected')
+    if (testStr.length > MAX_REGEX_INPUT_LENGTH) {
+      return false
     }
 
-    return result
+    const result = testLinearRegex(patternStr, testStr, {
+      maxPatternLength: MAX_REGEX_LENGTH,
+      maxInputLength: MAX_REGEX_INPUT_LENGTH,
+    })
+    return result.ok ? result.matched : false
   } catch (error) {
     // Log the error for debugging but don't expose to user
     const message = error instanceof Error ? error.message : 'Unknown error'
     if (process.env.NODE_ENV !== 'test') {
-      console.error('Regex matching failed:', message)
+      logger.error('Regex matching failed', { message })
     }
     return false
   }

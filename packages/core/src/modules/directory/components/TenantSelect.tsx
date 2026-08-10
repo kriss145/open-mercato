@@ -57,21 +57,11 @@ function filterTenantsByStatus(list: TenantRecord[], status: 'all' | 'active' | 
   return list
 }
 
-async function fetchDirectoryTenants(status: 'all' | 'active' | 'inactive', errorMessage: string): Promise<TenantRecord[]> {
-  const search = new URLSearchParams()
-  search.set('page', '1')
-  search.set('pageSize', '200')
-  search.set('sortField', 'name')
-  search.set('sortDir', 'asc')
-  if (status === 'active') search.set('isActive', 'true')
-  if (status === 'inactive') search.set('isActive', 'false')
-  const json = await readApiResultOrThrow<{ items?: unknown[] }>(
-    `/api/directory/tenants?${search.toString()}`,
-    undefined,
-    { errorMessage, allowNullResult: true },
-  )
-  const items = Array.isArray(json?.items) ? json.items : []
-  const normalized = items
+const DIRECTORY_TENANTS_PAGE_SIZE = 100
+const DIRECTORY_TENANTS_MAX_PAGES = 200
+
+function normalizeTenantItems(items: unknown[]): TenantRecord[] {
+  return items
     .map((item: unknown): TenantRecord | null => {
       if (!item || typeof item !== 'object') return null
       const entry = item as Record<string, unknown>
@@ -84,7 +74,34 @@ async function fetchDirectoryTenants(status: 'all' | 'active' | 'inactive', erro
       return { id, name, isActive }
     })
     .filter((tenant: TenantRecord | null): tenant is TenantRecord => tenant !== null)
-  return mergeTenantLists(filterTenantsByStatus(normalized, status))
+}
+
+async function fetchDirectoryTenants(status: 'all' | 'active' | 'inactive', errorMessage: string): Promise<TenantRecord[]> {
+  const collected: TenantRecord[] = []
+  let page = 1
+  let totalPages = 1
+  do {
+    const search = new URLSearchParams()
+    search.set('page', String(page))
+    search.set('pageSize', String(DIRECTORY_TENANTS_PAGE_SIZE))
+    search.set('sortField', 'name')
+    search.set('sortDir', 'asc')
+    if (status === 'active') search.set('isActive', 'true')
+    if (status === 'inactive') search.set('isActive', 'false')
+    const json = await readApiResultOrThrow<{ items?: unknown[]; totalPages?: unknown }>(
+      `/api/directory/tenants?${search.toString()}`,
+      undefined,
+      { errorMessage, allowNullResult: true },
+    )
+    const items = Array.isArray(json?.items) ? json.items : []
+    collected.push(...normalizeTenantItems(items))
+    totalPages = typeof json?.totalPages === 'number' && Number.isFinite(json.totalPages)
+      ? Math.max(1, Math.floor(json.totalPages))
+      : 1
+    if (items.length < DIRECTORY_TENANTS_PAGE_SIZE) break
+    page += 1
+  } while (page <= totalPages && page <= DIRECTORY_TENANTS_MAX_PAGES)
+  return mergeTenantLists(filterTenantsByStatus(collected, status))
 }
 
 async function fetchTenantsFromOrganizationSwitcher(status: 'all' | 'active' | 'inactive', errorMessage: string): Promise<TenantRecord[]> {
@@ -145,10 +162,16 @@ export const TenantSelect = React.forwardRef<HTMLSelectElement, TenantSelectProp
     let cancelled = false
     const loadTenants = async () => {
       setFetchStatus('loading')
+      const autoSelect = (tenants: TenantRecord[]) => {
+        if (!value && !includeEmptyOption && tenants.length > 0) {
+          onChange?.(tenants[0].id)
+        }
+      }
       try {
         const tenants = await fetchDirectoryTenants(status, fetchErrorMessage)
         if (cancelled) return
         setRemoteTenants(tenants)
+        autoSelect(tenants)
         setFetchStatus('success')
         return
       } catch {
@@ -156,6 +179,7 @@ export const TenantSelect = React.forwardRef<HTMLSelectElement, TenantSelectProp
           const fallbackTenants = await fetchTenantsFromOrganizationSwitcher(status, fetchErrorMessage)
           if (cancelled) return
           setRemoteTenants(fallbackTenants)
+          autoSelect(fallbackTenants)
           setFetchStatus('success')
           return
         } catch {
@@ -166,6 +190,7 @@ export const TenantSelect = React.forwardRef<HTMLSelectElement, TenantSelectProp
     }
     void loadTenants()
     return () => { cancelled = true }
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- value/onChange/includeEmptyOption are read once at fetch time for auto-select
   }, [fetchOnMount, status, t])
 
   const mergedTenants = React.useMemo(

@@ -5,7 +5,7 @@ import { resolveTranslations } from '@open-mercato/shared/lib/i18n/server'
 import type { EntityManager } from '@mikro-orm/postgresql'
 import { SalesChannel } from '../../data/entities'
 import { channelCreateSchema, channelUpdateSchema } from '../../data/validators'
-import { parseScopedCommandInput, resolveCrudRecordId } from '../utils'
+import { buildAggregateSearchFilter, parseScopedCommandInput, resolveCrudRecordId } from '../utils'
 import { E } from '#generated/entities.ids.generated'
 import * as F from '#generated/entities/sales_channel'
 import {
@@ -14,8 +14,10 @@ import {
   defaultDeleteRequestSchema,
 } from '../openapi'
 import { CatalogOffer } from '@open-mercato/core/modules/catalog/data/entities'
-import { escapeLikePattern } from '@open-mercato/shared/lib/db/escapeLikePattern'
 import { parseBooleanToken } from '@open-mercato/shared/lib/boolean'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('sales')
 
 const rawBodySchema = z.object({}).passthrough()
 
@@ -76,14 +78,8 @@ export function buildSearchFilters(query: z.infer<typeof listSchema>): Record<st
     const ids = parseIdList(query.ids)
     if (ids.length) filters.id = { $in: ids }
   }
-  if (query.search && query.search.trim().length > 0) {
-    const term = `%${escapeLikePattern(query.search.trim())}%`
-    filters.$or = [
-      { name: { $ilike: term } },
-      { code: { $ilike: term } },
-      { description: { $ilike: term } },
-    ]
-  }
+  const searchFilter = buildAggregateSearchFilter(query.search)
+  if (searchFilter) Object.assign(filters, searchFilter)
   const isActive = parseBooleanToken(query.isActive)
   if (isActive !== null) filters.is_active = isActive
   return filters
@@ -98,6 +94,7 @@ const crud = makeCrudRoute({
     tenantField: 'tenantId',
     softDeleteField: 'deletedAt',
   },
+  indexer: { entityType: E.sales.sales_channel },
   list: {
     schema: listSchema,
     entityId: E.sales.sales_channel,
@@ -254,6 +251,6 @@ export async function decorateChannelsWithOfferCounts(
       ;(item as Record<string, unknown>).offerCount = countMap.get(id) ?? 0
     })
   } catch (err) {
-    console.warn('[sales.channels] failed to resolve channel offer counts', err)
+    logger.warn('sales.channels failed to resolve channel offer counts', { err })
   }
 }

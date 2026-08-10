@@ -2,9 +2,17 @@
 
 import * as React from 'react'
 import Link from 'next/link'
+import { usePathname, useSearchParams } from 'next/navigation'
 import { Plus, Settings } from 'lucide-react'
 import { Button } from '@open-mercato/ui/primitives/button'
 import { Input } from '@open-mercato/ui/primitives/input'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@open-mercato/ui/primitives/select'
 import {
   Dialog,
   DialogContent,
@@ -15,6 +23,7 @@ import {
   DialogTrigger,
 } from '@open-mercato/ui/primitives/dialog'
 import { buildCountryOptions } from '@open-mercato/shared/lib/location/countries'
+import { buildHrefWithReturnTo } from '@open-mercato/shared/lib/navigation/returnTo'
 import type { AddressFormatStrategy } from '../utils/addressFormat'
 import { useAddressTypes } from './detail/hooks/useAddressTypes'
 
@@ -32,6 +41,8 @@ export type AddressEditorDraft = {
   region: string
   postalCode: string
   country: string
+  latitude?: string
+  longitude?: string
   isPrimary: boolean
 }
 
@@ -47,6 +58,8 @@ export type AddressEditorField =
   | 'region'
   | 'postalCode'
   | 'country'
+  | 'latitude'
+  | 'longitude'
   | 'isPrimary'
 
 type AddressEditorProps = {
@@ -58,6 +71,7 @@ type AddressEditorProps = {
   errors?: Partial<Record<AddressEditorField, string>>
   hidePrimaryToggle?: boolean
   showFormatHint?: boolean
+  showCoordinateFields?: boolean
 }
 
 export function AddressEditor({
@@ -69,7 +83,10 @@ export function AddressEditor({
   errors = {},
   hidePrimaryToggle = false,
   showFormatHint = true,
+  showCoordinateFields = false,
 }: AddressEditorProps) {
+  const pathname = usePathname()
+  const searchParams = useSearchParams()
   const { options: addressTypes, loading: addressTypesLoading, error: addressTypeError, createType } = useAddressTypes(t)
   const [typeDialogOpen, setTypeDialogOpen] = React.useState(false)
   const [typeValue, setTypeValue] = React.useState('')
@@ -97,6 +114,9 @@ export function AddressEditor({
     region: value.region ?? '',
     postalCode: value.postalCode ?? '',
     country: value.country ?? '',
+    ...(showCoordinateFields
+      ? { latitude: value.latitude ?? '', longitude: value.longitude ?? '' }
+      : {}),
     isPrimary: value.isPrimary ?? false,
   }
 
@@ -120,6 +140,15 @@ export function AddressEditor({
     if (!code.length) return null
     return countryOptions.find((option) => option.code === code) ?? null
   }, [countryOptions, current.country])
+  const returnTo = React.useMemo(() => {
+    const query = searchParams?.toString() ?? ''
+    if (!pathname) return null
+    return query.length ? `${pathname}?${query}` : pathname
+  }, [pathname, searchParams])
+  const manageAddressTypesHref = React.useMemo(
+    () => buildHrefWithReturnTo('/backend/config/customers', returnTo),
+    [returnTo],
+  )
 
   const handleTypeSubmit = React.useCallback(
     async (event: React.FormEvent<HTMLFormElement>) => {
@@ -140,7 +169,7 @@ export function AddressEditor({
   const inputClass = (field: AddressEditorField) =>
     [
       'w-full rounded-md border px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring',
-      errors[field] ? 'border-red-500 focus:ring-red-500' : 'border-input bg-background',
+      errors[field] ? 'border-status-error-border focus:ring-status-error-border' : 'border-input bg-background',
     ].join(' ')
 
   return (
@@ -155,24 +184,31 @@ export function AddressEditor({
           aria-invalid={errors.name ? 'true' : undefined}
         />
         <div className="flex gap-2">
-          <select
-            className={inputClass('purpose')}
-            value={current.purpose}
-            onChange={(evt) => update('purpose', evt.target.value)}
+          <Select
+            value={current.purpose || undefined}
+            onValueChange={(next) => update('purpose', next ?? '')}
             disabled={disabled}
-            aria-invalid={errors.purpose ? 'true' : undefined}
           >
-            <option value="">
-              {addressTypesLoading
-                ? t('customers.people.detail.addresses.types.loading', 'Loading…')
-                : t('customers.people.detail.addresses.types.placeholder', 'Address type')}
-            </option>
-            {addressTypes.map((entry) => (
-              <option key={entry.value} value={entry.value}>
-                {entry.label}
-              </option>
-            ))}
-          </select>
+            <SelectTrigger
+              className={errors.purpose ? 'border-destructive' : undefined}
+              aria-invalid={errors.purpose ? 'true' : undefined}
+            >
+              <SelectValue
+                placeholder={
+                  addressTypesLoading
+                    ? t('customers.people.detail.addresses.types.loading', 'Loading…')
+                    : t('customers.people.detail.addresses.types.placeholder', 'Address type')
+                }
+              />
+            </SelectTrigger>
+            <SelectContent>
+              {addressTypes.map((entry) => (
+                <SelectItem key={entry.value} value={entry.value}>
+                  {entry.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
           <Dialog open={typeDialogOpen} onOpenChange={setTypeDialogOpen}>
             <DialogTrigger asChild>
               <Button type="button" variant="outline" size="icon" className="shrink-0" disabled={disabled}>
@@ -220,7 +256,7 @@ export function AddressEditor({
             title={t('customers.people.detail.addresses.types.manage', 'Manage address types')}
           >
             <Link
-              href="/backend/config/customers"
+              href={manageAddressTypesHref}
               aria-label={t('customers.people.detail.addresses.types.manage', 'Manage address types')}
             >
               <Settings className="h-4 w-4" />
@@ -410,6 +446,32 @@ export function AddressEditor({
           </DialogContent>
         </Dialog>
         {errors.country ? <p className="text-xs text-destructive">{errors.country}</p> : null}
+        {showCoordinateFields ? (
+          <>
+            <Input
+              className={inputClass('latitude')}
+              placeholder={t('customers.people.detail.addresses.fields.latitude', 'Latitude')}
+              aria-label={t('customers.people.detail.addresses.fields.latitude', 'Latitude')}
+              inputMode="decimal"
+              value={current.latitude ?? ''}
+              onChange={(evt) => update('latitude', evt.target.value)}
+              disabled={disabled}
+              aria-invalid={errors.latitude ? 'true' : undefined}
+            />
+            {errors.latitude ? <p className="text-xs text-destructive">{errors.latitude}</p> : null}
+            <Input
+              className={inputClass('longitude')}
+              placeholder={t('customers.people.detail.addresses.fields.longitude', 'Longitude')}
+              aria-label={t('customers.people.detail.addresses.fields.longitude', 'Longitude')}
+              inputMode="decimal"
+              value={current.longitude ?? ''}
+              onChange={(evt) => update('longitude', evt.target.value)}
+              disabled={disabled}
+              aria-invalid={errors.longitude ? 'true' : undefined}
+            />
+            {errors.longitude ? <p className="text-xs text-destructive">{errors.longitude}</p> : null}
+          </>
+        ) : null}
       </div>
       {!hidePrimaryToggle ? (
         <label className="inline-flex items-center gap-2 text-sm">

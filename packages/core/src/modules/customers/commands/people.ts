@@ -6,6 +6,7 @@ import {
   emitCrudSideEffects,
   emitCrudUndoSideEffects,
   requireId,
+  snapshotsEqual,
 } from '@open-mercato/shared/lib/commands/helpers'
 import type { DataEngine } from '@open-mercato/shared/lib/data/engine'
 import type { CommandRuntimeContext } from '@open-mercato/shared/lib/commands'
@@ -14,14 +15,17 @@ import {
   CustomerAddress,
   CustomerComment,
   CustomerActivity,
+  CustomerInteraction,
   CustomerDeal,
   CustomerDealPersonLink,
+  CustomerPersonCompanyLink,
   CustomerTodoLink,
   CustomerEntity,
   CustomerPersonProfile,
   CustomerTagAssignment,
 } from '../data/entities'
 import { resolvePersonCustomFieldRouting, CUSTOMER_ENTITY_ID, PERSON_ENTITY_ID } from '../lib/customFieldRouting'
+import { CustomFieldValue } from '@open-mercato/core/modules/entities/data/entities'
 import {
   personCreateSchema,
   personUpdateSchema,
@@ -40,7 +44,9 @@ import {
   emitQueryIndexUpsertEvents,
   type QueryIndexEventEntry,
 } from './shared'
-import { CrudHttpError } from '@open-mercato/shared/lib/crud/errors'
+import { withAtomicFlush } from '@open-mercato/shared/lib/commands/flush'
+import { resolveRedoSnapshot } from '@open-mercato/shared/lib/commands/redo'
+import { CrudHttpError, notFound } from '@open-mercato/shared/lib/crud/errors'
 import { resolveTranslations } from '@open-mercato/shared/lib/i18n/server'
 import {
   loadCustomFieldSnapshot,
@@ -49,6 +55,14 @@ import {
 import type { CrudIndexerConfig, CrudEventsConfig } from '@open-mercato/shared/lib/crud/types'
 import { E } from '#generated/entities.ids.generated'
 import { findWithDecryption, findOneWithDecryption } from '@open-mercato/shared/lib/encryption/find'
+import { deriveDisplayName, isDerivedDisplayName } from '../lib/displayName'
+import {
+  loadPersonCompanyLinks,
+  summarizePersonCompanies,
+  syncLegacyPrimaryCompanyLink,
+} from '../lib/personCompanies'
+
+const INTERACTION_ENTITY_ID = 'customers:customer_interaction'
 
 type PersonAddressSnapshot = {
   id: string
@@ -99,6 +113,27 @@ type PersonTodoSnapshot = {
   createdByUserId: string | null
 }
 
+type PersonInteractionSnapshot = {
+  id: string
+  interactionType: string
+  title: string | null
+  body: string | null
+  status: string
+  scheduledAt: Date | null
+  occurredAt: Date | null
+  priority: number | null
+  authorUserId: string | null
+  ownerUserId: string | null
+  appearanceIcon: string | null
+  appearanceColor: string | null
+  source: string | null
+  dealId: string | null
+  createdAt: Date
+  updatedAt: Date
+  deletedAt: Date | null
+  custom?: Record<string, unknown>
+}
+
 type PersonSnapshot = {
   entity: {
     id: string
@@ -132,6 +167,12 @@ type PersonSnapshot = {
     twitterUrl: string | null
     companyEntityId: string | null
   }
+  companies: Array<{
+    linkId: string | null
+    companyId: string
+    displayName: string
+    isPrimary: boolean
+  }>
   tagIds: string[]
   addresses: PersonAddressSnapshot[]
   comments: PersonCommentSnapshot[]
@@ -144,6 +185,7 @@ type PersonSnapshot = {
   }>
   activities: PersonActivitySnapshot[]
   todos: PersonTodoSnapshot[]
+  interactions: PersonInteractionSnapshot[]
 }
 
 type PersonUndoPayload = {
@@ -155,15 +197,25 @@ const personCrudIndexer: CrudIndexerConfig<CustomerEntity> = {
   entityType: E.customers.customer_person_profile,
 }
 
-const personCrudEvents: CrudEventsConfig = {
+const personCrudEvents: CrudEventsConfig<CustomerEntity> = {
   module: 'customers',
   entity: 'person',
   persistent: true,
   buildPayload: (ctx) => ({
     id: ctx.identifiers.id,
+    entityId: ctx.entity?.id ?? ctx.identifiers.id,
     organizationId: ctx.identifiers.organizationId,
     tenantId: ctx.identifiers.tenantId,
   }),
+}
+
+function personEntityIndexEntry(entity: CustomerEntity): QueryIndexEventEntry {
+  return {
+    entityType: E.customers.customer_entity,
+    recordId: entity.id,
+    tenantId: entity.tenantId,
+    organizationId: entity.organizationId,
+  }
 }
 
 function normalizeOptionalString(value: string | null | undefined): string | null {
@@ -183,6 +235,29 @@ function normalizeEmail(value: string | null | undefined): string | null {
   return normalized ? normalized.toLowerCase() : null
 }
 
+type PersonDeleteBlockerCounts = {
+  dealLinks: number
+}
+
+function buildPersonHasDependentsError(
+  translate: (key: string, fallback?: string, params?: Record<string, string | number>) => string,
+  counts: PersonDeleteBlockerCounts,
+): CrudHttpError {
+  const blockers: string[] = []
+  if (counts.dealLinks > 0) {
+    blockers.push(
+      translate('customers.people.delete.blockers.deals', 'linked deals ({{count}})', { count: counts.dealLinks }),
+    )
+  }
+  const summary = blockers.join(', ')
+  const message = translate(
+    'customers.people.delete.blocked',
+    'Cannot delete person: {{blockers}}. Please unlink or reassign first.',
+    { blockers: summary },
+  )
+  return new CrudHttpError(422, { error: message, code: 'PERSON_HAS_DEPENDENTS' })
+}
+
 function serializePersonSnapshot(
   entity: CustomerEntity,
   profile: CustomerPersonProfile,
@@ -192,8 +267,10 @@ function serializePersonSnapshot(
   deals: CustomerDealPersonLink[],
   activities: CustomerActivity[],
   todoLinks: CustomerTodoLink[],
+  interactions: Array<PersonInteractionSnapshot>,
   custom?: Record<string, unknown>
 ): PersonSnapshot {
+  const companies = summarizePersonCompanies(profile, [])
   return {
     entity: {
       id: entity.id,
@@ -231,6 +308,7 @@ function serializePersonSnapshot(
           : profile.company.id
         : null,
     },
+    companies,
     tagIds,
     addresses: addresses.map((address) => ({
       id: address.id,
@@ -293,6 +371,7 @@ function serializePersonSnapshot(
       createdAt: todo.createdAt,
       createdByUserId: todo.createdByUserId ?? null,
     })),
+    interactions,
     custom,
   }
 }
@@ -308,6 +387,7 @@ async function loadPersonSnapshot(em: EntityManager, entityId: string): Promise<
     { tenantId: entity.tenantId, organizationId: entity.organizationId },
   )
   if (!profile) return null
+  const companyLinks = await loadPersonCompanyLinks(em, entity)
   const tagIds = await loadEntityTagIds(em, entity)
   const addresses = await em.find(CustomerAddress, { entity }, { orderBy: { createdAt: 'asc' } })
   const comments = await findWithDecryption(
@@ -332,6 +412,7 @@ async function loadPersonSnapshot(em: EntityManager, entityId: string): Promise<
     { tenantId: entity.tenantId, organizationId: entity.organizationId },
   )
   const todoLinks = await em.find(CustomerTodoLink, { entity }, { orderBy: { createdAt: 'asc' } })
+  const interactions = await em.find(CustomerInteraction, { entity }, { orderBy: { createdAt: 'asc' } })
   const entityCustom = await loadCustomFieldSnapshot(em, {
     entityId: CUSTOMER_ENTITY_ID,
     recordId: entity.id,
@@ -351,7 +432,36 @@ async function loadPersonSnapshot(em: EntityManager, entityId: string): Promise<
     if (target === CUSTOMER_ENTITY_ID && Object.prototype.hasOwnProperty.call(custom, key)) continue
     custom[key] = value
   }
-  return serializePersonSnapshot(entity, profile, tagIds, addresses, comments, deals, activities, todoLinks, custom)
+  const interactionSnapshots = await Promise.all(
+    interactions.map(async (interaction) => ({
+      id: interaction.id,
+      interactionType: interaction.interactionType,
+      title: interaction.title ?? null,
+      body: interaction.body ?? null,
+      status: interaction.status,
+      scheduledAt: interaction.scheduledAt ?? null,
+      occurredAt: interaction.occurredAt ?? null,
+      priority: interaction.priority ?? null,
+      authorUserId: interaction.authorUserId ?? null,
+      ownerUserId: interaction.ownerUserId ?? null,
+      appearanceIcon: interaction.appearanceIcon ?? null,
+      appearanceColor: interaction.appearanceColor ?? null,
+      source: interaction.source ?? null,
+      dealId: interaction.dealId ?? null,
+      createdAt: interaction.createdAt,
+      updatedAt: interaction.updatedAt,
+      deletedAt: interaction.deletedAt ?? null,
+      custom: await loadCustomFieldSnapshot(em, {
+        entityId: INTERACTION_ENTITY_ID,
+        recordId: interaction.id,
+        tenantId: entity.tenantId,
+        organizationId: entity.organizationId,
+      }),
+    })),
+  )
+  const snapshot = serializePersonSnapshot(entity, profile, tagIds, addresses, comments, deals, activities, todoLinks, interactionSnapshots, custom)
+  snapshot.companies = summarizePersonCompanies(profile, companyLinks)
+  return snapshot
 }
 
 async function resolveCompanyReference(
@@ -415,6 +525,86 @@ async function setCustomFieldsForPerson(
   }
 }
 
+type PersonGraphValues = {
+  entityId?: string
+  profileId?: string
+  organizationId: string
+  tenantId: string
+  displayName: string
+  description: string | null
+  ownerUserId: string | null
+  primaryEmail: string | null
+  primaryPhone: string | null
+  status: string | null
+  lifecycleStage: string | null
+  source: string | null
+  nextInteractionAt: Date | null
+  nextInteractionName: string | null
+  nextInteractionRefId: string | null
+  nextInteractionIcon: string | null
+  nextInteractionColor: string | null
+  isActive: boolean
+  firstName: string | null
+  lastName: string | null
+  preferredName: string | null
+  jobTitle: string | null
+  department: string | null
+  seniority: string | null
+  timezone: string | null
+  linkedInUrl: string | null
+  twitterUrl: string | null
+}
+
+// Single source of truth for the person entity+profile row mapping, shared by
+// `execute` (values from validated input) and `redo` (values from the after-
+// snapshot, carrying the original ids). Keeps create and id-preserving redo from
+// drifting field-by-field. Caller owns the surrounding flush, dictionary upserts,
+// tag/company-link sync, and custom-field restore.
+function buildPersonGraph(
+  em: EntityManager,
+  values: PersonGraphValues,
+): { entity: CustomerEntity; profile: CustomerPersonProfile } {
+  const entity = em.create(CustomerEntity, {
+    ...(values.entityId ? { id: values.entityId } : {}),
+    organizationId: values.organizationId,
+    tenantId: values.tenantId,
+    kind: 'person',
+    displayName: values.displayName,
+    description: values.description,
+    ownerUserId: values.ownerUserId,
+    primaryEmail: values.primaryEmail,
+    primaryPhone: values.primaryPhone,
+    status: values.status,
+    lifecycleStage: values.lifecycleStage,
+    source: values.source,
+    nextInteractionAt: values.nextInteractionAt,
+    nextInteractionName: values.nextInteractionName,
+    nextInteractionRefId: values.nextInteractionRefId,
+    nextInteractionIcon: values.nextInteractionIcon,
+    nextInteractionColor: values.nextInteractionColor,
+    isActive: values.isActive,
+  })
+  const profile = em.create(CustomerPersonProfile, {
+    ...(values.profileId ? { id: values.profileId } : {}),
+    organizationId: values.organizationId,
+    tenantId: values.tenantId,
+    entity,
+    firstName: values.firstName,
+    lastName: values.lastName,
+    preferredName: values.preferredName,
+    jobTitle: values.jobTitle,
+    department: values.department,
+    seniority: values.seniority,
+    timezone: values.timezone,
+    linkedInUrl: values.linkedInUrl,
+    twitterUrl: values.twitterUrl,
+    company: null,
+  })
+  em.persist(entity)
+  em.persist(profile)
+  return { entity, profile }
+}
+
 const createPersonCommand: CommandHandler<PersonCreateInput, { entityId: string; personId: string }> = {
   id: 'customers.people.create',
   async execute(rawInput, ctx) {
@@ -438,7 +628,10 @@ const createPersonCommand: CommandHandler<PersonCreateInput, { entityId: string;
     const timezone = normalizeOptionalString(parsed.timezone)
     const linkedInUrl = normalizeOptionalString(parsed.linkedInUrl)
     const twitterUrl = normalizeOptionalString(parsed.twitterUrl)
-    const displayName = parsed.displayName?.trim() ?? ''
+    const displayNameInput = parsed.displayName?.trim() ?? ''
+    const displayName = displayNameInput.length > 0
+      ? displayNameInput
+      : deriveDisplayName(firstName, lastName)
     const nextInteractionName = parsed.nextInteraction?.name ? parsed.nextInteraction.name.trim() : null
     const nextInteractionRefId = normalizeOptionalString(parsed.nextInteraction?.refId)
     const nextInteractionIcon = normalizeOptionalString(parsed.nextInteraction?.icon)
@@ -450,76 +643,72 @@ const createPersonCommand: CommandHandler<PersonCreateInput, { entityId: string;
       throw new CrudHttpError(400, { error: 'Display name is required' })
     }
 
-    const entity = em.create(CustomerEntity, {
-      organizationId: parsed.organizationId,
-      tenantId: parsed.tenantId,
-      kind: 'person',
-      displayName,
-      description,
-      ownerUserId: parsed.ownerUserId ?? null,
-      primaryEmail,
-      primaryPhone,
-      status,
-      lifecycleStage,
-      source,
-      nextInteractionAt: parsed.nextInteraction?.at ?? null,
-      nextInteractionName,
-      nextInteractionRefId,
-      nextInteractionIcon,
-      nextInteractionColor,
-      isActive: parsed.isActive ?? true,
-    })
-
-    const company = await resolveCompanyReference(em, parsed.companyEntityId ?? null, parsed.organizationId, parsed.tenantId)
-
-    const profile = em.create(CustomerPersonProfile, {
-      organizationId: parsed.organizationId,
-      tenantId: parsed.tenantId,
-      entity,
-      firstName,
-      lastName,
-      preferredName,
-      jobTitle,
-      department,
-      seniority,
-      timezone,
-      linkedInUrl,
-      twitterUrl,
-      company,
-    })
-
-    em.persist(entity)
-    em.persist(profile)
-    if (status) {
-      await ensureDictionaryEntry(em, {
-        tenantId: parsed.tenantId,
-        organizationId: parsed.organizationId,
-        kind: 'status',
-        value: status,
-      })
-    }
-    if (jobTitle) {
-      await ensureDictionaryEntry(em, {
-        tenantId: parsed.tenantId,
-        organizationId: parsed.organizationId,
-        kind: 'job_title',
-        value: jobTitle,
-      })
-    }
-    if (source) {
-      await ensureDictionaryEntry(em, {
-        tenantId: parsed.tenantId,
-        organizationId: parsed.organizationId,
-        kind: 'source',
-        value: source,
-      })
-    }
-    await em.flush()
+    let entity!: CustomerEntity
+    let profile!: CustomerPersonProfile
+    await withAtomicFlush(em, [
+      () => {
+        const graph = buildPersonGraph(em, {
+          organizationId: parsed.organizationId,
+          tenantId: parsed.tenantId,
+          displayName,
+          description,
+          ownerUserId: parsed.ownerUserId ?? null,
+          primaryEmail,
+          primaryPhone,
+          status,
+          lifecycleStage,
+          source,
+          nextInteractionAt: parsed.nextInteraction?.at ?? null,
+          nextInteractionName,
+          nextInteractionRefId,
+          nextInteractionIcon,
+          nextInteractionColor,
+          isActive: parsed.isActive ?? true,
+          firstName,
+          lastName,
+          preferredName,
+          jobTitle,
+          department,
+          seniority,
+          timezone,
+          linkedInUrl,
+          twitterUrl,
+        })
+        entity = graph.entity
+        profile = graph.profile
+      },
+      async () => {
+        if (status) {
+          await ensureDictionaryEntry(em, {
+            tenantId: parsed.tenantId,
+            organizationId: parsed.organizationId,
+            kind: 'status',
+            value: status,
+          })
+        }
+        if (jobTitle) {
+          await ensureDictionaryEntry(em, {
+            tenantId: parsed.tenantId,
+            organizationId: parsed.organizationId,
+            kind: 'job_title',
+            value: jobTitle,
+          })
+        }
+        if (source) {
+          await ensureDictionaryEntry(em, {
+            tenantId: parsed.tenantId,
+            organizationId: parsed.organizationId,
+            kind: 'source',
+            value: source,
+          })
+        }
+      },
+      () => syncLegacyPrimaryCompanyLink(em, entity, profile, parsed.companyEntityId ?? null),
+      () => syncEntityTags(em, entity, parsed.tags),
+    ], { transaction: true })
 
     const tenantId = entity.tenantId
     const organizationId = entity.organizationId
-    await syncEntityTags(em, entity, parsed.tags)
-    await em.flush()
     await setCustomFieldsForPerson(ctx, entity.id, profile.id, organizationId, tenantId, custom)
 
     const de = (ctx.container.resolve('dataEngine') as DataEngine)
@@ -535,6 +724,7 @@ const createPersonCommand: CommandHandler<PersonCreateInput, { entityId: string;
       indexer: personCrudIndexer,
       events: personCrudEvents,
     })
+    await emitQueryIndexUpsertEvents(ctx, [personEntityIndexEntry(entity)])
 
     return { entityId: entity.id, personId: profile.id }
   },
@@ -566,12 +756,158 @@ const createPersonCommand: CommandHandler<PersonCreateInput, { entityId: string;
     const em = (ctx.container.resolve('em') as EntityManager).fork()
     const entity = await em.findOne(CustomerEntity, { id: entityId })
     if (!entity) return
-    const profile = await em.findOne(CustomerPersonProfile, { entity })
-    await em.nativeDelete(CustomerTagAssignment, { entity })
-    if (profile) {
-      await em.remove(profile).flush()
+    const profile = await findOneWithDecryption(
+      em,
+      CustomerPersonProfile,
+      { entity },
+      undefined,
+      { tenantId: entity.tenantId, organizationId: entity.organizationId },
+    )
+    const identifiers = {
+      id: payload?.after?.profile.id ?? profile?.id ?? entity.id,
+      organizationId: entity.organizationId,
+      tenantId: entity.tenantId,
     }
-    await em.remove(entity).flush()
+    await withAtomicFlush(em, [
+      () => em.nativeDelete(CustomerTagAssignment, { entity, organizationId: entity.organizationId, tenantId: entity.tenantId }),
+      () => {
+        if (profile) em.remove(profile)
+      },
+      () => em.remove(entity),
+    ], { transaction: true })
+
+    const de = (ctx.container.resolve('dataEngine') as DataEngine)
+    await emitCrudUndoSideEffects({
+      dataEngine: de,
+      action: 'deleted',
+      entity,
+      identifiers,
+      indexer: personCrudIndexer,
+      events: personCrudEvents,
+    })
+    await emitQueryIndexDeleteEvents(ctx, [personEntityIndexEntry(entity)])
+  },
+  redo: async ({ logEntry, ctx }) => {
+    const after = resolveRedoSnapshot<PersonSnapshot>(logEntry)
+    if (!after) {
+      throw new CrudHttpError(400, { error: '[internal] redo snapshot unavailable for person create' })
+    }
+    const em = (ctx.container.resolve('em') as EntityManager).fork()
+    let entity = await findOneWithDecryption(
+      em,
+      CustomerEntity,
+      { id: after.entity.id },
+      undefined,
+      { tenantId: after.entity.tenantId, organizationId: after.entity.organizationId },
+    )
+    let profile!: CustomerPersonProfile
+    if (!entity) {
+      let newEntity!: CustomerEntity
+      let newProfile!: CustomerPersonProfile
+      await withAtomicFlush(em, [
+        () => {
+          const graph = buildPersonGraph(em, {
+            entityId: after.entity.id,
+            profileId: after.profile.id,
+            organizationId: after.entity.organizationId,
+            tenantId: after.entity.tenantId,
+            displayName: after.entity.displayName,
+            description: after.entity.description,
+            ownerUserId: after.entity.ownerUserId,
+            primaryEmail: after.entity.primaryEmail,
+            primaryPhone: after.entity.primaryPhone,
+            status: after.entity.status,
+            lifecycleStage: after.entity.lifecycleStage,
+            source: after.entity.source,
+            nextInteractionAt: after.entity.nextInteractionAt,
+            nextInteractionName: after.entity.nextInteractionName,
+            nextInteractionRefId: after.entity.nextInteractionRefId,
+            nextInteractionIcon: after.entity.nextInteractionIcon,
+            nextInteractionColor: after.entity.nextInteractionColor,
+            isActive: after.entity.isActive,
+            firstName: after.profile.firstName,
+            lastName: after.profile.lastName,
+            preferredName: after.profile.preferredName,
+            jobTitle: after.profile.jobTitle,
+            department: after.profile.department,
+            seniority: after.profile.seniority,
+            timezone: after.profile.timezone,
+            linkedInUrl: after.profile.linkedInUrl,
+            twitterUrl: after.profile.twitterUrl,
+          })
+          newEntity = graph.entity
+          newProfile = graph.profile
+        },
+        () => syncLegacyPrimaryCompanyLink(em, newEntity, newProfile, after.profile.companyEntityId),
+        () => syncEntityTags(em, newEntity, after.tagIds),
+      ], { transaction: true })
+      entity = newEntity
+      profile = newProfile
+    } else {
+      const existingProfile = await findOneWithDecryption(
+        em,
+        CustomerPersonProfile,
+        { entity },
+        undefined,
+        { tenantId: after.entity.tenantId, organizationId: after.entity.organizationId },
+      )
+      if (!existingProfile) throw notFound('Person profile not found')
+      profile = existingProfile
+      const survivingEntity = entity
+      await withAtomicFlush(em, [
+        () => {
+          survivingEntity.deletedAt = null
+          survivingEntity.displayName = after.entity.displayName
+          survivingEntity.description = after.entity.description
+          survivingEntity.ownerUserId = after.entity.ownerUserId
+          survivingEntity.primaryEmail = after.entity.primaryEmail
+          survivingEntity.primaryPhone = after.entity.primaryPhone
+          survivingEntity.status = after.entity.status
+          survivingEntity.lifecycleStage = after.entity.lifecycleStage
+          survivingEntity.source = after.entity.source
+          survivingEntity.nextInteractionAt = after.entity.nextInteractionAt
+          survivingEntity.nextInteractionName = after.entity.nextInteractionName
+          survivingEntity.nextInteractionRefId = after.entity.nextInteractionRefId
+          survivingEntity.nextInteractionIcon = after.entity.nextInteractionIcon
+          survivingEntity.nextInteractionColor = after.entity.nextInteractionColor
+          survivingEntity.isActive = after.entity.isActive
+          profile.firstName = after.profile.firstName
+          profile.lastName = after.profile.lastName
+          profile.preferredName = after.profile.preferredName
+          profile.jobTitle = after.profile.jobTitle
+          profile.department = after.profile.department
+          profile.seniority = after.profile.seniority
+          profile.timezone = after.profile.timezone
+          profile.linkedInUrl = after.profile.linkedInUrl
+          profile.twitterUrl = after.profile.twitterUrl
+        },
+        () => syncLegacyPrimaryCompanyLink(em, survivingEntity, profile, after.profile.companyEntityId),
+        () => syncEntityTags(em, survivingEntity, after.tagIds),
+      ], { transaction: true })
+    }
+
+    const restoredEntity = entity
+    const restoreValues = buildCustomFieldResetMap(after.custom, undefined)
+    if (Object.keys(restoreValues).length) {
+      await setCustomFieldsForPerson(ctx, restoredEntity.id, profile.id, restoredEntity.organizationId, restoredEntity.tenantId, restoreValues)
+    }
+
+    const de = (ctx.container.resolve('dataEngine') as DataEngine)
+    await emitCrudSideEffects({
+      dataEngine: de,
+      action: 'created',
+      entity: restoredEntity,
+      identifiers: {
+        id: profile.id ?? restoredEntity.id,
+        tenantId: restoredEntity.tenantId,
+        organizationId: restoredEntity.organizationId,
+      },
+      indexer: personCrudIndexer,
+      events: personCrudEvents,
+    })
+    await emitQueryIndexUpsertEvents(ctx, [personEntityIndexEntry(restoredEntity)])
+
+    return { entityId: restoredEntity.id, personId: profile.id }
   },
 }
 
@@ -579,7 +915,7 @@ const updatePersonCommand: CommandHandler<PersonUpdateInput, { entityId: string 
   id: 'customers.people.update',
   async prepare(rawInput, ctx) {
     const { parsed } = parseWithCustomFields(personUpdateSchema, rawInput)
-    const em = (ctx.container.resolve('em') as EntityManager)
+    const em = (ctx.container.resolve('em') as EntityManager).fork()
     const snapshot = await loadPersonSnapshot(em, parsed.id)
     return snapshot ? { before: snapshot } : {}
   },
@@ -591,88 +927,121 @@ const updatePersonCommand: CommandHandler<PersonUpdateInput, { entityId: string 
     ensureTenantScope(ctx, record.tenantId)
     ensureOrganizationScope(ctx, record.organizationId)
     const profile = await em.findOne(CustomerPersonProfile, { entity: record })
-    if (!profile) throw new CrudHttpError(404, { error: 'Person profile not found' })
-
-    if (parsed.description !== undefined) record.description = normalizeOptionalString(parsed.description)
-    if (parsed.ownerUserId !== undefined) record.ownerUserId = parsed.ownerUserId ?? null
-    if (parsed.primaryEmail !== undefined) record.primaryEmail = normalizeEmail(parsed.primaryEmail)
-    if (parsed.primaryPhone !== undefined) record.primaryPhone = normalizeOptionalString(parsed.primaryPhone)
-    if (parsed.status !== undefined) {
-      const normalizedStatus = normalizeOptionalString(parsed.status)
-      record.status = normalizedStatus
-      if (normalizedStatus) {
-        await ensureDictionaryEntry(em, {
-          tenantId: record.tenantId,
-          organizationId: record.organizationId,
-          kind: 'status',
-          value: normalizedStatus,
-        })
-      }
-    }
-    if (parsed.lifecycleStage !== undefined) record.lifecycleStage = normalizeOptionalString(parsed.lifecycleStage)
-    if (parsed.source !== undefined) {
-      const normalizedSource = normalizeOptionalString(parsed.source)
-      record.source = normalizedSource
-      if (normalizedSource) {
-        await ensureDictionaryEntry(em, {
-          tenantId: record.tenantId,
-          organizationId: record.organizationId,
-          kind: 'source',
-          value: normalizedSource,
-        })
-      }
-    }
-    if (parsed.isActive !== undefined) record.isActive = parsed.isActive
-    if (parsed.nextInteraction) {
-      record.nextInteractionAt = parsed.nextInteraction.at
-      record.nextInteractionName = parsed.nextInteraction.name.trim()
-      record.nextInteractionRefId = normalizeOptionalString(parsed.nextInteraction.refId) ?? null
-      record.nextInteractionIcon = normalizeOptionalString(parsed.nextInteraction.icon)
-      record.nextInteractionColor = normalizeHexColor(parsed.nextInteraction.color)
-    } else if (parsed.nextInteraction === null) {
-      record.nextInteractionAt = null
-      record.nextInteractionName = null
-      record.nextInteractionRefId = null
-      record.nextInteractionIcon = null
-      record.nextInteractionColor = null
-    }
-
-    if (parsed.firstName !== undefined) profile.firstName = normalizeOptionalString(parsed.firstName)
-    if (parsed.lastName !== undefined) profile.lastName = normalizeOptionalString(parsed.lastName)
-    if (parsed.preferredName !== undefined) profile.preferredName = normalizeOptionalString(parsed.preferredName)
-    if (parsed.jobTitle !== undefined) {
-      const normalizedJobTitle = normalizeOptionalString(parsed.jobTitle)
-      profile.jobTitle = normalizedJobTitle
-      if (normalizedJobTitle) {
-        await ensureDictionaryEntry(em, {
-          tenantId: record.tenantId,
-          organizationId: record.organizationId,
-          kind: 'job_title',
-          value: normalizedJobTitle,
-        })
-      }
-    }
-    if (parsed.department !== undefined) profile.department = normalizeOptionalString(parsed.department)
-    if (parsed.seniority !== undefined) profile.seniority = normalizeOptionalString(parsed.seniority)
-    if (parsed.timezone !== undefined) profile.timezone = normalizeOptionalString(parsed.timezone)
-    if (parsed.linkedInUrl !== undefined) profile.linkedInUrl = normalizeOptionalString(parsed.linkedInUrl)
-    if (parsed.twitterUrl !== undefined) profile.twitterUrl = normalizeOptionalString(parsed.twitterUrl)
-
-    if (parsed.companyEntityId !== undefined) {
-      profile.company = await resolveCompanyReference(em, parsed.companyEntityId, record.organizationId, record.tenantId)
-    }
+    if (!profile) throw notFound('Person profile not found')
 
     if (parsed.displayName !== undefined) {
       const nextDisplayName = parsed.displayName.trim()
       if (!nextDisplayName) {
         throw new CrudHttpError(400, { error: 'Display name is required' })
       }
-      record.displayName = nextDisplayName
     }
 
-    await em.flush()
-    await syncEntityTags(em, record, parsed.tags)
-    await em.flush()
+    if (
+      parsed.displayName === undefined
+      && (parsed.firstName !== undefined || parsed.lastName !== undefined)
+      && isDerivedDisplayName(record.displayName, profile.firstName, profile.lastName)
+    ) {
+      const nextFirst = parsed.firstName !== undefined ? parsed.firstName : profile.firstName
+      const nextLast = parsed.lastName !== undefined ? parsed.lastName : profile.lastName
+      const derived = deriveDisplayName(nextFirst, nextLast)
+      if (derived.length > 0) parsed.displayName = derived
+    }
+
+    await withAtomicFlush(em, [
+      () => {
+        if (parsed.description !== undefined) record.description = normalizeOptionalString(parsed.description)
+        if (parsed.ownerUserId !== undefined) record.ownerUserId = parsed.ownerUserId ?? null
+        if (parsed.primaryEmail !== undefined) record.primaryEmail = normalizeEmail(parsed.primaryEmail)
+        if (parsed.primaryPhone !== undefined) record.primaryPhone = normalizeOptionalString(parsed.primaryPhone)
+        if (parsed.status !== undefined) {
+          record.status = normalizeOptionalString(parsed.status)
+        }
+        if (parsed.lifecycleStage !== undefined) record.lifecycleStage = normalizeOptionalString(parsed.lifecycleStage)
+        if (parsed.source !== undefined) {
+          record.source = normalizeOptionalString(parsed.source)
+        }
+        if (parsed.isActive !== undefined) record.isActive = parsed.isActive
+        if (parsed.nextInteraction) {
+          record.nextInteractionAt = parsed.nextInteraction.at
+          record.nextInteractionName = parsed.nextInteraction.name.trim()
+          record.nextInteractionRefId = normalizeOptionalString(parsed.nextInteraction.refId) ?? null
+          record.nextInteractionIcon = normalizeOptionalString(parsed.nextInteraction.icon)
+          record.nextInteractionColor = normalizeHexColor(parsed.nextInteraction.color)
+        } else if (parsed.nextInteraction === null) {
+          record.nextInteractionAt = null
+          record.nextInteractionName = null
+          record.nextInteractionRefId = null
+          record.nextInteractionIcon = null
+          record.nextInteractionColor = null
+        }
+
+        if (parsed.firstName !== undefined) profile.firstName = normalizeOptionalString(parsed.firstName)
+        if (parsed.lastName !== undefined) profile.lastName = normalizeOptionalString(parsed.lastName)
+        if (parsed.preferredName !== undefined) profile.preferredName = normalizeOptionalString(parsed.preferredName)
+        if (parsed.jobTitle !== undefined) {
+          profile.jobTitle = normalizeOptionalString(parsed.jobTitle)
+        }
+        if (parsed.department !== undefined) profile.department = normalizeOptionalString(parsed.department)
+        if (parsed.seniority !== undefined) profile.seniority = normalizeOptionalString(parsed.seniority)
+        if (parsed.timezone !== undefined) profile.timezone = normalizeOptionalString(parsed.timezone)
+        if (parsed.linkedInUrl !== undefined) profile.linkedInUrl = normalizeOptionalString(parsed.linkedInUrl)
+        if (parsed.twitterUrl !== undefined) profile.twitterUrl = normalizeOptionalString(parsed.twitterUrl)
+
+        const profileFieldsUpdated = [
+          parsed.firstName, parsed.lastName, parsed.preferredName, parsed.jobTitle,
+          parsed.department, parsed.seniority, parsed.timezone, parsed.linkedInUrl,
+          parsed.twitterUrl, parsed.companyEntityId,
+        ].some((v) => v !== undefined)
+        if (profileFieldsUpdated) {
+          record.updatedAt = new Date()
+        }
+
+        if (parsed.displayName !== undefined) {
+          record.displayName = parsed.displayName.trim()
+        }
+      },
+      async () => {
+        if (parsed.status !== undefined) {
+          const normalizedStatus = normalizeOptionalString(parsed.status)
+          if (normalizedStatus) {
+            await ensureDictionaryEntry(em, {
+              tenantId: record.tenantId,
+              organizationId: record.organizationId,
+              kind: 'status',
+              value: normalizedStatus,
+            })
+          }
+        }
+        if (parsed.source !== undefined) {
+          const normalizedSource = normalizeOptionalString(parsed.source)
+          if (normalizedSource) {
+            await ensureDictionaryEntry(em, {
+              tenantId: record.tenantId,
+              organizationId: record.organizationId,
+              kind: 'source',
+              value: normalizedSource,
+            })
+          }
+        }
+        if (parsed.jobTitle !== undefined) {
+          const normalizedJobTitle = normalizeOptionalString(parsed.jobTitle)
+          if (normalizedJobTitle) {
+            await ensureDictionaryEntry(em, {
+              tenantId: record.tenantId,
+              organizationId: record.organizationId,
+              kind: 'job_title',
+              value: normalizedJobTitle,
+            })
+          }
+        }
+      },
+      async () => {
+        if (parsed.companyEntityId !== undefined) {
+          await syncLegacyPrimaryCompanyLink(em, record, profile, parsed.companyEntityId)
+        }
+      },
+      () => syncEntityTags(em, record, parsed.tags),
+    ], { transaction: true })
 
     await setCustomFieldsForPerson(ctx, record.id, profile.id, record.organizationId, record.tenantId, custom)
 
@@ -689,8 +1058,10 @@ const updatePersonCommand: CommandHandler<PersonUpdateInput, { entityId: string 
       indexer: personCrudIndexer,
       events: personCrudEvents,
     })
+    await emitQueryIndexUpsertEvents(ctx, [personEntityIndexEntry(record)])
 
-    return { entityId: record.id }
+    // Expose the freshly-bumped updatedAt for inline-edit sequential-save lock refresh (#2055).
+    return { entityId: record.id, updatedAt: record.updatedAt }
   },
   captureAfter: async (_input, result, ctx) => {
     const em = (ctx.container.resolve('em') as EntityManager).fork()
@@ -701,6 +1072,9 @@ const updatePersonCommand: CommandHandler<PersonUpdateInput, { entityId: string 
     const before = snapshots.before as PersonSnapshot | undefined
     if (!before) return null
     const afterSnapshot = snapshots.after as PersonSnapshot | undefined
+    if (afterSnapshot && snapshotsEqual(before, afterSnapshot)) {
+      return { skipLog: true }
+    }
     return {
       actionLabel: translate('customers.audit.people.update', 'Update person'),
       resourceKind: 'customers.person',
@@ -724,99 +1098,100 @@ const updatePersonCommand: CommandHandler<PersonUpdateInput, { entityId: string 
     const em = (ctx.container.resolve('em') as EntityManager).fork()
     const entity = await em.findOne(CustomerEntity, { id: before.entity.id })
     if (!entity) {
-      const newEntity = em.create(CustomerEntity, {
-        id: before.entity.id,
-        organizationId: before.entity.organizationId,
-        tenantId: before.entity.tenantId,
-        kind: 'person',
-        displayName: before.entity.displayName,
-        description: before.entity.description,
-        ownerUserId: before.entity.ownerUserId,
-        primaryEmail: before.entity.primaryEmail,
-        primaryPhone: before.entity.primaryPhone,
-        status: before.entity.status,
-        lifecycleStage: before.entity.lifecycleStage,
-        source: before.entity.source,
-        nextInteractionAt: before.entity.nextInteractionAt,
-        nextInteractionName: before.entity.nextInteractionName,
-        nextInteractionRefId: before.entity.nextInteractionRefId,
-        nextInteractionIcon: before.entity.nextInteractionIcon,
-        nextInteractionColor: before.entity.nextInteractionColor,
-        isActive: before.entity.isActive,
-      })
-      em.persist(newEntity)
-      const profile = em.create(CustomerPersonProfile, {
-        id: before.profile.id,
-        organizationId: before.entity.organizationId,
-        tenantId: before.entity.tenantId,
-        entity: newEntity,
-        firstName: before.profile.firstName,
-        lastName: before.profile.lastName,
-        preferredName: before.profile.preferredName,
-        jobTitle: before.profile.jobTitle,
-        department: before.profile.department,
-        seniority: before.profile.seniority,
-        timezone: before.profile.timezone,
-        linkedInUrl: before.profile.linkedInUrl,
-        twitterUrl: before.profile.twitterUrl,
-      })
-      em.persist(profile)
-      if (before.profile.companyEntityId) {
-        profile.company = await resolveCompanyReference(
-          em,
-          before.profile.companyEntityId,
-          before.entity.organizationId,
-          before.entity.tenantId
-        )
-      }
-      await em.flush()
-      await syncEntityTags(em, newEntity, before.tagIds)
-      await em.flush()
+      let newEntity!: CustomerEntity
+      let newProfile!: CustomerPersonProfile
+      await withAtomicFlush(em, [
+        () => {
+          newEntity = em.create(CustomerEntity, {
+            id: before.entity.id,
+            organizationId: before.entity.organizationId,
+            tenantId: before.entity.tenantId,
+            kind: 'person',
+            displayName: before.entity.displayName,
+            description: before.entity.description,
+            ownerUserId: before.entity.ownerUserId,
+            primaryEmail: before.entity.primaryEmail,
+            primaryPhone: before.entity.primaryPhone,
+            status: before.entity.status,
+            lifecycleStage: before.entity.lifecycleStage,
+            source: before.entity.source,
+            nextInteractionAt: before.entity.nextInteractionAt,
+            nextInteractionName: before.entity.nextInteractionName,
+            nextInteractionRefId: before.entity.nextInteractionRefId,
+            nextInteractionIcon: before.entity.nextInteractionIcon,
+            nextInteractionColor: before.entity.nextInteractionColor,
+            isActive: before.entity.isActive,
+          })
+          em.persist(newEntity)
+          newProfile = em.create(CustomerPersonProfile, {
+            id: before.profile.id,
+            organizationId: before.entity.organizationId,
+            tenantId: before.entity.tenantId,
+            entity: newEntity,
+            firstName: before.profile.firstName,
+            lastName: before.profile.lastName,
+            preferredName: before.profile.preferredName,
+            jobTitle: before.profile.jobTitle,
+            department: before.profile.department,
+            seniority: before.profile.seniority,
+            timezone: before.profile.timezone,
+            linkedInUrl: before.profile.linkedInUrl,
+            twitterUrl: before.profile.twitterUrl,
+          })
+          em.persist(newProfile)
+        },
+        () => syncLegacyPrimaryCompanyLink(em, newEntity, newProfile, before.profile.companyEntityId),
+        () => syncEntityTags(em, newEntity, before.tagIds),
+      ], { transaction: true })
     } else {
-      entity.displayName = before.entity.displayName
-      entity.description = before.entity.description
-      entity.ownerUserId = before.entity.ownerUserId
-      entity.primaryEmail = before.entity.primaryEmail
-      entity.primaryPhone = before.entity.primaryPhone
-      entity.status = before.entity.status
-      entity.lifecycleStage = before.entity.lifecycleStage
-      entity.source = before.entity.source
-      entity.nextInteractionAt = before.entity.nextInteractionAt
-      entity.nextInteractionName = before.entity.nextInteractionName
-      entity.nextInteractionRefId = before.entity.nextInteractionRefId
-      entity.nextInteractionIcon = before.entity.nextInteractionIcon
-      entity.nextInteractionColor = before.entity.nextInteractionColor
-      entity.isActive = before.entity.isActive
-      await em.flush()
-      const profile = await em.findOne(CustomerPersonProfile, { entity })
-      if (profile) {
-        profile.firstName = before.profile.firstName
-        profile.lastName = before.profile.lastName
-        profile.preferredName = before.profile.preferredName
-        profile.jobTitle = before.profile.jobTitle
-        profile.department = before.profile.department
-        profile.seniority = before.profile.seniority
-        profile.timezone = before.profile.timezone
-        profile.linkedInUrl = before.profile.linkedInUrl
-        profile.twitterUrl = before.profile.twitterUrl
-        profile.company = before.profile.companyEntityId
-          ? await resolveCompanyReference(
-              em,
-              before.profile.companyEntityId,
-              before.entity.organizationId,
-              before.entity.tenantId
-            )
-          : null
-      }
-      await syncEntityTags(em, entity, before.tagIds)
-      await em.flush()
+      await withAtomicFlush(em, [
+        () => {
+          entity.displayName = before.entity.displayName
+          entity.description = before.entity.description
+          entity.ownerUserId = before.entity.ownerUserId
+          entity.primaryEmail = before.entity.primaryEmail
+          entity.primaryPhone = before.entity.primaryPhone
+          entity.status = before.entity.status
+          entity.lifecycleStage = before.entity.lifecycleStage
+          entity.source = before.entity.source
+          entity.nextInteractionAt = before.entity.nextInteractionAt
+          entity.nextInteractionName = before.entity.nextInteractionName
+          entity.nextInteractionRefId = before.entity.nextInteractionRefId
+          entity.nextInteractionIcon = before.entity.nextInteractionIcon
+          entity.nextInteractionColor = before.entity.nextInteractionColor
+          entity.isActive = before.entity.isActive
+        },
+        async () => {
+          const profile = await findOneWithDecryption(
+            em,
+            CustomerPersonProfile,
+            { entity },
+            undefined,
+            { tenantId: before.entity.tenantId, organizationId: before.entity.organizationId },
+          )
+          if (profile) {
+            profile.firstName = before.profile.firstName
+            profile.lastName = before.profile.lastName
+            profile.preferredName = before.profile.preferredName
+            profile.jobTitle = before.profile.jobTitle
+            profile.department = before.profile.department
+            profile.seniority = before.profile.seniority
+            profile.timezone = before.profile.timezone
+            profile.linkedInUrl = before.profile.linkedInUrl
+            profile.twitterUrl = before.profile.twitterUrl
+            await syncLegacyPrimaryCompanyLink(em, entity, profile, before.profile.companyEntityId)
+          }
+        },
+        () => syncEntityTags(em, entity, before.tagIds),
+      ], { transaction: true })
     }
 
+    const indexedEntity = await em.findOne(CustomerEntity, { id: before.entity.id })
     const de = (ctx.container.resolve('dataEngine') as DataEngine)
     await emitCrudUndoSideEffects({
       dataEngine: de,
       action: 'updated',
-      entity: await em.findOne(CustomerEntity, { id: before.entity.id }),
+      entity: indexedEntity,
       identifiers: {
         id: before.profile.id ?? before.entity.id,
         organizationId: before.entity.organizationId,
@@ -825,6 +1200,9 @@ const updatePersonCommand: CommandHandler<PersonUpdateInput, { entityId: string 
       indexer: personCrudIndexer,
       events: personCrudEvents,
     })
+    if (indexedEntity) {
+      await emitQueryIndexUpsertEvents(ctx, [personEntityIndexEntry(indexedEntity)])
+    }
 
     const resetValues = buildCustomFieldResetMap(before.custom, payload?.after?.custom)
     if (Object.keys(resetValues).length) {
@@ -838,7 +1216,7 @@ const deletePersonCommand: CommandHandler<{ body?: Record<string, unknown>; quer
     id: 'customers.people.delete',
     async prepare(input, ctx) {
       const id = requireId(input, 'Person id required')
-      const em = (ctx.container.resolve('em') as EntityManager)
+      const em = (ctx.container.resolve('em') as EntityManager).fork()
       const snapshot = await loadPersonSnapshot(em, id)
       return snapshot ? { before: snapshot } : {}
     },
@@ -850,16 +1228,32 @@ const deletePersonCommand: CommandHandler<{ body?: Record<string, unknown>; quer
       const record = assertFound(entity, 'Person not found')
       ensureTenantScope(ctx, record.tenantId)
       ensureOrganizationScope(ctx, record.organizationId)
+
+      const dealLinks = await em.count(CustomerDealPersonLink, { person: record })
+      if (dealLinks > 0) {
+        const { translate } = await resolveTranslations()
+        throw buildPersonHasDependentsError(translate, { dealLinks })
+      }
+
       const profile = await em.findOne(CustomerPersonProfile, { entity: record })
-      if (profile) em.remove(profile)
-      await em.nativeDelete(CustomerAddress, { entity: record })
-      await em.nativeDelete(CustomerComment, { entity: record })
-      await em.nativeDelete(CustomerActivity, { entity: record })
-      await em.nativeDelete(CustomerTodoLink, { entity: record })
-      await em.nativeDelete(CustomerTagAssignment, { entity: record })
-      await em.nativeDelete(CustomerDealPersonLink, { person: record })
-      em.remove(record)
-      await em.flush()
+      await withAtomicFlush(em, [
+        async () => {
+          if (profile) em.remove(profile)
+          await em.nativeDelete(CustomerAddress, { entity: record, organizationId: record.organizationId, tenantId: record.tenantId })
+          await em.nativeDelete(CustomerComment, { entity: record, organizationId: record.organizationId, tenantId: record.tenantId })
+          await em.nativeDelete(CustomerActivity, { entity: record, organizationId: record.organizationId, tenantId: record.tenantId })
+          await em.nativeDelete(CustomerInteraction, { entity: record, organizationId: record.organizationId, tenantId: record.tenantId })
+          await em.nativeDelete(CustomerTodoLink, { entity: record, organizationId: record.organizationId, tenantId: record.tenantId })
+          await em.nativeDelete(CustomerTagAssignment, { entity: record, organizationId: record.organizationId, tenantId: record.tenantId })
+          await em.nativeDelete(CustomerDealPersonLink, { person: record })
+          await em.nativeDelete(CustomerPersonCompanyLink, { person: record })
+          if (profile) {
+            await em.nativeDelete(CustomFieldValue, { entityId: PERSON_ENTITY_ID, recordId: profile.id })
+          }
+          await em.nativeDelete(CustomFieldValue, { entityId: CUSTOMER_ENTITY_ID, recordId: record.id })
+          em.remove(record)
+        },
+      ], { transaction: true })
 
       const indexDeletes: QueryIndexEventEntry[] = []
       const dealUpserts: QueryIndexEventEntry[] = []
@@ -896,6 +1290,14 @@ const deletePersonCommand: CommandHandler<{ body?: Record<string, unknown>; quer
             organizationId: record.organizationId,
           })
         }
+        for (const interaction of snapshot.interactions ?? []) {
+          indexDeletes.push({
+            entityType: E.customers.customer_interaction,
+            recordId: interaction.id,
+            tenantId: record.tenantId,
+            organizationId: record.organizationId,
+          })
+        }
         for (const deal of snapshot.deals ?? []) {
           if (deal.dealId) {
             dealUpserts.push({
@@ -922,6 +1324,7 @@ const deletePersonCommand: CommandHandler<{ body?: Record<string, unknown>; quer
         events: personCrudEvents,
       })
 
+      await emitQueryIndexDeleteEvents(ctx, [personEntityIndexEntry(record)])
       await emitQueryIndexDeleteEvents(ctx, indexDeletes)
       await emitQueryIndexUpsertEvents(ctx, dealUpserts)
       return { entityId: record.id }
@@ -949,7 +1352,37 @@ const deletePersonCommand: CommandHandler<{ body?: Record<string, unknown>; quer
       const before = payload?.before
       if (!before) return
       const em = (ctx.container.resolve('em') as EntityManager).fork()
-      let entity = await em.findOne(CustomerEntity, { id: before.entity.id })
+      const de = (ctx.container.resolve('dataEngine') as DataEngine)
+
+      const decryptionScope = {
+        tenantId: before.entity.tenantId ?? null,
+        organizationId: before.entity.organizationId ?? null,
+      }
+      // Bind the outer EntityManager to an explicit transaction so every
+      // `em.flush()` below participates in the same unit of work. Using
+      // `em.transactional(cb)` would pass a forked em into `cb` and the
+      // surrounding closures would mutate the unwrapped em, escaping the
+      // transaction (see SPEC-018 and H8 in the CRM details screens review).
+      await em.begin()
+      let txResult: {
+        entity: CustomerEntity
+        profile: CustomerPersonProfile
+        beforeInteractions: PersonInteractionSnapshot[]
+        beforeTodos: PersonTodoSnapshot[]
+      }
+      try {
+        txResult = await (async () => {
+        let entity = await findOneWithDecryption(
+          em,
+          CustomerEntity,
+          {
+            id: before.entity.id,
+            tenantId: before.entity.tenantId,
+            organizationId: before.entity.organizationId,
+          },
+          {},
+          decryptionScope,
+        )
       if (!entity) {
         entity = em.create(CustomerEntity, {
           id: before.entity.id,
@@ -988,8 +1421,19 @@ const deletePersonCommand: CommandHandler<{ body?: Record<string, unknown>; quer
       entity.nextInteractionIcon = before.entity.nextInteractionIcon
       entity.nextInteractionColor = before.entity.nextInteractionColor
       entity.isActive = before.entity.isActive
+      entity.deletedAt = null
 
-      let profile = await em.findOne(CustomerPersonProfile, { entity })
+      let profile = await findOneWithDecryption(
+        em,
+        CustomerPersonProfile,
+        {
+          entity,
+          tenantId: before.entity.tenantId,
+          organizationId: before.entity.organizationId,
+        },
+        {},
+        decryptionScope,
+      )
       if (!profile) {
         profile = em.create(CustomerPersonProfile, {
           id: before.profile.id,
@@ -1018,23 +1462,38 @@ const deletePersonCommand: CommandHandler<{ body?: Record<string, unknown>; quer
         profile.twitterUrl = before.profile.twitterUrl
       }
 
-      if (before.profile.companyEntityId) {
-        profile.company = await resolveCompanyReference(
-          em,
-          before.profile.companyEntityId,
-          before.entity.organizationId,
-          before.entity.tenantId
-        )
-      } else {
-        profile.company = null
-      }
+      await syncLegacyPrimaryCompanyLink(em, entity, profile, before.profile.companyEntityId)
 
       await em.flush()
-      await syncEntityTags(em, entity, before.tagIds)
-      await em.flush()
+      await em.nativeDelete(CustomerPersonCompanyLink, { person: entity })
+      for (const companyLink of before.companies ?? []) {
+        const company = await resolveCompanyReference(
+          em,
+          companyLink.companyId,
+          before.entity.organizationId,
+          before.entity.tenantId,
+        )
+        if (!company) continue
+        const restoredLink = em.create(CustomerPersonCompanyLink, {
+          id: companyLink.linkId ?? undefined,
+          organizationId: before.entity.organizationId,
+          tenantId: before.entity.tenantId,
+          person: entity,
+          company,
+          isPrimary: companyLink.isPrimary,
+        })
+        em.persist(restoredLink)
+        if (companyLink.isPrimary) {
+          profile.company = company
+        }
+      }
+      await withAtomicFlush(em, [
+        () => syncEntityTags(em, entity, before.tagIds),
+      ])
 
       const beforeActivities = (before as { activities?: PersonActivitySnapshot[] }).activities ?? []
       const beforeTodos = (before as { todos?: PersonTodoSnapshot[] }).todos ?? []
+      const beforeInteractions = (before as { interactions?: PersonInteractionSnapshot[] }).interactions ?? []
 
       const relatedDealIds = new Set<string>()
       for (const link of before.deals) relatedDealIds.add(link.dealId)
@@ -1069,7 +1528,7 @@ const deletePersonCommand: CommandHandler<{ body?: Record<string, unknown>; quer
       }
       await em.flush()
 
-      await em.nativeDelete(CustomerActivity, { entity })
+      await em.nativeDelete(CustomerActivity, { entity, organizationId: entity.organizationId, tenantId: entity.tenantId })
       for (const activity of beforeActivities) {
         const restoredActivity = em.create(CustomerActivity, {
           id: activity.id,
@@ -1091,7 +1550,7 @@ const deletePersonCommand: CommandHandler<{ body?: Record<string, unknown>; quer
       }
       await em.flush()
 
-      await em.nativeDelete(CustomerComment, { entity })
+      await em.nativeDelete(CustomerComment, { entity, organizationId: entity.organizationId, tenantId: entity.tenantId })
       for (const comment of before.comments) {
         const restoredComment = em.create(CustomerComment, {
           id: comment.id,
@@ -1111,7 +1570,7 @@ const deletePersonCommand: CommandHandler<{ body?: Record<string, unknown>; quer
       }
       await em.flush()
 
-      await em.nativeDelete(CustomerAddress, { entity })
+      await em.nativeDelete(CustomerAddress, { entity, organizationId: entity.organizationId, tenantId: entity.tenantId })
       for (const address of before.addresses) {
         const restoredAddress = em.create(CustomerAddress, {
           id: address.id,
@@ -1134,7 +1593,7 @@ const deletePersonCommand: CommandHandler<{ body?: Record<string, unknown>; quer
       }
       await em.flush()
 
-      await em.nativeDelete(CustomerTodoLink, { entity })
+      await em.nativeDelete(CustomerTodoLink, { entity, organizationId: entity.organizationId, tenantId: entity.tenantId })
       for (const todo of beforeTodos) {
         const restoredTodo = em.create(CustomerTodoLink, {
           id: todo.id,
@@ -1150,7 +1609,62 @@ const deletePersonCommand: CommandHandler<{ body?: Record<string, unknown>; quer
       }
       await em.flush()
 
-      const de = (ctx.container.resolve('dataEngine') as DataEngine)
+      await em.nativeDelete(CustomerInteraction, { entity, organizationId: entity.organizationId, tenantId: entity.tenantId })
+      for (const interaction of beforeInteractions) {
+        const restoredInteraction = em.create(CustomerInteraction, {
+          id: interaction.id,
+          organizationId: entity.organizationId,
+          tenantId: entity.tenantId,
+          entity,
+          interactionType: interaction.interactionType,
+          title: interaction.title,
+          body: interaction.body,
+          status: interaction.status,
+          scheduledAt: interaction.scheduledAt,
+          occurredAt: interaction.occurredAt,
+          priority: interaction.priority,
+          authorUserId: interaction.authorUserId,
+          ownerUserId: interaction.ownerUserId,
+          dealId: interaction.dealId,
+          source: interaction.source,
+          appearanceIcon: interaction.appearanceIcon,
+          appearanceColor: interaction.appearanceColor,
+          createdAt: interaction.createdAt,
+          updatedAt: interaction.updatedAt,
+          deletedAt: interaction.deletedAt,
+        })
+        em.persist(restoredInteraction)
+      }
+      await em.flush()
+
+      return { entity, profile, beforeInteractions, beforeTodos }
+        })()
+        await em.commit()
+      } catch (err) {
+        try {
+          await em.rollback()
+        } catch {
+          // rollback failure should not mask the original error
+        }
+        throw err
+      }
+
+      for (const interaction of txResult.beforeInteractions) {
+        if (!interaction.custom || !Object.keys(interaction.custom).length) continue
+        await setCustomFieldsIfAny({
+          dataEngine: de,
+          entityId: INTERACTION_ENTITY_ID,
+          recordId: interaction.id,
+          organizationId: txResult.entity.organizationId,
+          tenantId: txResult.entity.tenantId,
+          values: interaction.custom,
+          notify: false,
+        })
+      }
+
+      const entity = txResult.entity
+      const profile = txResult.profile
+
       await emitCrudUndoSideEffects({
         dataEngine: de,
         action: 'created',
@@ -1189,10 +1703,18 @@ const deletePersonCommand: CommandHandler<{ body?: Record<string, unknown>; quer
           organizationId: entity.organizationId,
         })
       }
-      for (const todo of beforeTodos ?? []) {
+      for (const todo of txResult.beforeTodos ?? []) {
         upsertEntries.push({
           entityType: E.customers.customer_todo_link,
           recordId: todo.id,
+          tenantId: entity.tenantId,
+          organizationId: entity.organizationId,
+        })
+      }
+      for (const interaction of txResult.beforeInteractions ?? []) {
+        upsertEntries.push({
+          entityType: E.customers.customer_interaction,
+          recordId: interaction.id,
           tenantId: entity.tenantId,
           organizationId: entity.organizationId,
         })
@@ -1212,6 +1734,7 @@ const deletePersonCommand: CommandHandler<{ body?: Record<string, unknown>; quer
       if (Object.keys(resetValues).length) {
         await setCustomFieldsForPerson(ctx, entity.id, profile.id, entity.organizationId, entity.tenantId, resetValues)
       }
+      await emitQueryIndexUpsertEvents(ctx, [personEntityIndexEntry(entity)])
       await emitQueryIndexUpsertEvents(ctx, upsertEntries)
       await emitQueryIndexUpsertEvents(ctx, dealUpserts)
     },

@@ -12,6 +12,10 @@ import { getAuthFromRequest } from '@open-mercato/shared/lib/auth/server'
 import { resolveOrganizationScopeForRequest } from '@open-mercato/core/modules/directory/utils/organizationScope'
 import { WorkflowInstance } from '../../../../data/entities'
 import * as workflowExecutor from '../../../../lib/workflow-executor'
+import { workflowInstanceResponseSchema } from '../../../openapi'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('workflows')
 
 export const metadata = {
   requireAuth: true,
@@ -106,7 +110,7 @@ export async function POST(
       message: 'Workflow cancelled successfully',
     })
   } catch (error) {
-    console.error('Error cancelling workflow instance:', error)
+    logger.error('Error cancelling workflow instance', { err: error })
     return NextResponse.json(
       { error: 'Failed to cancel workflow instance' },
       { status: 500 }
@@ -128,7 +132,7 @@ export const openApi = {
           status: 200,
           description: 'Workflow cancelled successfully',
           schema: z.object({
-            data: z.any(),
+            data: workflowInstanceResponseSchema,
             message: z.string(),
           }),
         },

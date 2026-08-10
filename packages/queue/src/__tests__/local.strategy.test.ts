@@ -2,8 +2,23 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
+import { createLogger } from '@open-mercato/shared/lib/logger'
 import { createQueue } from '../factory'
 import type { QueuedJob } from '../types'
+
+jest.mock('@open-mercato/shared/lib/logger', () => {
+  const mocked = {
+    debug: jest.fn(),
+    info: jest.fn(),
+    warn: jest.fn(),
+    error: jest.fn(),
+    child: jest.fn(),
+  }
+  mocked.child.mockImplementation(() => mocked)
+  return { createLogger: jest.fn(() => mocked) }
+})
+
+const queueLoggerError = createLogger('queue').error as jest.Mock
 
 function readJson(p: string) { return JSON.parse(fs.readFileSync(p, 'utf8')) }
 
@@ -107,6 +122,83 @@ describe('Queue - local strategy', () => {
     await queue.close()
   })
 
+  test('removeQueuedJobsByScope removes only matching tenant scoped jobs', async () => {
+    const queue = createQueue<{
+      tenantId?: string
+      organizationId?: string | null
+      jobType?: string
+      value: number
+    }>('test-queue', 'local')
+    const queuePath = path.join('.mercato', 'queue', 'test-queue', 'queue.json')
+
+    await queue.enqueue({ tenantId: 'tenant-1', organizationId: 'org-1', jobType: 'batch-index', value: 1 })
+    await queue.enqueue({ tenantId: 'tenant-1', organizationId: 'org-1', jobType: 'index', value: 2 })
+    await queue.enqueue({ tenantId: 'tenant-1', organizationId: 'org-2', jobType: 'batch-index', value: 3 })
+    await queue.enqueue({ tenantId: 'tenant-2', organizationId: 'org-1', jobType: 'batch-index', value: 4 })
+    await queue.enqueue({ tenantId: 'tenant-1', organizationId: null, jobType: 'batch-index', value: 5 })
+    await queue.enqueue({ jobType: 'batch-index', value: 6 })
+
+    const scopedResult = await queue.removeQueuedJobsByScope!({
+      tenantId: 'tenant-1',
+      organizationId: 'org-1',
+      jobTypes: ['batch-index'],
+    })
+
+    expect(scopedResult.removed).toBe(1)
+    let remaining = readJson(queuePath)
+    expect(remaining.map((job: { payload: { value: number } }) => job.payload.value)).toEqual([2, 3, 4, 5, 6])
+
+    const tenantResult = await queue.removeQueuedJobsByScope!({ tenantId: 'tenant-1', jobTypes: ['batch-index'] })
+
+    expect(tenantResult.removed).toBe(2)
+    remaining = readJson(queuePath)
+    expect(remaining.map((job: { payload: { value: number } }) => job.payload.value)).toEqual([2, 4, 6])
+
+    await queue.close()
+  })
+
+  test('removeQueuedJobsByScope preserves in-flight local jobs', async () => {
+    const queue = createQueue<{
+      tenantId: string
+      organizationId: string
+      jobType: string
+      value: number
+    }>('test-queue', 'local')
+    const queuePath = path.join('.mercato', 'queue', 'test-queue', 'queue.json')
+    let release!: () => void
+    const releasePromise = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let started!: () => void
+    const startedPromise = new Promise<void>((resolve) => {
+      started = resolve
+    })
+
+    await queue.enqueue({ tenantId: 'tenant-1', organizationId: 'org-1', jobType: 'batch-index', value: 1 })
+    await queue.enqueue({ tenantId: 'tenant-1', organizationId: 'org-1', jobType: 'batch-index', value: 2 })
+    const processing = queue.process(async () => {
+      started()
+      await releasePromise
+    }, { limit: 1 })
+
+    await startedPromise
+    const result = await queue.removeQueuedJobsByScope!({
+      tenantId: 'tenant-1',
+      organizationId: 'org-1',
+      jobTypes: ['batch-index'],
+    })
+
+    expect(result.removed).toBe(1)
+    let remaining = readJson(queuePath)
+    expect(remaining.map((job: { payload: { value: number } }) => job.payload.value)).toEqual([1])
+
+    release()
+    await processing
+    remaining = readJson(queuePath)
+    expect(remaining).toEqual([])
+    await queue.close()
+  })
+
   test('getJobCounts returns correct counts', async () => {
     const queue = createQueue<{ value: number }>('test-queue', 'local')
 
@@ -171,6 +263,118 @@ describe('Queue - local strategy', () => {
     await queue.close()
   })
 
+  test('corrupted queue file is backed up and recreated', async () => {
+    const queue = createQueue<{ value: number }>('test-queue', 'local')
+    const queueDir = path.join('.mercato', 'queue', 'test-queue')
+    const queuePath = path.join(queueDir, 'queue.json')
+    const brokenContent = '{"nope"'
+    queueLoggerError.mockClear()
+
+    fs.mkdirSync(queueDir, { recursive: true })
+    fs.writeFileSync(queuePath, brokenContent, 'utf8')
+
+    const jobId = await queue.enqueue({ value: 42 })
+
+    const queueContent = readJson(queuePath)
+    expect(queueContent).toHaveLength(1)
+    expect(queueContent[0].id).toBe(jobId)
+    expect(queueContent[0].payload).toEqual({ value: 42 })
+
+    const backupFiles = fs.readdirSync(queueDir)
+      .filter((fileName) => fileName.startsWith('queue.corrupted.') && fileName.endsWith('.json'))
+
+    expect(backupFiles).toHaveLength(1)
+    expect(fs.readFileSync(path.join(queueDir, backupFiles[0]), 'utf8')).toBe(brokenContent)
+    expect(queueLoggerError).toHaveBeenCalledWith(
+      'Failed to parse queue file',
+      { err: expect.any(Error) },
+    )
+    expect(queueLoggerError).toHaveBeenCalledWith(
+      'Backed up corrupted queue file and recreated queue.json',
+      { backupFile: expect.stringContaining('queue.corrupted.') },
+    )
+
+    await queue.close()
+  })
+
+  test('failed jobs are retained in queue for retry', async () => {
+    const queue = createQueue<{ shouldFail: boolean }>('test-queue', 'local')
+    const queuePath = path.join('.mercato', 'queue', 'test-queue', 'queue.json')
+
+    await queue.enqueue({ shouldFail: true })
+
+    await queue.process((job) => {
+      if (job.payload.shouldFail) throw new Error('transient')
+    }, { limit: 10 })
+
+    const remaining = readJson(queuePath)
+    expect(remaining).toHaveLength(1)
+    expect(remaining[0].attemptCount).toBe(1)
+    expect(remaining[0].availableAt).toBeDefined()
+
+    await queue.close()
+  })
+
+  test('failed jobs are removed after max attempts', async () => {
+    const queue = createQueue<{ value: number }>('test-queue', 'local')
+    const queuePath = path.join('.mercato', 'queue', 'test-queue', 'queue.json')
+
+    await queue.enqueue({ value: 1 })
+
+    // Manually set attemptCount to simulate prior failures
+    const jobs = readJson(queuePath)
+    jobs[0].attemptCount = 2
+    jobs[0].availableAt = undefined
+    fs.writeFileSync(queuePath, JSON.stringify(jobs, null, 2), 'utf8')
+
+    await queue.process(() => { throw new Error('permanent') }, { limit: 10 })
+
+    const remaining = readJson(queuePath)
+    expect(remaining).toHaveLength(0)
+
+    await queue.close()
+  })
+
+  test('retry jobs include exponential backoff delay', async () => {
+    const queue = createQueue<{ value: number }>('test-queue', 'local')
+    const queuePath = path.join('.mercato', 'queue', 'test-queue', 'queue.json')
+
+    await queue.enqueue({ value: 1 })
+
+    const beforeProcess = Date.now()
+
+    await queue.process(() => { throw new Error('fail') }, { limit: 10 })
+
+    const remaining = readJson(queuePath)
+    expect(remaining).toHaveLength(1)
+    const availableAt = new Date(remaining[0].availableAt).getTime()
+    expect(availableAt).toBeGreaterThanOrEqual(beforeProcess + 1000)
+
+    await queue.close()
+  })
+
+  test('attempt number is passed correctly in job context', async () => {
+    const queue = createQueue<{ value: number }>('test-queue', 'local')
+    const queuePath = path.join('.mercato', 'queue', 'test-queue', 'queue.json')
+    const attempts: number[] = []
+
+    await queue.enqueue({ value: 1 })
+
+    // Set attemptCount to 1 to simulate a retry
+    const jobs = readJson(queuePath)
+    jobs[0].attemptCount = 1
+    jobs[0].availableAt = undefined
+    fs.writeFileSync(queuePath, JSON.stringify(jobs, null, 2), 'utf8')
+
+    await queue.process((_job, ctx) => {
+      attempts.push(ctx.attemptNumber)
+    }, { limit: 10 })
+
+    expect(attempts).toEqual([2])
+
+    await queue.close()
+  })
+
   test('job context contains correct information', async () => {
     const queue = createQueue<{ value: number }>('context-test', 'local')
     let capturedContext: any = null
@@ -186,6 +390,86 @@ describe('Queue - local strategy', () => {
     expect(capturedContext.jobId).toBe(jobId)
     expect(capturedContext.attemptNumber).toBe(1)
     expect(capturedContext.queueName).toBe('context-test')
+
+    await queue.close()
+  })
+
+  // Regression: queue operations MUST use async fs.promises.* so they do not
+  // block the Node.js event loop. See GitHub issue #1401.
+  test('queue operations do not call synchronous fs APIs on queue files', async () => {
+    const queueDir = path.join('.mercato', 'queue', 'sync-free')
+    const touchesQueue = (args: unknown[]) =>
+      args.some((arg) => typeof arg === 'string' && arg.includes(queueDir))
+
+    const syncCalls: string[] = []
+    const mkdirSpy = jest.spyOn(fs, 'mkdirSync').mockImplementation((...args: any[]) => {
+      if (touchesQueue(args)) syncCalls.push(`mkdirSync(${args[0]})`)
+      return undefined as any
+    })
+    const readSpy = jest.spyOn(fs, 'readFileSync').mockImplementation((...args: any[]) => {
+      if (touchesQueue(args)) syncCalls.push(`readFileSync(${args[0]})`)
+      return '' as any
+    })
+    const writeSpy = jest.spyOn(fs, 'writeFileSync').mockImplementation((...args: any[]) => {
+      if (touchesQueue(args)) syncCalls.push(`writeFileSync(${args[0]})`)
+      return undefined as any
+    })
+
+    try {
+      const queue = createQueue<{ value: number }>('sync-free', 'local')
+
+      await queue.enqueue({ value: 1 })
+      await queue.enqueue({ value: 2 })
+      await queue.getJobCounts()
+      await queue.process((_job) => {}, { limit: 10 })
+      await queue.clear()
+      await queue.close()
+
+      expect(syncCalls).toEqual([])
+    } finally {
+      mkdirSpy.mockRestore()
+      readSpy.mockRestore()
+      writeSpy.mockRestore()
+    }
+  })
+
+  // Regression: serialize enqueue calls so async fs writes cannot clobber
+  // each other. Before the async conversion this was trivially safe because
+  // sync I/O executed atomically. With async fs a mutex is required.
+  test('concurrent enqueues do not lose jobs', async () => {
+    const queue = createQueue<{ value: number }>('concurrent-queue', 'local')
+    const queuePath = path.join('.mercato', 'queue', 'concurrent-queue', 'queue.json')
+
+    const enqueueCount = 50
+    await Promise.all(
+      Array.from({ length: enqueueCount }, (_, idx) => queue.enqueue({ value: idx })),
+    )
+
+    const stored = readJson(queuePath)
+    expect(stored).toHaveLength(enqueueCount)
+    const storedValues = stored.map((job: any) => job.payload.value).sort((a: number, b: number) => a - b)
+    expect(storedValues).toEqual(Array.from({ length: enqueueCount }, (_, idx) => idx))
+
+    await queue.close()
+  }, 60_000)
+
+  // Regression: jobs enqueued while a batch is running must survive the
+  // subsequent write that removes completed jobs. The pre-fix snapshot-only
+  // write would clobber them.
+  test('jobs enqueued during batch handler are preserved on final write', async () => {
+    const queue = createQueue<{ value: number; latecomer?: boolean }>('race-queue', 'local')
+    const queuePath = path.join('.mercato', 'queue', 'race-queue', 'queue.json')
+
+    await queue.enqueue({ value: 1 })
+
+    await queue.process(async () => {
+      // Mid-handler, enqueue a second job. It should survive the final write.
+      await queue.enqueue({ value: 2, latecomer: true })
+    }, { limit: 10 })
+
+    const remaining = readJson(queuePath)
+    expect(remaining).toHaveLength(1)
+    expect(remaining[0].payload).toEqual({ value: 2, latecomer: true })
 
     await queue.close()
   })

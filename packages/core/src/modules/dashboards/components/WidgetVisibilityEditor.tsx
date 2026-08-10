@@ -3,9 +3,17 @@
 import * as React from 'react'
 import { Button } from '@open-mercato/ui/primitives/button'
 import { Spinner } from '@open-mercato/ui/primitives/spinner'
+import { RadioGroup } from '@open-mercato/ui/primitives/radio'
+import { RadioField } from '@open-mercato/ui/primitives/radio-field'
 import { apiCallOrThrow, readApiResultOrThrow } from '@open-mercato/ui/backend/utils/apiCall'
+import { useGuardedMutation } from '@open-mercato/ui/backend/injection/useGuardedMutation'
 import { flash } from '@open-mercato/ui/backend/FlashMessages'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('dashboards').child({ component: 'WidgetVisibilityEditor' })
+
+const WIDGET_VISIBILITY_CONTEXT_ID = 'dashboards-widget-visibility:save'
 
 type WidgetCatalogItem = {
   id: string
@@ -30,6 +38,7 @@ type UserResponse = {
 type BaseProps = {
   tenantId?: string | null
   organizationId?: string | null
+  preserveOnTenantChange?: boolean
 }
 
 type RoleProps = BaseProps & {
@@ -78,6 +87,8 @@ function resolveWidgetText(
 
 export const WidgetVisibilityEditor = React.forwardRef<WidgetVisibilityEditorHandle, WidgetVisibilityEditorProps>(function WidgetVisibilityEditor(props, ref) {
   const t = useT()
+  const tRef = React.useRef(t)
+  tRef.current = t
 
   const resolveTitle = React.useCallback(
     (widget: WidgetCatalogItem) => resolveWidgetText(t, widget.id, 'title', widget.title),
@@ -88,7 +99,14 @@ export const WidgetVisibilityEditor = React.forwardRef<WidgetVisibilityEditorHan
     (widget: WidgetCatalogItem) => resolveWidgetText(t, widget.id, 'description', widget.description || ''),
     [t],
   )
-  const { kind, targetId, tenantId, organizationId } = props
+  const { kind, targetId, tenantId, organizationId, preserveOnTenantChange = false } = props
+  const { runMutation, retryLastMutation } = useGuardedMutation<{
+    formId: string
+    resourceKind: string
+    retryLastMutation: () => Promise<boolean>
+  }>({
+    contextId: WIDGET_VISIBILITY_CONTEXT_ID,
+  })
   const [catalog, setCatalog] = React.useState<WidgetCatalogItem[]>([])
   const [loading, setLoading] = React.useState(true)
   const [saving, setSaving] = React.useState(false)
@@ -113,7 +131,7 @@ export const WidgetVisibilityEditor = React.forwardRef<WidgetVisibilityEditorHan
     const data = await readApiResultOrThrow<{ items?: unknown[] }>(
       '/api/dashboards/widgets/catalog',
       undefined,
-      { errorMessage: t('dashboards.widgets.error.load', 'Unable to load widget configuration.') },
+      { errorMessage: tRef.current('dashboards.widgets.error.load', 'Unable to load widget configuration.') },
     )
     const items = Array.isArray(data?.items) ? data.items : []
     const mapped = items
@@ -130,16 +148,22 @@ export const WidgetVisibilityEditor = React.forwardRef<WidgetVisibilityEditorHan
       })
       .filter((item: WidgetCatalogItem | null): item is WidgetCatalogItem => item !== null)
     setCatalog(mapped)
-  }, [t])
+  }, [])
 
-  const loadRoleData = React.useCallback(async () => {
+  const tenantIdRef = React.useRef(tenantId)
+  React.useEffect(() => { tenantIdRef.current = tenantId }, [tenantId])
+  const organizationIdRef = React.useRef(organizationId)
+  React.useEffect(() => { organizationIdRef.current = organizationId }, [organizationId])
+  const hasMountedRef = React.useRef(false)
+
+  const loadRoleData = React.useCallback(async (forTenantId: string | null | undefined, forOrganizationId: string | null | undefined) => {
     const params = new URLSearchParams({ roleId: targetId })
-    if (tenantId) params.set('tenantId', tenantId)
-    if (organizationId) params.set('organizationId', organizationId)
+    if (forTenantId) params.set('tenantId', forTenantId)
+    if (forOrganizationId) params.set('organizationId', forOrganizationId)
     const data = await readApiResultOrThrow<RoleResponse>(
       `/api/dashboards/roles/widgets?${params.toString()}`,
       undefined,
-      { errorMessage: t('dashboards.widgets.error.load', 'Unable to load widget configuration.') },
+      { errorMessage: tRef.current('dashboards.widgets.error.load', 'Unable to load widget configuration.') },
     )
     const ids = Array.isArray(data.widgetIds) ? data.widgetIds : []
     setSelected(ids)
@@ -147,16 +171,16 @@ export const WidgetVisibilityEditor = React.forwardRef<WidgetVisibilityEditorHan
     setMode('override')
     setOriginalMode('override')
     setEffective(ids)
-  }, [organizationId, targetId, tenantId, t])
+  }, [targetId])
 
-  const loadUserData = React.useCallback(async () => {
+  const loadUserData = React.useCallback(async (forTenantId: string | null | undefined, forOrganizationId: string | null | undefined) => {
     const params = new URLSearchParams({ userId: targetId })
-    if (tenantId) params.set('tenantId', tenantId)
-    if (organizationId) params.set('organizationId', organizationId)
+    if (forTenantId) params.set('tenantId', forTenantId)
+    if (forOrganizationId) params.set('organizationId', forOrganizationId)
     const data = await readApiResultOrThrow<UserResponse>(
       `/api/dashboards/users/widgets?${params.toString()}`,
       undefined,
-      { errorMessage: t('dashboards.widgets.error.load', 'Unable to load widget configuration.') },
+      { errorMessage: tRef.current('dashboards.widgets.error.load', 'Unable to load widget configuration.') },
     )
     const ids = Array.isArray(data.widgetIds) ? data.widgetIds : []
     setSelected(ids)
@@ -164,7 +188,7 @@ export const WidgetVisibilityEditor = React.forwardRef<WidgetVisibilityEditorHan
     setMode(data.mode || 'inherit')
     setOriginalMode(data.mode || 'inherit')
     setEffective(Array.isArray(data.effectiveWidgetIds) ? data.effectiveWidgetIds : [])
-  }, [organizationId, targetId, tenantId, t])
+  }, [targetId])
 
   React.useEffect(() => {
     let cancelled = false
@@ -172,21 +196,43 @@ export const WidgetVisibilityEditor = React.forwardRef<WidgetVisibilityEditorHan
       setLoading(true)
       setError(null)
       try {
-        await loadCatalog()
-        if (kind === 'role') await loadRoleData()
-        else await loadUserData()
+        await Promise.all([
+          loadCatalog(),
+          kind === 'role'
+            ? loadRoleData(tenantIdRef.current, organizationIdRef.current)
+            : loadUserData(tenantIdRef.current, organizationIdRef.current),
+        ])
       } catch (err) {
-        console.error('Failed to load widget visibility data', err)
+        logger.error('Failed to load widget visibility data', { err })
         if (!cancelled) {
-          setError(t('dashboards.widgets.error.load', 'Unable to load widget configuration.'))
+          setError(tRef.current('dashboards.widgets.error.load', 'Unable to load widget configuration.'))
         }
       } finally {
-        if (!cancelled) setLoading(false)
+        if (!cancelled) {
+          setLoading(false)
+          hasMountedRef.current = true
+        }
       }
     }
     load()
     return () => { cancelled = true }
-  }, [kind, loadCatalog, loadRoleData, loadUserData, t])
+  }, [kind, loadCatalog, loadRoleData, loadUserData])
+
+  React.useEffect(() => {
+    if (!hasMountedRef.current) return
+    if (preserveOnTenantChange) return
+    let cancelled = false
+    async function refetch() {
+      try {
+        if (kind === 'role') await loadRoleData(tenantId, organizationId)
+        else await loadUserData(tenantId, organizationId)
+      } catch (err) {
+        logger.error('Failed to reload widget visibility data', { err })
+      }
+    }
+    refetch()
+    return () => { cancelled = true }
+  }, [tenantId, organizationId, kind, loadRoleData, loadUserData, preserveOnTenantChange])
 
   const toggle = React.useCallback((id: string) => {
     setSelected((prev) => (prev.includes(id) ? prev.filter((value) => value !== id) : [...prev, id]))
@@ -212,11 +258,21 @@ export const WidgetVisibilityEditor = React.forwardRef<WidgetVisibilityEditorHan
           organizationId: organizationId ?? null,
           widgetIds: selected,
         }
-        await apiCallOrThrow('/api/dashboards/roles/widgets', {
-          method: 'PUT',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(payload),
-        }, { errorMessage: saveError })
+        // optimistic-lock-exempt: per-role widget visibility preference
+        await runMutation({
+          operation: () =>
+            apiCallOrThrow('/api/dashboards/roles/widgets', {
+              method: 'PUT',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify(payload),
+            }, { errorMessage: saveError }),
+          context: {
+            formId: WIDGET_VISIBILITY_CONTEXT_ID,
+            resourceKind: 'dashboards.role_widget_visibility',
+            retryLastMutation,
+          },
+          mutationPayload: payload,
+        })
         setOriginal(selected)
         setOriginalMode('override')
         setEffective(selected)
@@ -228,11 +284,21 @@ export const WidgetVisibilityEditor = React.forwardRef<WidgetVisibilityEditorHan
           mode,
           widgetIds: selected,
         }
-        await apiCallOrThrow('/api/dashboards/users/widgets', {
-          method: 'PUT',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(payload),
-        }, { errorMessage: saveError })
+        // optimistic-lock-exempt: per-user widget visibility preference
+        await runMutation({
+          operation: () =>
+            apiCallOrThrow('/api/dashboards/users/widgets', {
+              method: 'PUT',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify(payload),
+            }, { errorMessage: saveError }),
+          context: {
+            formId: WIDGET_VISIBILITY_CONTEXT_ID,
+            resourceKind: 'dashboards.user_widget_visibility',
+            retryLastMutation,
+          },
+          mutationPayload: payload,
+        })
         setOriginal(selected)
         if (mode === 'inherit') {
           const refreshed = await readApiResultOrThrow<UserResponse>(
@@ -249,12 +315,12 @@ export const WidgetVisibilityEditor = React.forwardRef<WidgetVisibilityEditorHan
       }
       try { flash(t('dashboards.widgets.flash.saved', 'Dashboard widgets updated'), 'success') } catch {}
     } catch (err) {
-      console.error('Failed to save widget visibility', err)
+      logger.error('Failed to save widget visibility', { err })
       setError(t('dashboards.widgets.error.save', 'Unable to save dashboard widget preferences.'))
     } finally {
       setSaving(false)
     }
-  }, [catalog.length, dirty, error, kind, loading, mode, organizationId, selected, t, targetId, tenantId])
+  }, [catalog.length, dirty, error, kind, loading, mode, organizationId, retryLastMutation, runMutation, selected, t, targetId, tenantId])
 
   React.useImperativeHandle(ref, () => ({ save }), [save])
 
@@ -277,32 +343,25 @@ export const WidgetVisibilityEditor = React.forwardRef<WidgetVisibilityEditorHan
       )}
 
       {kind === 'user' && (
-        <div className="flex items-center gap-3 rounded-md border bg-muted/30 px-3 py-2">
-          <label className="flex items-center gap-2 text-sm">
-            <input
-              type="radio"
-              name="widgetOverride"
-              value="inherit"
-              checked={mode === 'inherit'}
-              onChange={() => setMode('inherit')}
-            />
-            {t('dashboards.widgets.mode.inherit', 'Inherit from roles')}
-          </label>
-          <label className="flex items-center gap-2 text-sm">
-            <input
-              type="radio"
-              name="widgetOverride"
-              value="override"
-              checked={mode === 'override'}
-              onChange={() => setMode('override')}
-            />
-            {t('dashboards.widgets.mode.override', 'Override for this user')}
-          </label>
-        </div>
+        <RadioGroup
+          className="flex flex-row items-center gap-3 rounded-md border bg-muted/30 px-3 py-2"
+          name="widgetOverride"
+          value={mode}
+          onValueChange={(next) => setMode(next as 'inherit' | 'override')}
+        >
+          <RadioField
+            value="inherit"
+            label={t('dashboards.widgets.mode.inherit', 'Inherit from roles')}
+          />
+          <RadioField
+            value="override"
+            label={t('dashboards.widgets.mode.override', 'Override for this user')}
+          />
+        </RadioGroup>
       )}
 
       {kind === 'user' && mode === 'inherit' && (
-        <div className="rounded-md border border-muted bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+        <div className="rounded-md border border-muted bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
           {t('dashboards.widgets.mode.hint', 'This user currently inherits widgets from their assigned roles. Switch to override to customize.')}
         </div>
       )}

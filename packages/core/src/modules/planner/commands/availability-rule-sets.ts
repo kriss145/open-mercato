@@ -15,7 +15,18 @@ import {
   type PlannerAvailabilityRuleSetCreateInput,
   type PlannerAvailabilityRuleSetUpdateInput,
 } from '../data/validators'
-import { ensureOrganizationScope, ensureTenantScope, extractUndoPayload } from './shared'
+import { plannerAvailabilityRuleSetCrudEvents } from '../lib/crud'
+import { makeCreateRedo } from '@open-mercato/shared/lib/commands/redo'
+import {
+  applyScopeToWhere,
+  commandActorScope,
+  ensureOrganizationScope,
+  ensureTenantScope,
+  explicitPlannerCommandScope,
+  extractUndoPayload,
+  scopeForDecryption,
+  type PlannerCommandScope,
+} from './shared'
 import { E } from '#generated/entities.ids.generated'
 
 const availabilityRuleSetCrudIndexer: CrudIndexerConfig<PlannerAvailabilityRuleSet> = {
@@ -41,13 +52,14 @@ type AvailabilityRuleSetUndoPayload = {
 async function loadAvailabilityRuleSetSnapshot(
   em: EntityManager,
   id: string,
+  scope: PlannerCommandScope,
 ): Promise<AvailabilityRuleSetSnapshot | null> {
   const ruleSet = await findOneWithDecryption(
     em,
     PlannerAvailabilityRuleSet,
-    { id },
+    applyScopeToWhere<PlannerAvailabilityRuleSet>({ id }, scope),
     undefined,
-    { tenantId: null, organizationId: null },
+    scopeForDecryption(scope),
   )
   if (!ruleSet) return null
   const custom = await loadCustomFieldSnapshot(em, {
@@ -107,19 +119,28 @@ const createAvailabilityRuleSetCommand: CommandHandler<PlannerAvailabilityRuleSe
         organizationId: record.organizationId,
         tenantId: record.tenantId,
       },
+      events: plannerAvailabilityRuleSetCrudEvents,
       indexer: availabilityRuleSetCrudIndexer,
     })
     return { ruleSetId: record.id }
   },
-  captureAfter: async (_input, result, ctx) => {
+  captureAfter: async (input, result, ctx) => {
     const em = (ctx.container.resolve('em') as EntityManager).fork()
-    const snapshot = await loadAvailabilityRuleSetSnapshot(em, result.ruleSetId)
+    const snapshot = await loadAvailabilityRuleSetSnapshot(
+      em,
+      result.ruleSetId,
+      explicitPlannerCommandScope(input.tenantId, input.organizationId),
+    )
     if (!snapshot) return null
     return snapshot
   },
-  buildLog: async ({ result, ctx }) => {
+  buildLog: async ({ input, result, ctx }) => {
     const em = (ctx.container.resolve('em') as EntityManager).fork()
-    const snapshot = await loadAvailabilityRuleSetSnapshot(em, result.ruleSetId)
+    const snapshot = await loadAvailabilityRuleSetSnapshot(
+      em,
+      result.ruleSetId,
+      explicitPlannerCommandScope(input.tenantId, input.organizationId),
+    )
     if (!snapshot) return null
     const { translate } = await resolveTranslations()
     return {
@@ -157,10 +178,29 @@ const createAvailabilityRuleSetCommand: CommandHandler<PlannerAvailabilityRuleSe
           organizationId: ruleSet.organizationId,
           tenantId: ruleSet.tenantId,
         },
-        indexer: availabilityRuleSetCrudIndexer,
+        events: plannerAvailabilityRuleSetCrudEvents,
+      indexer: availabilityRuleSetCrudIndexer,
       })
     }
   },
+  redo: makeCreateRedo<PlannerAvailabilityRuleSet, AvailabilityRuleSetSnapshot, PlannerAvailabilityRuleSetCreateInput, { ruleSetId: string }>({
+    entityClass: PlannerAvailabilityRuleSet,
+    getSnapshotId: (snapshot) => snapshot.id,
+    seedFromSnapshot: (snapshot) => ({
+      id: snapshot.id,
+      tenantId: snapshot.tenantId,
+      organizationId: snapshot.organizationId,
+      name: snapshot.name,
+      description: snapshot.description ?? null,
+      timezone: snapshot.timezone,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      deletedAt: null,
+    }),
+    buildResult: (entity) => ({ ruleSetId: entity.id }),
+    events: plannerAvailabilityRuleSetCrudEvents,
+    indexer: availabilityRuleSetCrudIndexer,
+  }),
 }
 
 const updateAvailabilityRuleSetCommand: CommandHandler<PlannerAvailabilityRuleSetUpdateInput, { ruleSetId: string }> = {
@@ -168,19 +208,20 @@ const updateAvailabilityRuleSetCommand: CommandHandler<PlannerAvailabilityRuleSe
   async prepare(input, ctx) {
     const { parsed } = parseWithCustomFields(plannerAvailabilityRuleSetUpdateSchema, input)
     const em = (ctx.container.resolve('em') as EntityManager)
-    const snapshot = await loadAvailabilityRuleSetSnapshot(em, parsed.id)
+    const snapshot = await loadAvailabilityRuleSetSnapshot(em, parsed.id, commandActorScope(ctx))
     if (!snapshot) return {}
     return { before: snapshot }
   },
   async execute(input, ctx) {
     const { parsed, custom } = parseWithCustomFields(plannerAvailabilityRuleSetUpdateSchema, input)
     const em = (ctx.container.resolve('em') as EntityManager).fork()
+    const scope = commandActorScope(ctx)
     const record = await findOneWithDecryption(
       em,
       PlannerAvailabilityRuleSet,
-      { id: parsed.id, deletedAt: null },
+      applyScopeToWhere<PlannerAvailabilityRuleSet>({ id: parsed.id, deletedAt: null }, scope),
       undefined,
-      { tenantId: ctx.auth?.tenantId ?? null, organizationId: ctx.auth?.orgId ?? null },
+      scopeForDecryption(scope),
     )
     if (!record) throw new CrudHttpError(404, { error: 'Planner availability rule set not found.' })
     ensureTenantScope(ctx, record.tenantId)
@@ -209,6 +250,7 @@ const updateAvailabilityRuleSetCommand: CommandHandler<PlannerAvailabilityRuleSe
         organizationId: record.organizationId,
         tenantId: record.tenantId,
       },
+      events: plannerAvailabilityRuleSetCrudEvents,
       indexer: availabilityRuleSetCrudIndexer,
     })
     return { ruleSetId: record.id }
@@ -217,7 +259,11 @@ const updateAvailabilityRuleSetCommand: CommandHandler<PlannerAvailabilityRuleSe
     const before = snapshots.before as AvailabilityRuleSetSnapshot | undefined
     if (!before) return null
     const em = (ctx.container.resolve('em') as EntityManager).fork()
-    const after = await loadAvailabilityRuleSetSnapshot(em, before.id)
+    const after = await loadAvailabilityRuleSetSnapshot(
+      em,
+      before.id,
+      explicitPlannerCommandScope(before.tenantId, before.organizationId),
+    )
     if (!after) return null
     const changes = buildChanges(before as unknown as Record<string, unknown>, after as unknown as Record<string, unknown>, [
       'name',
@@ -284,6 +330,7 @@ const updateAvailabilityRuleSetCommand: CommandHandler<PlannerAvailabilityRuleSe
         organizationId: ruleSet.organizationId,
         tenantId: ruleSet.tenantId,
       },
+      events: plannerAvailabilityRuleSetCrudEvents,
       indexer: availabilityRuleSetCrudIndexer,
     })
   },
@@ -295,7 +342,7 @@ const deleteAvailabilityRuleSetCommand: CommandHandler<{ id?: string }, { ruleSe
     const id = input?.id
     if (!id) throw new CrudHttpError(400, { error: 'Availability rule set id is required.' })
     const em = (ctx.container.resolve('em') as EntityManager)
-    const snapshot = await loadAvailabilityRuleSetSnapshot(em, id)
+    const snapshot = await loadAvailabilityRuleSetSnapshot(em, id, commandActorScope(ctx))
     if (!snapshot) return {}
     return { before: snapshot }
   },
@@ -303,12 +350,13 @@ const deleteAvailabilityRuleSetCommand: CommandHandler<{ id?: string }, { ruleSe
     const id = input?.id
     if (!id) throw new CrudHttpError(400, { error: 'Availability rule set id is required.' })
     const em = (ctx.container.resolve('em') as EntityManager).fork()
+    const scope = commandActorScope(ctx)
     const record = await findOneWithDecryption(
       em,
       PlannerAvailabilityRuleSet,
-      { id, deletedAt: null },
+      applyScopeToWhere<PlannerAvailabilityRuleSet>({ id, deletedAt: null }, scope),
       undefined,
-      { tenantId: ctx.auth?.tenantId ?? null, organizationId: ctx.auth?.orgId ?? null },
+      scopeForDecryption(scope),
     )
     if (!record) throw new CrudHttpError(404, { error: 'Planner availability rule set not found.' })
     ensureTenantScope(ctx, record.tenantId)
@@ -328,6 +376,7 @@ const deleteAvailabilityRuleSetCommand: CommandHandler<{ id?: string }, { ruleSe
         organizationId: record.organizationId,
         tenantId: record.tenantId,
       },
+      events: plannerAvailabilityRuleSetCrudEvents,
       indexer: availabilityRuleSetCrudIndexer,
     })
     return { ruleSetId: record.id }
@@ -400,6 +449,7 @@ const deleteAvailabilityRuleSetCommand: CommandHandler<{ id?: string }, { ruleSe
         organizationId: ruleSet.organizationId,
         tenantId: ruleSet.tenantId,
       },
+      events: plannerAvailabilityRuleSetCrudEvents,
       indexer: availabilityRuleSetCrudIndexer,
     })
   },

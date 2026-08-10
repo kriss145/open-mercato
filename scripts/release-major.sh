@@ -2,8 +2,18 @@
 # Major release: bump major version, build, and publish with @latest tag
 set -euo pipefail
 
-echo "==> Bumping major version..."
-yarn workspaces foreach -A --no-private version major
+if [ "${CI:-}" != "true" ]; then
+  echo "==> Syncing create-app template from apps/mercato/src..."
+  yarn template:sync:fix
+else
+  echo "==> Skipping template sync in CI"
+fi
+
+echo "==> Bumping major version (packages + root manifest)..."
+./scripts/bump-version.sh major > /dev/null
+
+echo "==> Verifying the target version is not published yet..."
+./scripts/check-version-unpublished.sh
 
 echo "==> Building packages..."
 yarn build:packages
@@ -15,6 +25,6 @@ echo "==> Rebuilding packages with generated files..."
 yarn build:packages
 
 echo "==> Publishing with @latest tag..."
-yarn workspaces foreach -A --no-private npm publish --access public
+./scripts/publish-packages.sh
 
 echo "==> Done!"

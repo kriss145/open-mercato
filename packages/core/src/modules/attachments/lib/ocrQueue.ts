@@ -1,10 +1,14 @@
 import type { EntityManager } from '@mikro-orm/postgresql'
 import { Attachment, AttachmentPartition } from '../data/entities'
 import { OcrService } from './ocrService'
+import type { StorageDriver } from './drivers/types'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('attachments').child({ component: 'ocr' })
 
 export type OcrRequestedEvent = {
   attachmentId: string
-  filePath: string
+  storagePath: string
   mimeType: string
   partitionCode: string
   organizationId: string | null
@@ -13,13 +17,15 @@ export type OcrRequestedEvent = {
 
 export async function processAttachmentOcr(
   em: EntityManager,
-  payload: OcrRequestedEvent
+  payload: OcrRequestedEvent,
+  driver: StorageDriver,
 ): Promise<void> {
-  const { attachmentId, filePath, mimeType, partitionCode } = payload
+  const { attachmentId, storagePath, mimeType, partitionCode } = payload
 
-  console.log(`[attachments.ocr] Processing started for attachment: ${attachmentId}`)
+  logger.info('Processing started', { attachmentId })
   const startTime = Date.now()
 
+  const { filePath, cleanup } = await driver.toLocalPath(partitionCode, storagePath)
   try {
     const partition = await em.findOne(AttachmentPartition, { code: partitionCode })
     const resolvedModel = partition?.ocrModel ?? process.env.OCR_MODEL ?? 'gpt-4o'
@@ -27,7 +33,7 @@ export async function processAttachmentOcr(
     const ocrService = new OcrService()
 
     if (!ocrService.available) {
-      console.warn(`[attachments.ocr] OPENAI_API_KEY not configured, skipping OCR for: ${attachmentId}`)
+      logger.warn('OPENAI_API_KEY not configured, skipping OCR', { attachmentId })
       return
     }
 
@@ -38,20 +44,20 @@ export async function processAttachmentOcr(
     })
 
     if (!result) {
-      console.log(`[attachments.ocr] No content extracted for attachment: ${attachmentId}`)
+      logger.info('No content extracted', { attachmentId })
       return
     }
 
     const attachment = await em.findOne(Attachment, { id: attachmentId })
     if (!attachment) {
-      console.error(`[attachments.ocr] Attachment not found: ${attachmentId}`)
+      logger.error('Attachment not found', { attachmentId })
       return
     }
 
     attachment.content = result.content
-    await em.persistAndFlush(attachment)
+    await em.persist(attachment).flush()
 
-    console.log(`[attachments.ocr] Processing completed:`, {
+    logger.info('Processing completed', {
       attachmentId,
       pageCount: result.pageCount,
       contentLength: result.content.length,
@@ -59,9 +65,10 @@ export async function processAttachmentOcr(
       totalTimeMs: Date.now() - startTime,
     })
   } catch (error) {
-    console.error(`[attachments.ocr] Processing failed:`, {
-      attachmentId,
-      error: error instanceof Error ? error.message : String(error),
+    logger.error('Processing failed', { attachmentId, err: error })
+  } finally {
+    await cleanup().catch((cleanupError) => {
+      logger.warn('Temp file cleanup failed', { err: cleanupError })
     })
   }
 }
@@ -69,21 +76,30 @@ export async function processAttachmentOcr(
 export async function requestOcrProcessing(
   em: EntityManager,
   attachment: Attachment,
-  filePath: string
+  driver: StorageDriver,
+  storagePath: string,
 ): Promise<void> {
   const payload: OcrRequestedEvent = {
     attachmentId: attachment.id,
-    filePath,
+    storagePath,
     mimeType: attachment.mimeType,
     partitionCode: attachment.partitionCode,
     organizationId: attachment.organizationId ?? null,
     tenantId: attachment.tenantId ?? null,
   }
 
+  if (typeof (em as { fork?: unknown })?.fork !== 'function') {
+    throw new Error(
+      '[internal] attachments OCR background processing requires an EntityManager that exposes fork(); ' +
+        'reusing the request-scoped EntityManager in the async worker would race with later request mutations.',
+    )
+  }
+
+  const workerEm = em.fork()
+
   setImmediate(() => {
-    const workerEm = typeof (em as any)?.fork === 'function' ? (em as any).fork() : em
-    processAttachmentOcr(workerEm, payload).catch((error) => {
-      console.error(`[attachments.ocr] Background processing error:`, error)
+    processAttachmentOcr(workerEm, payload, driver).catch((error) => {
+      logger.error('Background processing error', { err: error })
     })
   })
 }

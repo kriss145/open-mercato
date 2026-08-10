@@ -27,6 +27,9 @@ import {
   findWithDecryption,
   findOneWithDecryption,
 } from "@open-mercato/shared/lib/encryption/find";
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('catalog')
 
 const rawBodySchema = z.object({}).passthrough();
 
@@ -235,14 +238,14 @@ const crud = makeCrudRoute({
         Object.assign(filters, cfFilters);
       } catch (err) {
         // Custom field filter parsing may fail for non-existent or misconfigured fields.
-        if (process.env.NODE_ENV === 'development') console.warn('[catalog:prices] custom field filter error', err);
+        logger.debug('catalog.prices custom field filter error', { err });
       }
       if (
         typeof query.quantity === "number" &&
         Number.isFinite(query.quantity) &&
         query.quantity > 0
       ) {
-        const normalizedQuantity = await resolveNormalizedQuantityForFilter({
+        await resolveNormalizedQuantityForFilter({
           em,
           organizationId,
           tenantId,
@@ -251,11 +254,6 @@ const crud = makeCrudRoute({
           quantity: query.quantity,
           quantityUnit: query.quantityUnit,
         });
-        filters.min_quantity = { $lte: normalizedQuantity };
-        filters.$or = [
-          { max_quantity: null },
-          { max_quantity: { $gte: normalizedQuantity } },
-        ];
       }
       return filters;
     },
@@ -267,6 +265,58 @@ const crud = makeCrudRoute({
         if (key.startsWith("cf:")) delete normalized[key];
       }
       return { ...normalized, ...cfEntries };
+    },
+  },
+  hooks: {
+    afterList: async (payload, ctx) => {
+      const query = ctx.query as PriceQuery;
+      if (
+        typeof query.quantity !== "number" ||
+        !Number.isFinite(query.quantity) ||
+        query.quantity <= 0
+      ) {
+        return;
+      }
+
+      const organizationId =
+        ctx.selectedOrganizationId ?? ctx.auth?.orgId ?? null;
+      const tenantId = ctx.auth?.tenantId ?? null;
+      if (!organizationId || !tenantId) return;
+
+      const em = ctx.container.resolve("em") as EntityManager;
+      const normalizedQuantity = await resolveNormalizedQuantityForFilter({
+        em,
+        organizationId,
+        tenantId,
+        productId: query.productId,
+        variantId: query.variantId,
+        quantity: query.quantity,
+        quantityUnit: query.quantityUnit,
+      });
+
+      const filteredItems = payload.items.filter((item: unknown) => {
+        const row = item as Record<string, unknown>;
+        const minQuantity = Number(row.min_quantity ?? row.minQuantity ?? 1);
+        if (!Number.isFinite(minQuantity) || minQuantity > normalizedQuantity) {
+          return false;
+        }
+
+        const maxRaw = row.max_quantity ?? row.maxQuantity ?? null;
+        if (maxRaw === null || maxRaw === undefined) return true;
+
+        const maxQuantity = Number(maxRaw);
+        return Number.isFinite(maxQuantity) && maxQuantity >= normalizedQuantity;
+      });
+
+      payload.items = filteredItems;
+      payload.total = filteredItems.length;
+      payload.totalPages =
+        filteredItems.length === 0
+          ? 0
+          : Math.max(
+              1,
+              Math.ceil(filteredItems.length / Math.max(payload.pageSize, 1)),
+            );
     },
   },
   actions: {

@@ -3,16 +3,19 @@
 import * as React from 'react'
 import { MapPin, Truck } from 'lucide-react'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@open-mercato/ui/primitives/dialog'
+import { useDialogKeyHandler } from '@open-mercato/ui/hooks/useDialogKeyHandler'
 import { Input } from '@open-mercato/ui/primitives/input'
 import { Textarea } from '@open-mercato/ui/primitives/textarea'
 import { Label } from '@open-mercato/ui/primitives/label'
 import { Switch } from '@open-mercato/ui/primitives/switch'
 import { CrudForm, type CrudCustomFieldRenderProps, type CrudField, type CrudFormGroup } from '@open-mercato/ui/backend/CrudForm'
 import { LookupSelect, type LookupSelectItem } from '@open-mercato/ui/backend/inputs'
-import { apiCall } from '@open-mercato/ui/backend/utils/apiCall'
+import { apiCall, withScopedApiRequestHeaders } from '@open-mercato/ui/backend/utils/apiCall'
+import { buildOptimisticLockHeader } from '@open-mercato/ui/backend/utils/optimisticLock'
 import { createCrud, updateCrud } from '@open-mercato/ui/backend/utils/crud'
 import { collectCustomFieldValues } from '@open-mercato/ui/backend/utils/customFieldValues'
 import { createCrudFormError } from '@open-mercato/ui/backend/utils/serverErrors'
+import { handleSectionMutationError } from './optimisticLock'
 import { flash } from '@open-mercato/ui/backend/FlashMessages'
 import { cn } from '@open-mercato/shared/lib/utils'
 import { E } from '#generated/entities.ids.generated'
@@ -22,6 +25,9 @@ import { formatMoney, normalizeNumber } from './lineItemUtils'
 import type { OrderLine, ShipmentRow } from './shipmentTypes'
 import { formatAddressString, type AddressFormatStrategy, type AddressValue } from '@open-mercato/core/modules/customers/utils/addressFormat'
 import { normalizeCustomFieldSubmitValue, extractCustomFieldValues } from './customFieldHelpers'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('sales')
 
 type ShippingMethodOption = {
   id: string
@@ -43,6 +49,7 @@ type ShipmentDialogProps = {
   currencyCode?: string | null
   organizationId: string | null
   tenantId: string | null
+  documentUpdatedAt?: string | null
   computeAvailable: (lineId: string, excludeShipmentId?: string | null) => number
   shippingAddressSnapshot?: NormalizedAddressSnapshot | Record<string, unknown> | null
   onClose: () => void
@@ -62,6 +69,34 @@ type StatusOption = {
   value: string
   label: string
   color: string | null
+}
+
+function mergeShippingMethodOptions(
+  options: ShippingMethodOption[],
+  selected: ShippingMethodOption | null,
+): ShippingMethodOption[] {
+  if (!selected) return options
+  if (options.some((option) => option.id === selected.id)) return options
+  return [selected, ...options]
+}
+
+function mergeStatusOptions(options: StatusOption[], selected: StatusOption | null): StatusOption[] {
+  if (!selected) return options
+  if (options.some((option) => option.id === selected.id)) return options
+  return [selected, ...options]
+}
+
+function mapStatusOption(entry: Record<string, unknown>): StatusOption | null {
+  const id = typeof entry.id === 'string' ? entry.id : null
+  const value = typeof entry.value === 'string' ? entry.value : null
+  if (!id || !value) return null
+  const label =
+    typeof entry.label === 'string' && entry.label.trim().length
+      ? entry.label
+      : value
+  const color =
+    typeof entry.color === 'string' && entry.color.trim().length ? entry.color : null
+  return { id, value, label, color }
 }
 
 const ADDRESS_SNAPSHOT_KEY = 'shipmentAddressSnapshot'
@@ -171,7 +206,7 @@ const snapshotKey = (snapshot?: NormalizedAddressSnapshot | null): string | null
   if (!snapshot || typeof snapshot !== 'object') return null
   const normalized: Record<string, unknown> = {}
   Object.keys(snapshot)
-    .sort()
+    .sort((a, b) => a.localeCompare(b))
     .forEach((key) => {
       normalized[key] = snapshot[key]
   })
@@ -224,6 +259,20 @@ const extractShipmentAddressSnapshot = (
   return normalizeAddressSnapshot(raw as Record<string, unknown>)
 }
 
+const addressOptionsSignature = (options: ShipmentAddressOption[]): string =>
+  options.map((option) => `${snapshotKey(option.snapshot) ?? ''}::${option.id}`).join('||')
+
+function useStableAddressOptions(options: ShipmentAddressOption[]): ShipmentAddressOption[] {
+  const signature = addressOptionsSignature(options)
+  const stableRef = React.useRef(options)
+  const signatureRef = React.useRef(signature)
+  if (signatureRef.current !== signature) {
+    signatureRef.current = signature
+    stableRef.current = options
+  }
+  return stableRef.current
+}
+
 export function ShipmentDialog({
   open,
   mode,
@@ -233,6 +282,7 @@ export function ShipmentDialog({
   currencyCode,
   organizationId,
   tenantId,
+  documentUpdatedAt,
   computeAvailable,
   shippingAddressSnapshot,
   onClose,
@@ -246,6 +296,13 @@ export function ShipmentDialog({
   const [addressOptions, setAddressOptions] = React.useState<ShipmentAddressOption[]>([])
   const [addressLoading, setAddressLoading] = React.useState(false)
   const [addressError, setAddressError] = React.useState<string | null>(null)
+  const addressLoadPromiseRef = React.useRef<{
+    orderId: string
+    promise: Promise<ShipmentAddressOption[]>
+  } | null>(null)
+  const currentAddressOrderIdRef = React.useRef(orderId)
+  currentAddressOrderIdRef.current = orderId
+  const initializedDialogKeyRef = React.useRef<string | null>(null)
   const [documentStatuses, setDocumentStatuses] = React.useState<StatusOption[]>([])
   const [lineStatuses, setLineStatuses] = React.useState<StatusOption[]>([])
   const [shipmentStatuses, setShipmentStatuses] = React.useState<StatusOption[]>([])
@@ -292,7 +349,7 @@ export function ShipmentDialog({
     [shipmentAddressSnapshot, t],
   )
 
-  const baseAddressOptions = React.useMemo(
+  const computedBaseAddressOptions = React.useMemo(
     () =>
       dedupeAddressOptions(
         [shippingAddressOption, shipmentAddressOption].filter(
@@ -301,6 +358,7 @@ export function ShipmentDialog({
       ),
     [shipmentAddressOption, shippingAddressOption],
   )
+  const baseAddressOptions = useStableAddressOptions(computedBaseAddressOptions)
 
   const preferredAddressId = React.useMemo(() => {
     const shipmentKey = snapshotKey(shipmentAddressSnapshot)
@@ -421,41 +479,59 @@ export function ShipmentDialog({
 
   const mergeAddressOptions = React.useCallback(
     (options: ShipmentAddressOption[]) =>
-      setAddressOptions((prev) => dedupeAddressOptions([...prev, ...options])),
+      setAddressOptions((prev) => {
+        const next = dedupeAddressOptions([...prev, ...options])
+        return next.length === prev.length ? prev : next
+      }),
     [],
   )
 
-  const loadAddressOptions = React.useCallback(async () => {
+  const loadAddressOptions = React.useCallback((): Promise<ShipmentAddressOption[]> => {
+    const activeRequest = addressLoadPromiseRef.current
+    if (activeRequest?.orderId === orderId) return activeRequest.promise
+
     setAddressLoading(true)
-    try {
-      const params = new URLSearchParams({
-        page: '1',
-        pageSize: '100',
-        documentId: orderId,
-        documentKind: 'order',
-      })
-      const response = await apiCall<{ items?: Array<Record<string, unknown>> }>(
-        `/api/sales/document-addresses?${params.toString()}`,
-        undefined,
-        { fallback: { items: [] } },
-      )
-      const items = Array.isArray(response.result?.items) ? response.result.items : []
-      const mapped = items
-        .map((item) => mapDocumentAddressOption(item))
-        .filter((entry): entry is ShipmentAddressOption => Boolean(entry))
-      mergeAddressOptions(mapped)
-      setAddressError(null)
-      return mapped
-    } catch (err) {
-      console.error('sales.shipments.addresses.load', err)
-      setAddressError(
-        t('sales.documents.shipments.addressLoadError', 'Failed to load addresses.'),
-      )
-      return []
-    } finally {
-      setAddressLoading(false)
-    }
-  }, [mapDocumentAddressOption, mergeAddressOptions, orderId, t])
+    const request = (async () => {
+      try {
+        const params = new URLSearchParams({
+          page: '1',
+          pageSize: '100',
+          documentId: orderId,
+          documentKind: 'order',
+        })
+        const response = await apiCall<{ items?: Array<Record<string, unknown>> }>(
+          `/api/sales/document-addresses?${params.toString()}`,
+          undefined,
+          { fallback: { items: [] } },
+        )
+        const items = Array.isArray(response.result?.items) ? response.result.items : []
+        const mapped = items
+          .map((item) => mapDocumentAddressOption(item))
+          .filter((entry): entry is ShipmentAddressOption => Boolean(entry))
+        const loadedOptions = dedupeAddressOptions([...baseAddressOptions, ...mapped])
+        if (currentAddressOrderIdRef.current !== orderId) return baseAddressOptions
+        mergeAddressOptions(loadedOptions)
+        setAddressError(null)
+        return loadedOptions
+      } catch (err) {
+        logger.error('sales.shipments.addresses.load', { err })
+        if (currentAddressOrderIdRef.current === orderId) {
+          setAddressError(
+            t('sales.documents.shipments.addressLoadError', 'Failed to load addresses.'),
+          )
+        }
+        return baseAddressOptions
+      }
+    })()
+    addressLoadPromiseRef.current = { orderId, promise: request }
+    void request.then(() => {
+      if (addressLoadPromiseRef.current?.promise === request) {
+        addressLoadPromiseRef.current = null
+        setAddressLoading(false)
+      }
+    })
+    return request
+  }, [baseAddressOptions, mapDocumentAddressOption, mergeAddressOptions, orderId, t])
 
   const buildPriceSubtitle = React.useCallback(
     (option: ShippingMethodOption): string | undefined => {
@@ -523,11 +599,16 @@ export function ShipmentDialog({
           .map((item) => mapShippingMethod(item))
           .filter((entry): entry is ShippingMethodOption => !!entry)
         if (!query) {
-          setShippingMethods(options)
+          setShippingMethods((current) =>
+            current.reduce(
+              (next, selected) => mergeShippingMethodOptions(next, selected),
+              options,
+            ),
+          )
         }
         return options
       } catch (err) {
-        console.error('sales.shipments.shipping-methods.load', err)
+        logger.error('sales.shipments.shipping-methods.load', { err })
         return []
       } finally {
         if (applyLoadingState) setShippingMethodLoading(false)
@@ -587,6 +668,21 @@ export function ShipmentDialog({
     [],
   )
 
+  const shippingMethodLookupOptions = React.useMemo<LookupSelectItem[]>(
+    () =>
+      shippingMethods.map((option) => ({
+        id: option.id,
+        title: option.name,
+        subtitle: [option.code, buildPriceSubtitle(option)].filter(Boolean).join(' • ') || undefined,
+        icon: (
+          <div className="flex h-8 w-8 items-center justify-center rounded-md bg-primary/10 text-primary">
+            <Truck className="h-4 w-4" />
+          </div>
+        ),
+      })),
+    [buildPriceSubtitle, shippingMethods],
+  )
+
   const loadDocumentStatuses = React.useCallback(async (): Promise<StatusOption[]> => {
     setDocumentStatusLoading(true)
     try {
@@ -614,7 +710,7 @@ export function ShipmentDialog({
       setDocumentStatuses(mapped)
       return mapped
     } catch (err) {
-      console.error('sales.shipments.statuses.load', err)
+      logger.error('sales.shipments.statuses.load', { err })
       setDocumentStatuses([])
       return []
     } finally {
@@ -649,7 +745,7 @@ export function ShipmentDialog({
       setLineStatuses(mapped)
       return mapped
     } catch (err) {
-      console.error('sales.shipments.line-statuses.load', err)
+      logger.error('sales.shipments.line-statuses.load', { err })
       setLineStatuses([])
       return []
     } finally {
@@ -668,28 +764,36 @@ export function ShipmentDialog({
       )
       const items = Array.isArray(response.result?.items) ? response.result.items : []
       const mapped = items
-        .map((entry) => {
-          const id = typeof entry.id === 'string' ? entry.id : null
-          const value = typeof entry.value === 'string' ? entry.value : null
-          if (!id || !value) return null
-          const label =
-            typeof entry.label === 'string' && entry.label.trim().length
-              ? entry.label
-              : value
-          const color =
-            typeof entry.color === 'string' && entry.color.trim().length ? entry.color : null
-          return { id, value, label, color }
-        })
+        .map((entry) => mapStatusOption(entry))
         .filter((entry): entry is StatusOption => Boolean(entry))
-      setShipmentStatuses(mapped)
+      setShipmentStatuses((current) =>
+        current.reduce(
+          (next, selected) => mergeStatusOptions(next, selected),
+          mapped,
+        ),
+      )
       return mapped
     } catch (err) {
-      console.error('sales.shipments.statuses.load', err)
+      logger.error('sales.shipments.statuses.load', { err })
       setShipmentStatuses([])
       return []
     } finally {
       setShipmentStatusLoading(false)
     }
+  }, [])
+
+  const loadShipmentStatusById = React.useCallback(async (statusEntryId: string): Promise<StatusOption | null> => {
+    const response = await apiCall<{ items?: Array<Record<string, unknown>> }>(
+      `/api/sales/shipment-statuses?id=${encodeURIComponent(statusEntryId)}&pageSize=1`,
+      undefined,
+      { fallback: { items: [] } },
+    )
+    const items = Array.isArray(response.result?.items) ? response.result.items : []
+    return (
+      items
+        .map((entry) => mapStatusOption(entry))
+        .find((entry): entry is StatusOption => entry?.id === statusEntryId) ?? null
+    )
   }, [])
 
   const fetchDocumentStatusItems = React.useCallback(
@@ -757,17 +861,32 @@ export function ShipmentDialog({
     [loadShipmentStatuses, renderStatusIcon, shipmentStatuses],
   )
 
+  const shipmentStatusLookupOptions = React.useMemo<LookupSelectItem[]>(
+    () =>
+      shipmentStatuses.map((option) => ({
+        id: option.id,
+        title: option.label,
+        subtitle: option.value,
+        icon: renderStatusIcon(option.color),
+      })),
+    [renderStatusIcon, shipmentStatuses],
+  )
+
   React.useEffect(() => {
-    if (!open) return
+    if (!open) {
+      initializedDialogKeyRef.current = null
+      return
+    }
+    const dialogKey = `${orderId}:${mode}:${shipment?.id ?? 'new'}`
+    if (initializedDialogKeyRef.current === dialogKey) return
+    initializedDialogKeyRef.current = dialogKey
     setFormResetKey((prev) => prev + 1)
     if (!shippingMethods.length) {
       void loadShippingMethods()
     }
     setAddressOptions(baseAddressOptions)
     setAddressError(null)
-    if (!addressOptions.length) {
-      void loadAddressOptions()
-    }
+    void loadAddressOptions()
     if (!shipmentStatuses.length) {
       void loadShipmentStatuses()
     }
@@ -778,7 +897,6 @@ export function ShipmentDialog({
       void loadLineStatuses()
     }
   }, [
-    addressOptions.length,
     baseAddressOptions,
     documentStatuses.length,
     loadAddressOptions,
@@ -788,6 +906,8 @@ export function ShipmentDialog({
     loadShippingMethods,
     mode,
     open,
+    orderId,
+    shipment?.id,
     lineStatuses.length,
     shipmentStatuses.length,
     shippingMethods.length,
@@ -814,17 +934,41 @@ export function ShipmentDialog({
   ])
 
   React.useEffect(() => {
+    const statusEntryId = shipment?.statusEntryId
+    if (!statusEntryId || shipmentStatuses.some((status) => status.id === statusEntryId)) return
+    const fallback =
+      shipment.status || shipment.statusLabel
+        ? {
+            id: statusEntryId,
+            value: shipment.status ?? statusEntryId,
+            label: shipment.statusLabel ?? shipment.status ?? statusEntryId,
+            color: null,
+          }
+        : null
+    setShipmentStatuses((current) => mergeStatusOptions(current, fallback))
+    loadShipmentStatusById(statusEntryId)
+      .then((selected) => {
+        setShipmentStatuses((current) => mergeStatusOptions(current, selected))
+      })
+      .catch(() => {})
+  }, [
+    loadShipmentStatusById,
+    shipment?.status,
+    shipment?.statusEntryId,
+    shipment?.statusLabel,
+    shipmentStatuses,
+  ])
+
+  React.useEffect(() => {
     if (!open) return
     mergeAddressOptions(baseAddressOptions)
   }, [baseAddressOptions, mergeAddressOptions, open])
 
   const fetchAddressItems = React.useCallback(
     async (query?: string): Promise<LookupSelectItem[]> => {
-      if (!addressOptions.length && !addressLoading) {
-        await loadAddressOptions()
-      }
+      const options = addressOptions.length ? addressOptions : await loadAddressOptions()
       const needle = query?.trim().toLowerCase() ?? ''
-      return addressOptions
+      return options
         .filter((option) => {
           if (!needle) return true
           return (
@@ -843,7 +987,7 @@ export function ShipmentDialog({
           ),
         }))
     },
-    [addressLoading, addressOptions, loadAddressOptions],
+    [addressOptions, loadAddressOptions],
   )
 
   const validateItems = React.useCallback(
@@ -972,13 +1116,27 @@ export function ShipmentDialog({
       }
 
       const action = shipment?.id ? updateCrud : createCrud
-      const result = await action(
-        'sales/shipments',
-        shipment?.id ? { id: shipment.id, ...payload } : payload,
-        {
-          errorMessage: t('sales.documents.shipments.errorSave', 'Failed to save shipment.'),
-        },
-      )
+      let result
+      try {
+        result = await withScopedApiRequestHeaders(
+          // The server guards the PARENT order's aggregate version (Gap B) for
+          // both create and update, so send the order's `updated_at`.
+          buildOptimisticLockHeader(documentUpdatedAt ?? undefined),
+          () =>
+            action(
+              'sales/shipments',
+              shipment?.id ? { id: shipment.id, ...payload } : payload,
+              {
+                errorMessage: t('sales.documents.shipments.errorSave', 'Failed to save shipment.'),
+              },
+            ),
+        )
+      } catch (err) {
+        if (handleSectionMutationError(err, t, () => void onSaved())) {
+          return
+        }
+        throw err
+      }
       if (result.ok) {
         const shipmentId = ((result.result as any)?.id as string | undefined) ?? shipment?.id ?? null
         const shouldAddShippingAdjustment =
@@ -1042,7 +1200,7 @@ export function ShipmentDialog({
               )
               emitSalesDocumentTotalsRefresh({ documentId: orderId, kind: 'order' })
             } catch (err) {
-              console.warn('sales.shipments.adjustment.create', err)
+              logger.warn('sales.shipments.adjustment.create', { err })
               flash(
                 t(
                   'sales.documents.shipments.shippingAdjustmentError',
@@ -1085,7 +1243,7 @@ export function ShipmentDialog({
           try {
             await onAddComment(note)
           } catch (err) {
-            console.warn('sales.shipments.comment', err)
+            logger.warn('sales.shipments.comment', { err })
           }
         }
         await onSaved()
@@ -1093,6 +1251,7 @@ export function ShipmentDialog({
     },
     [
       currencyCode,
+      documentUpdatedAt,
       lines,
       mode,
       onAddComment,
@@ -1109,13 +1268,14 @@ export function ShipmentDialog({
     ],
   )
 
-  const handleShortcutSubmit = React.useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
-    if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
-      event.preventDefault()
-      const form = dialogContentRef.current?.querySelector('form')
-      form?.requestSubmit()
-    }
-  }, [])
+  const handleSubmitForm = React.useCallback(
+    () => dialogContentRef.current?.querySelector('form')?.requestSubmit(),
+    [],
+  )
+  const handleKeyDown = useDialogKeyHandler({
+    onConfirm: handleSubmitForm,
+    onCancel: onClose,
+  })
 
   const fields = React.useMemo<CrudField[]>(() => {
     const shippingAdjustmentLabel = t(
@@ -1176,7 +1336,7 @@ export function ShipmentDialog({
                       className="h-12 w-12 rounded-md border object-cover"
                     />
                   ) : (
-                    <div className="flex h-12 w-12 items-center justify-center rounded-md border bg-muted text-[10px] text-muted-foreground">
+                    <div className="flex h-12 w-12 items-center justify-center rounded-md border bg-muted text-xs text-muted-foreground">
                       N/A
                     </div>
                   )}
@@ -1195,7 +1355,7 @@ export function ShipmentDialog({
                 <div className="space-y-1">
                   <Input
                     type="number"
-                    step="0.01"
+                    step="1"
                     min="0"
                     value={valueString}
                     disabled={disabled}
@@ -1291,6 +1451,7 @@ export function ShipmentDialog({
               value={currentValue}
               onChange={(next) => setValue(next ?? '')}
               fetchItems={fetchShippingMethodItems}
+              options={shippingMethodLookupOptions}
               placeholder={t('sales.documents.shipments.shippingMethodPlaceholder', 'Select method')}
               loading={shippingMethodLoading}
               minQuery={0}
@@ -1309,6 +1470,7 @@ export function ShipmentDialog({
               value={currentValue}
               onChange={(next) => setValue(next ?? '')}
               fetchItems={fetchShipmentStatusItems}
+              options={shipmentStatusLookupOptions}
               placeholder={t('sales.documents.shipments.statusPlaceholder', 'Select shipment status')}
               loading={shipmentStatusLoading}
               minQuery={0}
@@ -1523,13 +1685,7 @@ export function ShipmentDialog({
       <DialogContent
         ref={dialogContentRef}
         className="sm:max-w-5xl"
-        onKeyDown={(event) => {
-          if (event.key === 'Escape') {
-            event.preventDefault()
-            onClose()
-          }
-          handleShortcutSubmit(event)
-        }}
+        onKeyDown={handleKeyDown}
       >
         <DialogHeader>
           <DialogTitle>

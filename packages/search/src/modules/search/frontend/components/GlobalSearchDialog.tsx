@@ -55,9 +55,11 @@ import {
 } from '@open-mercato/shared/lib/frontend/organizationEvents'
 import { isAllOrganizationsSelection } from '@open-mercato/core/modules/directory/constants'
 import { parseSelectedOrganizationCookie } from '@open-mercato/core/modules/directory/utils/scopeCookies'
+import { ForbiddenError } from '@open-mercato/ui/backend/utils/api'
+import { resolveSearchMinTokenLength } from '@open-mercato/shared/lib/search/config'
 import { fetchGlobalSearchResults } from '../utils'
 
-const MIN_QUERY_LENGTH = 2
+const MIN_QUERY_LENGTH = resolveSearchMinTokenLength()
 
 /** Default strategies used when none are configured */
 const DEFAULT_STRATEGIES: SearchStrategyId[] = ['fulltext', 'vector', 'tokens']
@@ -166,6 +168,7 @@ export function GlobalSearchDialog({
   const [error, setError] = React.useState<string | null>(null)
   const [selectedIndex, setSelectedIndex] = React.useState(0)
   const inputRef = React.useRef<HTMLInputElement | null>(null)
+  const listRef = React.useRef<HTMLDivElement | null>(null)
   const abortRef = React.useRef<AbortController | null>(null)
   const t = useT()
   const [showScopeHint, setShowScopeHint] = React.useState<boolean>(() => hasActiveOrganizationSelection())
@@ -252,7 +255,11 @@ export function GlobalSearchDialog({
         if (controller.signal.aborted) return
         const abortError = err as { name?: string }
         if (abortError?.name === 'AbortError') return
-        setError(err instanceof Error ? err.message : t('search.dialog.errors.searchFailed'))
+        if (err instanceof ForbiddenError) {
+          setError(t('search.dialog.errors.noPermission'))
+        } else {
+          setError(err instanceof Error ? err.message : t('search.dialog.errors.searchFailed'))
+        }
         setResults([])
       } finally {
         if (!controller.signal.aborted) setLoading(false)
@@ -305,6 +312,19 @@ export function GlobalSearchDialog({
     }
   }, [results, selectedIndex, openResult])
 
+  React.useEffect(() => {
+    const container = listRef.current
+    const active = container?.querySelector<HTMLElement>('[data-active="true"]')
+    if (!container || !active) return
+    const { top: containerTop, bottom: containerBottom } = container.getBoundingClientRect()
+    const { top: activeTop, bottom: activeBottom } = active.getBoundingClientRect()
+    if (activeTop < containerTop) {
+      container.scrollTop -= containerTop - activeTop
+    } else if (activeBottom > containerBottom) {
+      container.scrollTop += activeBottom - containerBottom
+    }
+  }, [selectedIndex])
+
   // Check if vector search is enabled but not configured
   const showVectorWarning = !embeddingConfigured && enabledStrategies.includes('vector') && !error
 
@@ -314,8 +334,14 @@ export function GlobalSearchDialog({
 
   return (
     <>
-      <Button type="button" variant="ghost" size="sm" onClick={() => setOpen(true)} className="hidden sm:inline-flex items-center gap-2">
-        <Search className="h-4 w-4" />
+      <Button
+        type="button"
+        variant="ghost"
+        size="sm"
+        onClick={() => setOpen(true)}
+        className="hidden sm:inline-flex items-center gap-2 text-foreground"
+      >
+        <Search className="h-4 w-4 text-foreground" />
         <span>{t('search.dialog.actions.search')}</span>
         <span className="ml-2 rounded border px-1 text-xs text-muted-foreground">⌘K</span>
       </Button>
@@ -327,7 +353,7 @@ export function GlobalSearchDialog({
         onClick={() => setOpen(true)}
         aria-label={t('search.dialog.actions.openGlobalSearch')}
       >
-        <Search className="h-4 w-4" />
+        <Search className="h-4 w-4 text-foreground" />
       </Button>
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent className="max-w-xl p-0" aria-describedby="global-search-description">
@@ -338,7 +364,7 @@ export function GlobalSearchDialog({
             {t('search.dialog.instructions')}
           </span>
           <div className="flex flex-col gap-3 border-b px-4 pb-3 pt-12">
-            <div className="flex items-center gap-2 rounded border bg-background px-3 py-2 focus-within:ring-2 focus-within:ring-ring">
+            <div className="flex items-center gap-2 rounded border border-border bg-background px-3 py-2 transition-colors focus-within:border-primary">
               <Search className="h-4 w-4 text-muted-foreground" />
               <TypedInput
                 ref={inputRef}
@@ -346,7 +372,7 @@ export function GlobalSearchDialog({
                 onChange={(event) => setQuery(event.target.value)}
                 onKeyDown={handleKeyDown}
                 placeholder={t('search.dialog.input.placeholder')}
-                className="border-none px-0 shadow-none focus-visible:ring-0"
+                className="border-none px-0 shadow-none focus-visible:ring-0 focus-visible:ring-offset-0"
                 autoFocus
               />
               {loading && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
@@ -356,7 +382,7 @@ export function GlobalSearchDialog({
               <p className="rounded bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</p>
             ) : null}
             {showVectorWarning ? (
-              <p className="rounded bg-amber-100 dark:bg-amber-900/20 px-3 py-2 text-sm text-amber-800 dark:text-amber-200">{missingConfigMessage}</p>
+              <p className="rounded bg-status-warning-bg px-3 py-2 text-sm text-status-warning-text">{missingConfigMessage}</p>
             ) : null}
             {showScopeHint ? (
               <p className="text-xs text-muted-foreground">
@@ -364,11 +390,11 @@ export function GlobalSearchDialog({
               </p>
             ) : null}
           </div>
-          <div className="max-h-96 overflow-y-auto px-2 pb-3">
+          <div ref={listRef} className="max-h-96 overflow-y-auto px-2 pb-3">
             {results.length === 0 && !loading && !error ? (
               <div className="px-4 py-6 text-sm text-muted-foreground">
                 {query.trim().length < MIN_QUERY_LENGTH
-                  ? t('search.dialog.empty.hint')
+                  ? t('search.dialog.empty.hint', { count: MIN_QUERY_LENGTH })
                   : t('search.dialog.empty.none')}
               </div>
             ) : null}
@@ -379,7 +405,7 @@ export function GlobalSearchDialog({
                 const hasLink = pickPrimaryLink(result) !== null
                 const Icon = presenter?.icon ? resolveIcon(presenter.icon) : null
                 return (
-                  <li key={`${result.entityId}:${result.recordId}`}>
+                  <li key={`${result.entityId}:${result.recordId}`} data-active={isActive}>
                     <button
                       type="button"
                       onClick={() => openResult(result)}
@@ -388,7 +414,7 @@ export function GlobalSearchDialog({
                         'w-full rounded-lg px-4 py-3 text-left transition border',
                         isActive
                           ? 'border-primary bg-primary/10 text-foreground shadow-sm'
-                          : 'border-transparent hover:border-muted-foreground/30 hover:bg-muted/60',
+                          : 'border-transparent hover:border-muted-foreground/30 hover:bg-muted/50',
                         !hasLink && 'opacity-60'
                       )}
                     >
@@ -400,7 +426,7 @@ export function GlobalSearchDialog({
                               {formatEntityId(result.entityId)}
                             </span>
                             {!hasLink && (
-                              <span className="rounded-full border border-amber-500/50 bg-amber-50 dark:bg-amber-900/20 px-2 py-0.5 text-xs text-amber-700 dark:text-amber-400">
+                              <span className="rounded-full border border-status-warning-border bg-status-warning-bg px-2 py-0.5 text-xs text-status-warning-text">
                                 {t('search.dialog.noLink')}
                               </span>
                             )}
@@ -416,7 +442,7 @@ export function GlobalSearchDialog({
                                   className={cn(
                                     'rounded-full border px-2 py-0.5 text-xs',
                                     link.kind === 'primary'
-                                      ? 'border-primary text-primary'
+                                      ? 'border-accent-indigo text-foreground'
                                       : 'border-muted-foreground/40 text-muted-foreground'
                                   )}
                                 >

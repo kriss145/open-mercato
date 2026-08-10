@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test'
+import { expect, test, type Locator, type Page } from '@playwright/test'
 import { apiRequest, getAuthToken } from '@open-mercato/core/modules/core/__integration__/helpers/api'
 import { createProductFixture, deleteCatalogProductIfExists } from '@open-mercato/core/modules/core/__integration__/helpers/catalogFixtures'
 import { login } from '@open-mercato/core/modules/core/__integration__/helpers/auth'
@@ -6,14 +6,79 @@ import { deleteTranslationIfExists, getLocales, setLocales } from './helpers/tra
 
 const ENTITY_TYPE = 'catalog:catalog_product'
 
-async function fillCombobox(page: import('@playwright/test').Page, placeholder: string, value: string) {
+function escapeForRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+async function fillCombobox(
+  page: import('@playwright/test').Page,
+  placeholder: string,
+  value: string,
+  options?: { waitForEnabledPlaceholder?: string },
+) {
   const input = page.getByPlaceholder(placeholder)
   await expect(input).toBeEnabled({ timeout: 10_000 })
   await input.click()
   await input.fill(value)
-  await input.press('Enter')
+  const suggestion = page.getByRole('button', {
+    name: new RegExp(escapeForRegex(value), 'i'),
+  }).first()
+  const suggestionVisible = await suggestion.waitFor({ state: 'visible', timeout: 2_000 }).then(
+    () => true,
+    () => false,
+  )
+  if (suggestionVisible) {
+    await suggestion.click()
+  } else {
+    await input.press('Enter')
+  }
   await input.press('Tab')
-  await page.waitForTimeout(300)
+  if (options?.waitForEnabledPlaceholder) {
+    await expect(page.getByPlaceholder(options.waitForEnabledPlaceholder)).toBeEnabled({ timeout: 10_000 })
+  }
+}
+
+async function selectEntityForRecordPicker(
+  page: Page,
+  entityType: string,
+) {
+  const recordInput = page.getByPlaceholder('Search records...')
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await fillCombobox(page, 'Select an entity', entityType)
+    const enabled = await expect
+      .poll(async () => !(await recordInput.isDisabled()), { timeout: 4_000 })
+      .toBe(true)
+      .then(() => true)
+      .catch(() => false)
+    if (enabled) {
+      return
+    }
+  }
+
+  await expect(recordInput).toBeEnabled({ timeout: 10_000 })
+}
+
+async function waitForTranslationField(root: Locator, preferredPlaceholder?: string): Promise<Locator> {
+  const fieldLocator = root.locator('table').locator('input, textarea')
+  await expect.poll(async () => fieldLocator.count(), {
+    message: 'Expected at least one translation input to be available',
+    timeout: 45_000,
+  }).toBeGreaterThan(0)
+
+  const firstEditableField = fieldLocator.first()
+  await expect(firstEditableField).toBeVisible()
+  await expect(firstEditableField).toBeEnabled()
+
+  const normalizedPlaceholder = preferredPlaceholder?.trim()
+  if (!normalizedPlaceholder) return firstEditableField
+
+  const preferredField = root.getByPlaceholder(normalizedPlaceholder).first()
+  if (await preferredField.count()) {
+    if (await preferredField.isVisible()) return preferredField
+  }
+
+  return firstEditableField
 }
 
 /**
@@ -36,18 +101,26 @@ test.describe('TC-TRANS-009: Translation Command Undo', () => {
       await login(page, 'superadmin')
       await page.goto('/backend/config/translations')
 
-      await fillCombobox(page, 'Select an entity', ENTITY_TYPE)
+      await selectEntityForRecordPicker(page, ENTITY_TYPE)
       await fillCombobox(page, 'Search records...', productId!)
 
       const managerCard = page.locator('.bg-card').filter({
         has: page.getByRole('button', { name: 'Save translations' }),
       })
-      await managerCard.getByRole('button', { name: 'DE' }).click()
+      await managerCard.getByRole('tab', { name: 'DE' }).click()
 
-      const titleInput = page.locator('table input').first()
-      await titleInput.fill('Deutscher Titel QA')
+      const titleInput = await waitForTranslationField(managerCard, 'Deutscher Titel QA')
+      await titleInput.click()
+      await page.keyboard.type('Deutscher Titel QA')
+      await expect.poll(async () => titleInput.inputValue()).toBe('Deutscher Titel QA')
 
+      const saveResponsePromise = page.waitForResponse((response) =>
+        response.request().method() === 'PUT'
+        && response.url().includes(`/api/translations/${encodeURIComponent(ENTITY_TYPE)}/${productId}`),
+      )
       await page.getByRole('button', { name: 'Save translations' }).click()
+      const saveResponse = await saveResponsePromise
+      expect(saveResponse.ok()).toBeTruthy()
       await expect(page.getByText('Translations saved').first()).toBeVisible()
 
       // Verify translation was created via API
@@ -92,21 +165,27 @@ test.describe('TC-TRANS-009: Translation Command Undo', () => {
       await login(page, 'superadmin')
       await page.goto('/backend/config/translations')
 
-      await fillCombobox(page, 'Select an entity', ENTITY_TYPE)
+      await selectEntityForRecordPicker(page, ENTITY_TYPE)
       await fillCombobox(page, 'Search records...', productId!)
 
       const managerCard = page.locator('.bg-card').filter({
         has: page.getByRole('button', { name: 'Save translations' }),
       })
-      await managerCard.getByRole('button', { name: 'DE' }).click()
+      await managerCard.getByRole('tab', { name: 'DE' }).click()
 
       // Verify the original translation is loaded
-      const titleInput = page.locator('table input').first()
+      const titleInput = await waitForTranslationField(managerCard, 'Original Titel')
       await expect(titleInput).toHaveValue('Original Titel')
 
       // Update the translation via UI
       await titleInput.fill('Aktualisierter Titel')
+      const saveResponsePromise = page.waitForResponse((response) =>
+        response.request().method() === 'PUT'
+        && response.url().includes(`/api/translations/${encodeURIComponent(ENTITY_TYPE)}/${productId}`),
+      )
       await page.getByRole('button', { name: 'Save translations' }).click()
+      const saveResponse = await saveResponsePromise
+      expect(saveResponse.ok()).toBeTruthy()
       await expect(page.getByText('Translations saved').first()).toBeVisible()
 
       // Click the Undo button

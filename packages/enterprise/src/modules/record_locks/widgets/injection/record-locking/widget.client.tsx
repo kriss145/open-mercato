@@ -6,12 +6,19 @@ import { apiCall, apiCallOrThrow } from '@open-mercato/ui/backend/utils/apiCall'
 import { flash } from '@open-mercato/ui/backend/FlashMessages'
 import { Button } from '@open-mercato/ui/primitives/button'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@open-mercato/ui/primitives/dialog'
-import { Notice } from '@open-mercato/ui/primitives/Notice'
+import { Alert, AlertDescription } from '@open-mercato/ui/primitives/alert'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
 import type { InjectionWidgetComponentProps } from '@open-mercato/shared/modules/widgets/injection'
 import { BACKEND_MUTATION_ERROR_EVENT } from '@open-mercato/ui/backend/injection/mutationEvents'
+import { registerRecordLockConflictHandler } from '@open-mercato/ui/backend/conflicts'
 import { useSearchParams } from 'next/navigation'
 import { Mail } from 'lucide-react'
+import {
+  RECORD_LOCKS_FORCE_RELEASED_EVENT,
+  RECORD_LOCKS_INCOMING_CHANGES_EVENT,
+  RECORD_LOCKS_LOCK_CONTENDED_EVENT,
+  RECORD_LOCKS_RECORD_DELETED_EVENT,
+} from '@open-mercato/enterprise/modules/record_locks/notifications.handlers'
 import {
   ChangedFieldsTable,
   type ChangeRow,
@@ -25,6 +32,11 @@ import {
   type RecordLockUiConflict,
   type RecordLockUiView,
 } from '@open-mercato/enterprise/modules/record_locks/lib/clientLockStore'
+import { isUuid, resolveConflictId, runAcceptIncoming } from './conflictResolution'
+import { isOptimisticLockFloorConflict } from '@open-mercato/enterprise/modules/record_locks/lib/optimisticLockFloor'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('record_locks').child({ component: 'record-locking-widget' })
 
 type CrudInjectionContext = {
   formId?: string
@@ -84,15 +96,33 @@ type CrudSaveErrorEventDetail = {
   error?: unknown
 }
 
+type RecordLockContendedEventDetail = {
+  sourceEntityId?: string | null
+}
+
+type RecordDeletedEventDetail = {
+  resourceId?: string | null
+  resourceKind?: string | null
+}
+
+type RecordLockIncomingChangesEventDetail = {
+  resourceId?: string | null
+  resourceKind?: string | null
+}
+
+type RecordLockForceReleasedEventDetail = {
+  resourceId?: string | null
+  resourceKind?: string | null
+}
+
 function isObjectRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object'
 }
 
-function isUuid(value: string | null | undefined): value is string {
-  if (typeof value !== 'string') return false
+function readStringOrNull(value: unknown): string | null {
+  if (typeof value !== 'string') return null
   const trimmed = value.trim()
-  if (!trimmed) return false
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(trimmed)
+  return trimmed.length > 0 ? trimmed : null
 }
 
 function extractErrorStatus(error: unknown): number | null {
@@ -267,6 +297,74 @@ function isRecordDeletedError(error: unknown): boolean {
   }
 
   return false
+}
+
+/**
+ * Action the record-lock widget takes when a CrudForm / guarded-mutation save
+ * error event (`om:crud-save-error` / backend-mutation-error) fires. Extracted
+ * as a pure function so the single-conflict-surface (S3) decision is unit-testable
+ * without rendering the widget:
+ *
+ *  - `ignore`          — event is for a different form/record, there is no
+ *                        actionable mounted record, OR the error is a plain OSS
+ *                        `optimistic_lock_conflict` 409 already owned by the OSS
+ *                        conflict bar via `surfaceRecordConflict` (opening the
+ *                        dialog too would render TWO surfaces — #3504/#3505).
+ *  - `record-deleted`  — the record was deleted by another user.
+ *  - `apply-conflict`  — a genuine enterprise `record_lock_conflict` payload;
+ *                        open the field-level merge dialog with it.
+ *  - `fallback-dialog` — an unrecognized 409 (neither record-lock nor OSS
+ *                        optimistic-lock) for the mounted record; open the
+ *                        degraded fallback dialog (legacy behavior).
+ */
+export type RecordLockSaveErrorDecision =
+  | { action: 'ignore' }
+  | { action: 'record-deleted' }
+  | {
+      action: 'apply-conflict'
+      payload: {
+        conflict: RecordLockUiConflict
+        lock?: RecordLockUiView | null
+        latestActionLogId?: string | null
+      }
+    }
+  | { action: 'fallback-dialog' }
+
+export function resolveRecordLockSaveErrorDecision(args: {
+  error: unknown
+  eventContextId: string | null | undefined
+  formId: string
+  currentState: { resourceKind?: string | null; resourceId?: string | null } | null | undefined
+}): RecordLockSaveErrorDecision {
+  const { error, eventContextId, formId, currentState } = args
+  const payload = extractRecordLockConflictPayload(error)
+  const eventTargetsCurrentForm = !eventContextId || eventContextId === formId
+  if (!eventTargetsCurrentForm) {
+    if (!payload || !currentState?.resourceKind || !currentState?.resourceId) return { action: 'ignore' }
+    const payloadResourceKind = payload.conflict.resourceKind?.trim() ?? ''
+    const payloadResourceId = payload.conflict.resourceId?.trim() ?? ''
+    if (!payloadResourceKind || !payloadResourceId) return { action: 'ignore' }
+    if (payloadResourceKind !== currentState.resourceKind || payloadResourceId !== currentState.resourceId) {
+      return { action: 'ignore' }
+    }
+  }
+  if (!payload) {
+    if (!currentState?.resourceKind || !currentState?.resourceId) return { action: 'ignore' }
+    if (isRecordDeletedError(error)) return { action: 'record-deleted' }
+    // A plain OSS `optimistic_lock_conflict` 409 (the shape `makeCrudRoute` /
+    // `CrudForm` returns on a stale write) is already surfaced by the OSS conflict
+    // bar via `surfaceRecordConflict`. Defer to it instead of opening the degraded
+    // fallback merge dialog — otherwise both surfaces render at once (#3504) and the
+    // dialog has no field diff and a no-op "Accept incoming" (#3505). The rich merge
+    // dialog stays reserved for genuine `record_lock_conflict` payloads (handled
+    // above) whose conflict carries field changes + resolution options. Delegates to
+    // the shared `optimisticLockFloor` detector so this arbitration stays identical to
+    // the conflict bar's ownership decision (single source of truth).
+    if (isOptimisticLockFloorConflict(error)) return { action: 'ignore' }
+    if (extractErrorStatus(error) === 409) return { action: 'fallback-dialog' }
+    return { action: 'ignore' }
+  }
+  return { action: 'apply-conflict', payload }
 }
 
 function clearIncomingChangesQueryFlag() {
@@ -461,7 +559,7 @@ function releaseLockWithKeepalive(state: {
     keepalive: true,
     credentials: 'include',
   }).catch((error) => {
-    console.warn('[RecordLockingWidget] Failed to release lock with keepalive fallback', error)
+    logger.warn('Failed to release lock with keepalive fallback', { err: error })
   })
 }
 
@@ -566,7 +664,7 @@ export default function RecordLockingWidget({
       token: current.lock.token,
       reason: 'cancelled',
     }).catch((error) => {
-      console.warn('[RecordLockingWidget] Failed to release lock while demoting owner', error)
+      logger.warn('Failed to release lock while demoting owner', { err: error })
     })
     clearRecordLockFormState(formId)
   }, [formId, isPrimaryInstance])
@@ -685,28 +783,20 @@ export default function RecordLockingWidget({
   React.useEffect(() => {
     if (!isPrimaryInstance) return
     if (!mine || !state?.lock?.id) return
-    let cancelled = false
 
-    const syncContentionBanner = async () => {
-      const call = await apiCall<{ items?: Array<{ sourceEntityId?: string | null; type?: string }> }>(
-        '/api/notifications?status=unread&type=record_locks.lock.contended&pageSize=20'
-      )
-      if (cancelled) return
-      const items = Array.isArray(call.result?.items) ? call.result.items : []
-      const hasUnreadContention = items.some((item) => item.sourceEntityId === state.lock?.id)
-      if (hasUnreadContention) {
-        setShowLockContentionBanner(true)
-      }
+    const onContention = (event: Event) => {
+      const detail = isObjectRecord((event as CustomEvent<unknown>).detail)
+        ? ((event as CustomEvent<unknown>).detail as RecordLockContendedEventDetail)
+        : null
+      if (!detail) return
+      if (detail.sourceEntityId !== state.lock?.id) return
+      setShowLockContentionBanner(true)
     }
 
-    void syncContentionBanner()
-    const interval = window.setInterval(() => {
-      void syncContentionBanner()
-    }, 5000)
+    window.addEventListener(RECORD_LOCKS_LOCK_CONTENDED_EVENT, onContention)
 
     return () => {
-      cancelled = true
-      window.clearInterval(interval)
+      window.removeEventListener(RECORD_LOCKS_LOCK_CONTENDED_EVENT, onContention)
     }
   }, [isPrimaryInstance, mine, state?.lock?.id])
 
@@ -714,27 +804,14 @@ export default function RecordLockingWidget({
     if (!isPrimaryInstance) return
     if (!state?.resourceKind || !state?.resourceId) return
     if (state.recordDeleted === true) return
-    let cancelled = false
-
-    const syncRecordDeletedState = async () => {
-      const call = await apiCall<{
-        items?: Array<{
-          sourceEntityId?: string | null
-          bodyVariables?: Record<string, string> | null
-        }>
-      }>('/api/notifications?status=unread&type=record_locks.record.deleted&pageSize=20')
-      if (cancelled) return
-      const items = Array.isArray(call.result?.items) ? call.result.items : []
-      const hasUnreadRecordDeleted = items.some((item) => {
-        const matchesResourceId = item.sourceEntityId === state.resourceId
-        if (!matchesResourceId) return false
-        const kindFromBody = typeof item.bodyVariables?.resourceKind === 'string'
-          ? item.bodyVariables.resourceKind.trim()
-          : ''
-        if (!kindFromBody) return true
-        return kindFromBody === state.resourceKind
-      })
-      if (!hasUnreadRecordDeleted) return
+    const onRecordDeleted = (event: Event) => {
+      const detail = isObjectRecord((event as CustomEvent<unknown>).detail)
+        ? ((event as CustomEvent<unknown>).detail as RecordDeletedEventDetail)
+        : null
+      if (!detail) return
+      if (detail.resourceId !== state.resourceId) return
+      const kind = readStringOrNull(detail.resourceKind)
+      if (kind && kind !== state.resourceKind) return
       setIsConflictDialogOpen(true)
       setRecordLockFormState(formId, {
         recordDeleted: true,
@@ -747,14 +824,10 @@ export default function RecordLockingWidget({
       })
     }
 
-    void syncRecordDeletedState()
-    const interval = window.setInterval(() => {
-      void syncRecordDeletedState()
-    }, 5000)
+    window.addEventListener(RECORD_LOCKS_RECORD_DELETED_EVENT, onRecordDeleted)
 
     return () => {
-      cancelled = true
-      window.clearInterval(interval)
+      window.removeEventListener(RECORD_LOCKS_RECORD_DELETED_EVENT, onRecordDeleted)
     }
   }, [formId, isPrimaryInstance, state?.recordDeleted, state?.resourceId, state?.resourceKind])
 
@@ -793,7 +866,6 @@ export default function RecordLockingWidget({
       )
     if (hasUnresolvedConflict) return
     if (!state?.resourceKind || !state?.resourceId) return
-    let cancelled = false
     const refreshPresence = async () => {
       const call = await apiCall<AcquireResponse>('/api/record_locks/acquire', {
         method: 'POST',
@@ -804,7 +876,6 @@ export default function RecordLockingWidget({
         }),
       })
       const payload = call.result ?? {}
-      if (cancelled) return
       if (!call.ok) {
         const currentState = getRecordLockFormState(formId)
         setRecordLockFormState(formId, {
@@ -838,14 +909,60 @@ export default function RecordLockingWidget({
         allowForceUnlock: payload.allowForceUnlock ?? false,
       })
     }
-
-    const interval = window.setInterval(() => {
+    const onIncomingChanges = (event: Event) => {
+      const detail = isObjectRecord((event as CustomEvent<unknown>).detail)
+        ? ((event as CustomEvent<unknown>).detail as RecordLockIncomingChangesEventDetail)
+        : null
+      if (!detail) return
+      if (detail.resourceId !== state.resourceId) return
+      const kind = readStringOrNull(detail.resourceKind)
+      if (kind && kind !== state.resourceKind) return
+      setShowIncomingChangesRequested(true)
       void refreshPresence()
-    }, 4000)
+    }
+    const onForceReleased = (event: Event) => {
+      const detail = isObjectRecord((event as CustomEvent<unknown>).detail)
+        ? ((event as CustomEvent<unknown>).detail as RecordLockForceReleasedEventDetail)
+        : null
+      if (!detail) return
+      if (detail.resourceId !== state.resourceId) return
+      const kind = readStringOrNull(detail.resourceKind)
+      if (kind && kind !== state.resourceKind) return
+      void refreshPresence()
+    }
+    const onBridgeReconnected = (event: Event) => {
+      const detail = isObjectRecord((event as CustomEvent<unknown>).detail)
+        ? (event as CustomEvent<Record<string, unknown>>).detail
+        : null
+      if (detail?.id !== 'om:bridge:reconnected') return
+      void refreshPresence()
+    }
+    const onFocus = () => {
+      void refreshPresence()
+    }
+    const onVisibilityChange = () => {
+      if (!document.hidden) {
+        void refreshPresence()
+      }
+    }
+
+    window.addEventListener(RECORD_LOCKS_INCOMING_CHANGES_EVENT, onIncomingChanges)
+    window.addEventListener(RECORD_LOCKS_FORCE_RELEASED_EVENT, onForceReleased)
+    window.addEventListener('om:event', onBridgeReconnected)
+    window.addEventListener('focus', onFocus)
+    document.addEventListener('visibilitychange', onVisibilityChange)
+    const heartbeatInterval = window.setInterval(() => {
+      void refreshPresence()
+    }, 30_000)
+    void refreshPresence()
 
     return () => {
-      cancelled = true
-      window.clearInterval(interval)
+      window.removeEventListener(RECORD_LOCKS_INCOMING_CHANGES_EVENT, onIncomingChanges)
+      window.removeEventListener(RECORD_LOCKS_FORCE_RELEASED_EVENT, onForceReleased)
+      window.removeEventListener('om:event', onBridgeReconnected)
+      window.removeEventListener('focus', onFocus)
+      document.removeEventListener('visibilitychange', onVisibilityChange)
+      window.clearInterval(heartbeatInterval)
     }
   }, [
     formId,
@@ -974,38 +1091,33 @@ export default function RecordLockingWidget({
       const detail = (event as CustomEvent<CrudSaveErrorEventDetail>).detail
       if (!detail) return
       const eventContextId = detail.contextId ?? detail.formId
-      let payload = extractRecordLockConflictPayload(detail.error)
       const currentState = getRecordLockFormState(formId)
-      const eventTargetsCurrentForm = !eventContextId || eventContextId === formId
-      if (!eventTargetsCurrentForm) {
-        if (!payload || !currentState?.resourceKind || !currentState?.resourceId) return
-        const payloadResourceKind = payload.conflict.resourceKind?.trim() ?? ''
-        const payloadResourceId = payload.conflict.resourceId?.trim() ?? ''
-        if (!payloadResourceKind || !payloadResourceId) return
-        if (payloadResourceKind !== currentState.resourceKind || payloadResourceId !== currentState.resourceId) return
+      const decision = resolveRecordLockSaveErrorDecision({
+        error: detail.error,
+        eventContextId,
+        formId,
+        currentState,
+      })
+      if (decision.action === 'ignore') return
+      if (decision.action === 'record-deleted') {
+        setIsConflictDialogOpen(true)
+        setRecordLockFormState(formId, {
+          recordDeleted: true,
+          acquired: false,
+          lock: null,
+          conflict: null,
+          pendingConflictId: null,
+          pendingResolution: 'normal',
+          pendingResolutionArmed: false,
+        })
+        return
       }
-        if (!payload) {
-        if (!currentState?.resourceKind || !currentState?.resourceId) return
-        if (isRecordDeletedError(detail.error)) {
-          setIsConflictDialogOpen(true)
-          setRecordLockFormState(formId, {
-            recordDeleted: true,
-            acquired: false,
-            lock: null,
-            conflict: null,
-            pendingConflictId: null,
-            pendingResolution: 'normal',
-            pendingResolutionArmed: false,
-          })
-          return
-        }
-        if (extractErrorStatus(detail.error) === 409) {
-          applyConflictPayload(buildFallbackConflict(currentState))
-        }
+      if (decision.action === 'fallback-dialog') {
+        if (currentState) applyConflictPayload(buildFallbackConflict(currentState))
         return
       }
 
-      applyConflictPayload(payload)
+      applyConflictPayload(decision.payload)
     }
 
     window.addEventListener(BACKEND_MUTATION_ERROR_EVENT, onCrudSaveError)
@@ -1015,6 +1127,33 @@ export default function RecordLockingWidget({
       window.removeEventListener('om:crud-save-error', onCrudSaveError)
     }
   }, [formId, isPrimaryInstance])
+
+  // Single conflict surface (S3): own the surface for record_lock_conflict 409s
+  // routed through `surfaceRecordConflict` (command/raw-write paths that don't
+  // emit the crud-save-error event). Opening the dialog here is idempotent with
+  // the listener above; returning true tells the core helper to suppress the OSS
+  // bar (so we never render both). Decline (false) for a different record so the
+  // bar still renders there — a conflict is never swallowed.
+  React.useEffect(() => {
+    if (!isPrimaryInstance) return
+    if (!resourceKind || !resourceId) return
+    const unregister = registerRecordLockConflictHandler((_conflict, error) => {
+      const payload = extractRecordLockConflictPayload(error)
+      if (!payload) return false
+      const payloadKind = payload.conflict.resourceKind?.trim() ?? ''
+      const payloadId = payload.conflict.resourceId?.trim() ?? ''
+      if (payloadKind && payloadId && (payloadKind !== resourceKind || payloadId !== resourceId)) return false
+      setIsConflictDialogOpen(true)
+      setRecordLockFormState(formId, {
+        conflict: payload.conflict,
+        pendingConflictId: payload.conflict.id,
+        pendingResolution: 'normal',
+        pendingResolutionArmed: false,
+      })
+      return true
+    })
+    return unregister
+  }, [formId, isPrimaryInstance, resourceKind, resourceId])
 
   const handleTakeOver = React.useCallback(async () => {
     keepMineRetryVersionRef.current += 1
@@ -1057,42 +1196,41 @@ export default function RecordLockingWidget({
 
   const handleAcceptIncoming = React.useCallback(async () => {
     keepMineRetryVersionRef.current += 1
-    if (!state?.conflict || !state?.resourceKind || !state?.resourceId) return
-    let conflictId: string | undefined = isUuid(state.conflict.id) ? state.conflict.id : undefined
-    if (!conflictId) {
-      const validation = await validateBeforeSave({}, context)
-      conflictId = isUuid(validation.conflict?.id) ? validation.conflict.id : undefined
-      if (!conflictId) {
-        flash(
-          t(
-            'record_locks.conflict.refresh_required',
-            'Could not confirm conflict details. Save again to refresh conflict data.',
-          ),
-          'error',
-        )
-        return
-      }
-    }
-    await apiCallOrThrow('/api/record_locks/release', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        resourceKind: state.resourceKind,
-        resourceId: state.resourceId,
-        token: state.lock?.token ?? undefined,
-        reason: 'conflict_resolved',
-        conflictId,
-        resolution: 'accept_incoming',
-      }),
+    await runAcceptIncoming({
+      conflict: state?.conflict,
+      resourceKind: state?.resourceKind,
+      resourceId: state?.resourceId,
+      revalidateConflictId: async () => {
+        const validation = await validateBeforeSave({}, context)
+        return resolveConflictId(validation.conflict)
+      },
+      releaseIncoming: async (conflictId) => {
+        await apiCallOrThrow('/api/record_locks/release', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            resourceKind: state?.resourceKind,
+            resourceId: state?.resourceId,
+            token: state?.lock?.token ?? undefined,
+            reason: 'conflict_resolved',
+            conflictId,
+            resolution: 'accept_incoming',
+          }),
+        })
+      },
+      clearConflictState: () => {
+        setRecordLockFormState(formId, {
+          conflict: null,
+          pendingConflictId: null,
+          pendingResolution: 'normal',
+          pendingResolutionArmed: false,
+        })
+      },
+      reload: () => {
+        window.location.reload()
+      },
     })
-    setRecordLockFormState(formId, {
-      conflict: null,
-      pendingConflictId: null,
-      pendingResolution: 'normal',
-      pendingResolutionArmed: false,
-    })
-    window.location.reload()
-  }, [context, formId, state?.conflict, state?.lock?.token, state?.resourceId, state?.resourceKind, t])
+  }, [context, formId, state?.conflict, state?.lock?.token, state?.resourceId, state?.resourceKind])
 
   const handleKeepMine = React.useCallback(() => {
     if (!state?.conflict) return
@@ -1176,7 +1314,7 @@ export default function RecordLockingWidget({
       }
       setIsConflictDialogOpen(false)
     }}>
-      <DialogContent>
+      <DialogContent data-testid="record-lock-conflict-dialog">
         <DialogHeader>
           <DialogTitle>
             {isRecordDeleted
@@ -1204,21 +1342,25 @@ export default function RecordLockingWidget({
           ) : null}
           {(state?.conflict?.changes?.length ?? 0) === 0 ? (
             !isRecordDeleted ? (
-            <Notice compact variant="info">
-              {t(
-                'record_locks.conflict.no_field_details',
-                'Field-level conflict details are unavailable for this record. Choose a resolution to continue.'
-              )}
-            </Notice>
+            <Alert variant="info">
+              <AlertDescription>
+                {t(
+                  'record_locks.conflict.no_field_details',
+                  'Field-level conflict details are unavailable for this record. Choose a resolution to continue.'
+                )}
+              </AlertDescription>
+            </Alert>
             ) : null
           ) : null}
           {showOverrideBlockedNotice ? (
-            <Notice compact variant="warning">
-              {t(
-                'record_locks.conflict.override_blocked_notice',
-                'You cannot keep your version because you do not have permission to override incoming changes.',
-              )}
-            </Notice>
+            <Alert variant="warning">
+              <AlertDescription>
+                {t(
+                  'record_locks.conflict.override_blocked_notice',
+                  'You cannot keep your version because you do not have permission to override incoming changes.',
+                )}
+              </AlertDescription>
+            </Alert>
           ) : null}
           <div className="-mx-6 -mb-6 mt-4 border-t bg-background/95 px-6 py-3 backdrop-blur supports-[backdrop-filter]:bg-background/80">
             <div className="flex flex-wrap justify-end gap-2">
@@ -1313,7 +1455,7 @@ export default function RecordLockingWidget({
         {participantEmails.map((email) => (
           <span
             key={email}
-            className="inline-flex items-center gap-1 rounded-full border border-amber-300 bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-900"
+            className="inline-flex items-center gap-1 rounded-full border border-amber-300 bg-amber-100 px-2 py-0.5 text-overline font-medium text-amber-900"
           >
             <Mail className="h-3 w-3" />
             <span>{email}</span>

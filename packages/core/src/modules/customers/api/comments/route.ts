@@ -1,8 +1,8 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 import { z } from 'zod'
 import type { EntityManager } from '@mikro-orm/postgresql'
 import { makeCrudRoute } from '@open-mercato/shared/lib/crud/factory'
 import { CrudHttpError } from '@open-mercato/shared/lib/crud/errors'
+import { findWithDecryption } from '@open-mercato/shared/lib/encryption/find'
 import { CustomerComment, CustomerDeal } from '../../data/entities'
 import { commentCreateSchema, commentUpdateSchema } from '../../data/validators'
 import { E } from '#generated/entities.ids.generated'
@@ -13,6 +13,9 @@ import {
   createPagedListResponseSchema,
   defaultOkResponseSchema,
 } from '../openapi'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('customers')
 
 const rawBodySchema = z.object({}).passthrough()
 
@@ -68,8 +71,8 @@ const crud = makeCrudRoute({
       createdAt: 'created_at',
       updatedAt: 'updated_at',
     },
-    buildFilters: async (query: any) => {
-      const filters: Record<string, any> = {}
+    buildFilters: async (query: Record<string, unknown>) => {
+      const filters: Record<string, unknown> = {}
       if (query.entityId) filters.entity_id = { $eq: query.entityId }
       if (query.dealId) filters.deal_id = { $eq: query.dealId }
       return filters
@@ -139,9 +142,23 @@ const crud = makeCrudRoute({
         ),
       )
       if (!dealIds.length) return
+      const tenantId = ctx.auth?.tenantId ?? null
+      const organizationId = ctx.selectedOrganizationId ?? ctx.auth?.orgId ?? null
+      if (!tenantId || !organizationId) {
+        const { translate } = await resolveTranslations()
+        throw new CrudHttpError(400, {
+          error: translate('customers.errors.tenant_required', 'Tenant context is required'),
+        })
+      }
       try {
         const em = (ctx.container.resolve('em') as EntityManager)
-        const deals = await em.find(CustomerDeal, { id: { $in: dealIds } })
+        const deals = await findWithDecryption(
+          em,
+          CustomerDeal,
+          { id: { $in: dealIds }, tenantId, organizationId },
+          undefined,
+          { tenantId, organizationId },
+        )
         const map = new Map<string, string>()
         deals.forEach((deal: CustomerDeal) => {
           if (deal.id) map.set(deal.id, deal.title ?? '')
@@ -163,7 +180,7 @@ const crud = makeCrudRoute({
           }
         })
       } catch (err) {
-        console.warn('[customers.comments] failed to enrich deal titles', err)
+        logger.warn('failed to enrich deal titles', { component: 'comments', err })
       }
     },
   },

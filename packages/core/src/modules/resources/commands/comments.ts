@@ -13,7 +13,9 @@ import {
   type ResourcesResourceCommentCreateInput,
   type ResourcesResourceCommentUpdateInput,
 } from '../data/validators'
-import { ensureOrganizationScope, ensureTenantScope, extractUndoPayload, requireResource } from './shared'
+import { resourcesResourceCommentCrudEvents } from '../lib/crud'
+import { makeCreateRedo } from '@open-mercato/shared/lib/commands/redo'
+import { ensureOrganizationScope, ensureTenantScope, extractUndoPayload, requireResource, resolveResourceAuthorUserId } from './shared'
 import { E } from '#generated/entities.ids.generated'
 
 const commentCrudIndexer: CrudIndexerConfig<ResourcesResourceComment> = {
@@ -60,18 +62,15 @@ const createCommentCommand: CommandHandler<
     const parsed = resourcesResourceCommentCreateSchema.parse(rawInput)
     ensureTenantScope(ctx, parsed.tenantId)
     ensureOrganizationScope(ctx, parsed.organizationId)
-    const authSub = ctx.auth?.isApiKey ? null : ctx.auth?.sub ?? null
-    const normalizedAuthor = (() => {
-      if (parsed.authorUserId) return parsed.authorUserId
-      if (!authSub) return null
-      const uuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/
-      return uuidRegex.test(authSub) ? authSub : null
-    })()
 
     const em = (ctx.container.resolve('em') as EntityManager).fork()
     const resource = await requireResource(em, parsed.entityId, 'Resource not found')
     ensureTenantScope(ctx, resource.tenantId)
     ensureOrganizationScope(ctx, resource.organizationId)
+    const normalizedAuthor = await resolveResourceAuthorUserId(em, parsed.authorUserId, ctx, {
+      tenantId: resource.tenantId,
+      organizationId: resource.organizationId,
+    })
 
     const comment = em.create(ResourcesResourceComment, {
       organizationId: parsed.organizationId,
@@ -97,6 +96,7 @@ const createCommentCommand: CommandHandler<
         organizationId: comment.organizationId,
         tenantId: comment.tenantId,
       },
+      events: resourcesResourceCommentCrudEvents,
       indexer: commentCrudIndexer,
     })
 
@@ -136,6 +136,25 @@ const createCommentCommand: CommandHandler<
       await em.flush()
     }
   },
+  redo: makeCreateRedo<ResourcesResourceComment, CommentSnapshot, ResourcesResourceCommentCreateInput, { commentId: string; authorUserId: string | null }>({
+    entityClass: ResourcesResourceComment,
+    seedFromSnapshot: (after) => ({
+      id: after.id,
+      organizationId: after.organizationId,
+      tenantId: after.tenantId,
+      body: after.body,
+      authorUserId: after.authorUserId,
+      appearanceIcon: after.appearanceIcon,
+      appearanceColor: after.appearanceColor,
+    }),
+    beforeRestore: async ({ em, snapshot }) => {
+      const resource = await requireResource(em, snapshot.resourceId, 'Resource not found')
+      return { resource }
+    },
+    buildResult: (entity) => ({ commentId: entity.id, authorUserId: entity.authorUserId ?? null }),
+    events: resourcesResourceCommentCrudEvents,
+    indexer: commentCrudIndexer,
+  }),
 }
 
 const updateCommentCommand: CommandHandler<ResourcesResourceCommentUpdateInput, { commentId: string }> = {
@@ -161,7 +180,6 @@ const updateCommentCommand: CommandHandler<ResourcesResourceCommentUpdateInput, 
       comment.resource = resource
     }
     if (parsed.body !== undefined) comment.body = parsed.body
-    if (parsed.authorUserId !== undefined) comment.authorUserId = parsed.authorUserId ?? null
     if (parsed.appearanceIcon !== undefined) comment.appearanceIcon = parsed.appearanceIcon ?? null
     if (parsed.appearanceColor !== undefined) comment.appearanceColor = parsed.appearanceColor ?? null
 
@@ -177,6 +195,7 @@ const updateCommentCommand: CommandHandler<ResourcesResourceCommentUpdateInput, 
         organizationId: comment.organizationId,
         tenantId: comment.tenantId,
       },
+      events: resourcesResourceCommentCrudEvents,
       indexer: commentCrudIndexer,
     })
 
@@ -256,6 +275,7 @@ const updateCommentCommand: CommandHandler<ResourcesResourceCommentUpdateInput, 
         organizationId: comment.organizationId,
         tenantId: comment.tenantId,
       },
+      events: resourcesResourceCommentCrudEvents,
       indexer: commentCrudIndexer,
     })
   },
@@ -289,6 +309,7 @@ const deleteCommentCommand: CommandHandler<{ body?: Record<string, unknown>; que
         organizationId: comment.organizationId,
         tenantId: comment.tenantId,
       },
+      events: resourcesResourceCommentCrudEvents,
       indexer: commentCrudIndexer,
     })
     return { commentId: comment.id }
@@ -353,6 +374,7 @@ const deleteCommentCommand: CommandHandler<{ body?: Record<string, unknown>; que
         organizationId: comment.organizationId,
         tenantId: comment.tenantId,
       },
+      events: resourcesResourceCommentCrudEvents,
       indexer: commentCrudIndexer,
     })
   },

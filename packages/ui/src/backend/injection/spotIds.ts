@@ -33,7 +33,32 @@ export const DataTableInjectionSpots = {
   header: (tableId: string): InjectionSpotId => `data-table:${tableId}:header`,
   footer: (tableId: string): InjectionSpotId => `data-table:${tableId}:footer`,
   toolbar: (tableId: string): InjectionSpotId => `data-table:${tableId}:toolbar`,
+  // Slot rendered immediately after the search input on the same row as the
+  // FilterBar — intended for compact, icon-sized triggers (AI assistants,
+  // saved view shortcuts, etc.). Hosts pass the resolved spot ID through to
+  // FilterBar's `searchTrailing` prop. Stays empty when the table has no
+  // search input.
+  searchTrailing: (tableId: string): InjectionSpotId => `data-table:${tableId}:search-trailing`,
   emptyState: (tableId: string): InjectionSpotId => `data-table:${tableId}:empty-state`,
+  columns: (tableId: string): InjectionSpotId => `data-table:${tableId}:columns`,
+  rowActions: (tableId: string): InjectionSpotId => `data-table:${tableId}:row-actions`,
+  bulkActions: (tableId: string): InjectionSpotId => `data-table:${tableId}:bulk-actions`,
+  filters: (tableId: string): InjectionSpotId => `data-table:${tableId}:filters`,
+} as const
+
+// Portal chrome spot IDs (FROZEN once shipped)
+export const PORTAL_SIDEBAR_MAIN_INJECTION_SPOT_ID: InjectionSpotId = 'menu:portal:sidebar:main'
+export const PORTAL_SIDEBAR_ACCOUNT_INJECTION_SPOT_ID: InjectionSpotId = 'menu:portal:sidebar:account'
+export const PORTAL_HEADER_ACTIONS_INJECTION_SPOT_ID: InjectionSpotId = 'menu:portal:header:actions'
+export const PORTAL_USER_DROPDOWN_INJECTION_SPOT_ID: InjectionSpotId = 'menu:portal:user-dropdown'
+
+// Portal page injection spots (FROZEN once shipped)
+export const PortalInjectionSpots = {
+  dashboardSections: 'portal:dashboard:sections' as InjectionSpotId,
+  dashboardProfile: 'portal:dashboard:profile' as InjectionSpotId,
+  dashboardSidebar: 'portal:dashboard:sidebar' as InjectionSpotId,
+  pageBefore: (pageId: string): InjectionSpotId => `portal:${pageId}:before` as InjectionSpotId,
+  pageAfter: (pageId: string): InjectionSpotId => `portal:${pageId}:after` as InjectionSpotId,
 } as const
 
 export const DetailInjectionSpots = {

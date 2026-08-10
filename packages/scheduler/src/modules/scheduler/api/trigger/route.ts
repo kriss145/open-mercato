@@ -5,11 +5,14 @@ import { createRequestContainer } from '@open-mercato/shared/lib/di/container'
 import type { EntityManager } from '@mikro-orm/core'
 import type { OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
 import { createQueue } from '@open-mercato/queue'
-import { getRedisUrl } from '@open-mercato/shared/lib/redis/connection'
+import { getRedisUrlOrThrow } from '@open-mercato/shared/lib/redis/connection'
 import { ScheduledJob } from '../../data/entities.js'
 import { scheduleTriggerSchema } from '../../data/validators.js'
 import type { ExecuteSchedulePayload } from '../../workers/execute-schedule.worker.js'
 import { resolveTranslations } from '@open-mercato/shared/lib/i18n/server'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('scheduler').child({ component: 'trigger' })
 
 export const metadata = {
   requireAuth: true,
@@ -57,10 +60,9 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: translate('scheduler.error.not_found', 'Schedule not found') }, { status: 404 })
     }
 
-    // System-scoped schedules (no tenantId/orgId) require superadmin
-    const isSuperAdmin = Array.isArray(auth.roles) && auth.roles.some(
-      (role) => typeof role === 'string' && role.trim().toLowerCase() === 'superadmin'
-    )
+    // System-scoped schedules (no tenantId/orgId) require super-admin. Use the
+    // immutable `isSuperAdmin` flag — never compare mutable/spoofable role names.
+    const isSuperAdmin = auth.isSuperAdmin === true
     if (!schedule.tenantId && !schedule.organizationId && !isSuperAdmin) {
       return NextResponse.json({ error: translate('scheduler.error.access_denied', 'Access denied') }, { status: 403 })
     }
@@ -80,7 +82,7 @@ export async function POST(req: NextRequest) {
 
     // Enqueue execution job to scheduler-execution queue
     const executionQueue = createQueue<ExecuteSchedulePayload>('scheduler-execution', queueStrategy, {
-      connection: { url: getRedisUrl('QUEUE') },
+      connection: { url: getRedisUrlOrThrow('QUEUE') },
     })
 
     const payload: ExecuteSchedulePayload = {
@@ -95,7 +97,7 @@ export async function POST(req: NextRequest) {
     const jobId = await executionQueue.enqueue(payload)
     await executionQueue.close()
 
-    console.log('[scheduler:trigger] Manually triggered schedule:', {
+    logger.info('Manually triggered schedule', {
       scheduleId: schedule.id,
       scheduleName: schedule.name,
       jobId,
@@ -109,7 +111,7 @@ export async function POST(req: NextRequest) {
     })
 
   } catch (error) {
-    console.error('[scheduler:trigger] Error:', error)
+    logger.error('Manual trigger failed', { err: error })
     return NextResponse.json(
       { error: error instanceof Error ? error.message : translate('scheduler.error.trigger_failed', 'Failed to trigger schedule') },
       { status: 400 }

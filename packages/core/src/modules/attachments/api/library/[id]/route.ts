@@ -11,7 +11,7 @@ import {
   normalizeAttachmentTags,
   readAttachmentMetadata,
 } from '../../../lib/metadata'
-import { deletePartitionFile } from '../../../lib/storage'
+import type { StorageDriverFactory } from '../../../lib/drivers'
 import { splitCustomFieldPayload, loadCustomFieldValues } from '@open-mercato/shared/lib/crud/custom-fields'
 import { emitCrudSideEffects, setCustomFieldsIfAny } from '@open-mercato/shared/lib/commands/helpers'
 import { normalizeCustomFieldResponse } from '@open-mercato/shared/lib/custom-fields/normalize'
@@ -25,6 +25,9 @@ import {
   attachmentDetailResponseSchema,
   attachmentErrorSchema,
 } from '../../openapi'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('attachments').child({ component: 'library' })
 
 const updateSchema = z.object({
   tags: z.array(z.string()).optional(),
@@ -51,7 +54,6 @@ type RouteContext = { params: Promise<RouteParams> }
 
 async function resolveAttachmentId(ctx: RouteContext): Promise<string | null> {
   const params = ctx?.params
-  if (!params) return null
   try {
     const { id } = await params
     if (typeof id === 'string' && id.trim().length) {
@@ -121,7 +123,7 @@ export async function GET(req: NextRequest, ctx: RouteContext) {
       partitionTitle: partition?.title ?? null,
       tags: metadata.tags ?? [],
       assignments: enrichedAssignments,
-      content: record.content ?? null,
+      content: record.content && record.content.trim() ? record.content : null,
       customFields,
     },
   })
@@ -164,22 +166,25 @@ export async function PATCH(req: NextRequest, ctx: RouteContext) {
   if (parsed.data.tags) patch.tags = normalizeAttachmentTags(parsed.data.tags)
   if (parsed.data.assignments) patch.assignments = normalizeAttachmentAssignments(parsed.data.assignments)
   record.storageMetadata = mergeAttachmentMetadata(record.storageMetadata, patch)
-  await em.flush()
-
-  if (dataEngine && custom && Object.keys(custom).length) {
-    try {
-      await setCustomFieldsIfAny({
-        dataEngine,
-        entityId: E.attachments.attachment,
-        recordId: record.id,
-        tenantId: record.tenantId ?? auth.tenantId ?? null,
-        organizationId: record.organizationId ?? auth.orgId ?? null,
-        values: custom,
-      })
-    } catch (error) {
-      console.error('[attachments] failed to persist custom attributes', error)
-      return NextResponse.json({ error: 'Failed to save attachment attributes.' }, { status: 500 })
-    }
+  // Commit the metadata mutation and the custom-field write atomically so a
+  // custom-field failure cannot leave the attachment metadata partially updated.
+  try {
+    await em.transactional(async (tx) => {
+      await tx.flush()
+      if (dataEngine && custom && Object.keys(custom).length) {
+        await setCustomFieldsIfAny({
+          dataEngine,
+          entityId: E.attachments.attachment,
+          recordId: record.id,
+          tenantId: record.tenantId ?? auth.tenantId ?? null,
+          organizationId: record.organizationId ?? auth.orgId ?? null,
+          values: custom,
+        })
+      }
+    })
+  } catch (error) {
+    logger.error('Failed to persist custom attributes', { err: error })
+    return NextResponse.json({ error: 'Failed to save attachment attributes.' }, { status: 500 })
   }
 
   if (dataEngine) {
@@ -229,6 +234,7 @@ export async function DELETE(req: NextRequest, ctx: RouteContext) {
   const { resolve } = await createRequestContainer()
   const em = resolve('em') as EntityManager
   const dataEngine = resolve('dataEngine') as DataEngine
+  const storageDriverFactory = resolve('storageDriverFactory') as StorageDriverFactory
   const deleteFilter: Record<string, unknown> = {
     id: attachmentId,
     tenantId: auth.tenantId,
@@ -238,9 +244,16 @@ export async function DELETE(req: NextRequest, ctx: RouteContext) {
   if (!record) {
     return NextResponse.json({ error: 'Attachment not found' }, { status: 404 })
   }
-
-  await deletePartitionFile(record.partitionCode, record.storagePath, record.storageDriver)
-  await em.removeAndFlush(record)
+  const deleteDriver = await storageDriverFactory.resolveForPartition(record.partitionCode, {
+    tenantId: record.tenantId ?? auth.tenantId,
+    organizationId: record.organizationId ?? auth.orgId,
+  })
+  // Commit the DB row removal before deleting the irreversible storage file so a
+  // failed commit cannot leave a dangling record whose backing file is already gone.
+  const recordPartitionCode = record.partitionCode
+  const recordStoragePath = record.storagePath
+  await em.remove(record).flush()
+  await deleteDriver.delete(recordPartitionCode, recordStoragePath)
 
   if (dataEngine) {
     await emitCrudSideEffects({

@@ -7,6 +7,9 @@ import { CrudHttpError } from '@open-mercato/shared/lib/crud/errors'
 import type { EntityManager } from '@mikro-orm/postgresql'
 import type { AwilixContainer } from 'awilix'
 import type { CommandRuntimeContext } from '@open-mercato/shared/lib/commands'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('dictionaries').child({ component: 'context' })
 
 export type DictionariesRouteContext = {
   container: AwilixContainer
@@ -17,6 +20,15 @@ export type DictionariesRouteContext = {
   tenantId: string
   readableOrganizationIds: string[]
   translate: (key: string, fallback?: string) => string
+}
+
+export function resolveDictionaryActorId(
+  auth: Awaited<ReturnType<typeof getAuthFromRequest>>,
+): string {
+  if (auth && typeof auth.sub === 'string' && auth.sub.trim().length > 0) return auth.sub
+  if (auth && typeof auth.userId === 'string' && auth.userId.trim().length > 0) return auth.userId
+  if (auth && typeof auth.keyId === 'string' && auth.keyId.trim().length > 0) return auth.keyId
+  return 'system'
 }
 
 export async function resolveDictionariesRouteContext(req: Request): Promise<DictionariesRouteContext> {
@@ -79,7 +91,7 @@ export async function resolveDictionariesRouteContext(req: Request): Promise<Dic
       for (const id of candidateIds) readableOrganizationIds.add(id)
     }
   } catch (err) {
-    console.warn('[dictionaries.resolveContext] Failed to resolve readable organizations', err)
+    logger.warn('Failed to resolve readable organizations', { err })
     for (const id of candidateIds) readableOrganizationIds.add(id)
   }
 

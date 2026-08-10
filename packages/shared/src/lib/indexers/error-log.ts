@@ -1,5 +1,8 @@
 import type { EntityManager } from '@mikro-orm/postgresql'
-import type { Knex } from 'knex'
+import { type Kysely, sql } from 'kysely'
+import { createLogger } from '../logger'
+
+const logger = createLogger('shared').child({ component: 'indexers' })
 
 export type IndexerErrorSource = 'query_index' | 'vector' | 'fulltext'
 
@@ -16,7 +19,7 @@ export type RecordIndexerErrorInput = {
 
 type RecordIndexerErrorDeps = {
   em?: EntityManager
-  knex?: Knex
+  db?: Kysely<any>
 }
 
 const MAX_MESSAGE_LENGTH = 8_192
@@ -58,14 +61,11 @@ function safeJson(value: unknown): unknown {
   }
 }
 
-function pickKnex(deps: RecordIndexerErrorDeps): Knex | null {
-  if (deps.knex) return deps.knex
+function pickDb(deps: RecordIndexerErrorDeps): Kysely<any> | null {
+  if (deps.db) return deps.db
   if (deps.em) {
     try {
-      const connection = deps.em.getConnection()
-      if (connection && typeof connection.getKnex === 'function') {
-        return connection.getKnex()
-      }
+      return deps.em.getKysely<any>()
     } catch {
       return null
     }
@@ -74,9 +74,9 @@ function pickKnex(deps: RecordIndexerErrorDeps): Knex | null {
 }
 
 export async function recordIndexerError(deps: RecordIndexerErrorDeps, input: RecordIndexerErrorInput): Promise<void> {
-  const knex = pickKnex(deps)
-  if (!knex) {
-    console.error('[indexers] Unable to record indexer error (missing knex connection)', {
+  const db = pickDb(deps)
+  if (!db) {
+    logger.error('Unable to record indexer error (missing db connection)', {
       source: input.source,
       handler: input.handler,
     })
@@ -87,20 +87,37 @@ export async function recordIndexerError(deps: RecordIndexerErrorDeps, input: Re
   const payload = safeJson(input.payload)
   const now = new Date()
 
+  // Persisting to indexer_error_logs is not enough on its own: nobody watches that
+  // table, and a failing database is exactly when the insert below is least likely
+  // to land. Emit through the log facade too so the failure survives the process.
+  // `input.payload` is deliberately omitted — it can carry record documents.
+  logger.error('Indexer error recorded', {
+    source: input.source,
+    handler: input.handler,
+    entityType: input.entityType ?? null,
+    recordId: input.recordId ?? null,
+    tenantId: input.tenantId ?? null,
+    organizationId: input.organizationId ?? null,
+    err: input.error,
+  })
+
   try {
-    await knex('indexer_error_logs').insert({
-      source: input.source,
-      handler: input.handler,
-      entity_type: input.entityType ?? null,
-      record_id: input.recordId ?? null,
-      tenant_id: input.tenantId ?? null,
-      organization_id: input.organizationId ?? null,
-      payload,
-      message: truncate(message, MAX_MESSAGE_LENGTH),
-      stack: truncate(stack, MAX_STACK_LENGTH),
-      occurred_at: now,
-    })
+    await db
+      .insertInto('indexer_error_logs' as any)
+      .values({
+        source: input.source,
+        handler: input.handler,
+        entity_type: input.entityType ?? null,
+        record_id: input.recordId ?? null,
+        tenant_id: input.tenantId ?? null,
+        organization_id: input.organizationId ?? null,
+        payload: payload === null ? null : sql`${JSON.stringify(payload)}::jsonb`,
+        message: truncate(message, MAX_MESSAGE_LENGTH),
+        stack: truncate(stack, MAX_STACK_LENGTH),
+        occurred_at: now,
+      } as any)
+      .execute()
   } catch (loggingError) {
-    console.error('[indexers] Failed to persist indexer error', loggingError)
+    logger.error('Failed to persist indexer error', { err: loggingError })
   }
 }

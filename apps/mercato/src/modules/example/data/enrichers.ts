@@ -3,10 +3,17 @@
  *
  * Demonstrates how a module can enrich another module's API responses.
  * This enricher adds todo count data to customer person records.
+ *
+ * It reads other modules' tables (todos and per-customer priority), so its
+ * output is not a pure function of the customer record's own cached state. It
+ * therefore keeps `cacheableOnListHit` at the fail-closed default and re-runs on
+ * every CRUD list cache hit so the counts stay fresh. See the
+ * `cacheableOnListHit` guidance in packages/core/AGENTS.md for when an enricher
+ * may opt into being served from the list cache on a hit.
  */
 
 import type { ResponseEnricher, EnricherContext } from '@open-mercato/shared/lib/crud/response-enricher'
-import { Todo } from './entities'
+import { ExampleCustomerPriority, Todo } from './entities'
 
 type CustomerRecord = Record<string, unknown> & { id: string }
 
@@ -14,6 +21,7 @@ type TodoEnrichment = {
   _example: {
     todoCount: number
     openTodoCount: number
+    priority: 'low' | 'normal' | 'high' | 'critical'
   }
 }
 
@@ -51,8 +59,9 @@ const customerTodoCountEnricher: ResponseEnricher<CustomerRecord, TodoEnrichment
   targetEntity: 'customers.person',
   priority: 10,
   timeout: 2000,
+  cacheableOnListHit: false,
   fallback: {
-    _example: { todoCount: 0, openTodoCount: 0 },
+    _example: { todoCount: 0, openTodoCount: 0, priority: 'normal' },
   },
 
   async enrichOne(record, context) {
@@ -64,10 +73,20 @@ const customerTodoCountEnricher: ResponseEnricher<CustomerRecord, TodoEnrichment
     })
     const statsByBucket = buildBucketStats(todos)
     const scoped = statsByBucket.get(getPersonBucket(record.id)) ?? { todoCount: 0, openTodoCount: 0 }
+    const priority = await em.findOne(ExampleCustomerPriority, {
+      customerId: record.id,
+      organizationId: context.organizationId,
+      tenantId: context.tenantId,
+      deletedAt: null,
+    }, { orderBy: { updatedAt: 'desc', createdAt: 'desc' } })
 
     return {
       ...record,
-      _example: { todoCount: scoped.todoCount, openTodoCount: scoped.openTodoCount },
+      _example: {
+        todoCount: scoped.todoCount,
+        openTodoCount: scoped.openTodoCount,
+        priority: (priority?.priority as TodoEnrichment['_example']['priority']) ?? 'normal',
+      },
     }
   },
 
@@ -79,10 +98,27 @@ const customerTodoCountEnricher: ResponseEnricher<CustomerRecord, TodoEnrichment
       deletedAt: null,
     })
     const statsByBucket = buildBucketStats(todos)
+    const customerIds = records.map((record) => record.id)
+    const priorities: ExampleCustomerPriority[] = customerIds.length > 0
+      ? await em.find(ExampleCustomerPriority, {
+          customerId: { $in: customerIds },
+          organizationId: context.organizationId,
+          tenantId: context.tenantId,
+          deletedAt: null,
+        }, { orderBy: { updatedAt: 'desc', createdAt: 'desc' } })
+      : []
+    const priorityByCustomerId = new Map<string, ExampleCustomerPriority['priority']>()
+    for (const entry of priorities) {
+      if (priorityByCustomerId.has(entry.customerId)) continue
+      priorityByCustomerId.set(entry.customerId, entry.priority)
+    }
 
     return records.map((record) => ({
       ...record,
-      _example: statsByBucket.get(getPersonBucket(record.id)) ?? { todoCount: 0, openTodoCount: 0 },
+      _example: {
+        ...(statsByBucket.get(getPersonBucket(record.id)) ?? { todoCount: 0, openTodoCount: 0 }),
+        priority: (priorityByCustomerId.get(record.id) as TodoEnrichment['_example']['priority'] | undefined) ?? 'normal',
+      },
     }))
   },
 }

@@ -13,9 +13,9 @@
 .turbo
 
 # testing
-/coverage
-/test-results
-/playwright-report
+coverage/
+test-results/
+playwright-report/
 published-app/
 
 # next.js
@@ -29,6 +29,7 @@ build
 # misc
 .DS_Store
 *.pem
+/release-output.txt
 
 # Exception: Allow public CA certificates for SSL verification
 !certs/*.pem
@@ -45,6 +46,7 @@ yarn-error.log*
 .env.development.local
 .env.test.local
 .env.production.local
+.env.preview
 !.env.example
 
 # vercel
@@ -71,6 +73,16 @@ packages/**/dist/
 # runtime/event state
 .events/
 
+# runtime SQLite cache (default CACHE_SQLITE_PATH target); rewritten on every dev run
+/data/*.db
+/data/*.db-journal
+/data/*.db-wal
+/data/*.db-shm
+apps/*/data/*.db
+apps/*/data/*.db-journal
+apps/*/data/*.db-wal
+apps/*/data/*.db-shm
+
 # prevent accidental check-in of transpiled JS alongside TS sources
 src/**/*.js
 src/**/*.jsx
@@ -84,7 +96,6 @@ public/uploads/*
 apps/mercato/storage/*
 apps/mercato/storage/attachments/*
 storage
-apps/mercato/data
 packages/client/src/generated/openapi.types.ts
 package-lock.json
 
@@ -100,6 +111,14 @@ packages/cache/node_modules/*
 newrelic_agent.log
 /generated/
 .queue
+.worktrees/
+
+# Dev Container auto-generated compose volumes
+.devcontainer/docker-compose.volumes.yml
+# Dev Container personal overrides (local bind mounts, env vars, etc.)
+.devcontainer/docker-compose.local.yml
+# Personal compose overrides (auto-discovered by docker-exec.mjs)
+docker-compose.*.local.yml
 
 # OpenCode local config (generated at runtime, may contain secrets)
 docker/opencode/opencode.jsonc
@@ -111,7 +130,35 @@ docker/opencode/opencode.jsonc
 
 # MCPs
 .playwright-mcp
+# Local CI / agent investigation logs (not source)
+.ai/reports/
 .ai/qa/ephemeral-env.lock/owner.json
 .ai/qa/ephemeral-env.lock/*
 .ai/qa/ephemeral*
 .ai/dev-ephemeral-envs.json
+# om-prepare-test-env shared descriptor + per-run QA artifacts (generated, not source)
+.ai/qa/test-env.json
+.ai/qa/test-env.lock/
+.ai/qa/test-env-boot.log
+.ai/qa/artifacts_*/
+# entrypoint scripts om-prepare-test-env compiles are bound to the machine that
+# generated them (shell, ports, process tools) — keep them local, never commit
+.ai/scripts/test-env-*
+.agents/
+
+apps/mercato/data/
+apps/mercato/data/cache.db
+apps/mercato/data/*.db
+apps/mercato/data/*.db-journal
+apps/mercato/data/*.db-wal
+apps/mercato/data/*.db-shm
+
+# Local security-tooling working dir
+.deepsec/
+
+# Official modules submodule — personal activation override
+official-modules.local.json
+apps/mercato/src/module-facts.generated.json
+
+# skills CLI lockfile (external skills are re-resolved on each install)
+skills-lock.json

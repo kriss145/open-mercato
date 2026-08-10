@@ -21,7 +21,13 @@ Run `yarn mercato --help` to list modules and `yarn mercato <module> --help` to 
   - [`yarn db:migrate`](./db-migrate) – apply migrations and refresh generated metadata.
   - [`yarn db:greenfield`](./db-greenfield) – destructive reset that regenerates a clean schema.
 - **Development Runtime**
+  - `yarn dev` – start the compact development runtime with splash-based startup progress on the default local backend port, plus ready-state splash actions such as coding-tool launchers and standalone GitHub publish helpers when enabled.
+  - `yarn dev:classic` – start the legacy raw passthrough runtime with no splash screen.
+  - `yarn dev:verbose` – start the same runtime in raw passthrough mode for debugging.
+  - `yarn dev:greenfield:classic` – run the greenfield boot flow with raw passthrough output and no splash screen.
   - [`yarn dev:ephemeral`](./dev-ephemeral) – start a dev server on a free port, open browser automatically, and register active instances in `.ai/dev-ephemeral-envs.json`.
+  - `yarn dev:ephemeral:classic` – run the ephemeral flow with raw passthrough output and no splash screen.
+  - **Database name override (optional, additive)**: every dev/setup command above accepts `--database-name[=<name>]` to rewrite the database segment of `DATABASE_URL` for the run. Examples: `yarn dev --database-name=client_a` (explicit), `yarn dev --database-name` (derive from `process.cwd()`), `yarn dev --database-name=temp --no-update-env` (current run only). Without the flag, behavior is unchanged. See the monorepo and standalone installation guides for the full walkthrough.
 - **Code Generation**
   - `mercato generate` or `mercato generate all` – run all generators (entity IDs, registry, entities, DI, API client).
   - `mercato generate entity-ids` – generate entity ID mappings.
@@ -33,8 +39,11 @@ Run `yarn mercato --help` to list modules and `yarn mercato <module> --help` to 
   - `mercato db generate` – generate per-module migrations.
   - `mercato db migrate` – apply pending migrations.
   - `mercato db greenfield --yes` – destructive reset and regenerate schema.
+- **Deployment**
+  - [`mercato deploy railway`](/deployment/railway) – provision or update a Railway project using Git or local source, with managed PostgreSQL, Redis, an optional worker, and tracked deployment state.
 - **Auth module**
   - [`mercato auth seed-roles`](./auth-seed-roles)
+  - [`mercato auth sync-role-acls`](./auth-sync-role-acls)
   - [`mercato auth setup`](./auth-setup)
   - [`mercato auth add-user`](./auth-add-user)
   - [`mercato auth set-password`](./auth-set-password)
@@ -56,6 +65,14 @@ Run `yarn mercato --help` to list modules and `yarn mercato <module> --help` to 
 - **Entities**
   - [`mercato entities install`](./entities-install)
   - [`mercato entities decrypt-database`](./entities-decrypt-database)
+- **Configs module**
+  - [`mercato configs cache`](./configs-cache) – inspect cache segments and purge by segment, tag, key, identifier token, pattern, or structural navigation scope.
+- **Official Modules**
+  - [`mercato module add <packageSpec>`](./module-add) – install and register an official `@open-mercato/*` module package.
+  - [`mercato module add <packageSpec> --eject`](./module-add) – copy module source into `src/modules/` for local ownership.
+  - [`mercato module enable <packageName>`](./module-enable) – register an already-installed official module package (no dependency install).
+  - [`mercato module enable <packageName> --eject`](./module-enable) – copy an already-installed package into `src/modules/` and enable it as `@app`.
+  - [`mercato module eject <moduleId>`](./eject) – alias for `mercato eject <moduleId>`.
 - **Module Ejection**
   - [`mercato eject --list`](./eject) – list modules available for ejection.
   - [`mercato eject <moduleId>`](./eject) – copy a core module into your local `src/modules/` for full customization.

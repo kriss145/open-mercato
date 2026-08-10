@@ -1,11 +1,5 @@
-import {
-  Entity,
-  PrimaryKey,
-  Property,
-  Index,
-  Unique,
-  OptionalProps,
-} from '@mikro-orm/core'
+import { OptionalProps } from '@mikro-orm/core'
+import { Entity, Index, PrimaryKey, Property, Unique } from '@mikro-orm/decorators/legacy'
 
 // ---------------------------------------------------------------------------
 // Shared Types
@@ -42,6 +36,15 @@ export interface ExtractedParticipant {
 
 export type InboxEmailStatus = 'received' | 'processing' | 'processed' | 'needs_review' | 'failed'
 export type InboxProposalStatus = 'pending' | 'partial' | 'accepted' | 'rejected'
+export type InboxProposalCategory =
+  | 'rfq'
+  | 'order'
+  | 'order_update'
+  | 'complaint'
+  | 'shipping_update'
+  | 'inquiry'
+  | 'payment'
+  | 'other'
 export type InboxActionType =
   | 'create_order'
   | 'create_quote'
@@ -78,6 +81,13 @@ export class InboxSettings {
 
   @Property({ name: 'inbox_address', type: 'text' })
   inboxAddress!: string
+
+  // Per-tenant inbound-webhook secret. When set, custom-provider webhook
+  // signatures for this inbox MUST verify against THIS secret (not the global
+  // INBOX_OPS_WEBHOOK_SECRET), binding the shared signing key to a single
+  // tenant and preventing cross-tenant injection by a holder of the global key.
+  @Property({ name: 'webhook_secret', type: 'text', nullable: true })
+  webhookSecret?: string | null
 
   @Property({ name: 'is_active', type: 'boolean', default: true })
   isActive: boolean = true
@@ -206,9 +216,10 @@ export class InboxEmail {
 @Entity({ tableName: 'inbox_proposals' })
 @Index({ properties: ['organizationId', 'tenantId'] })
 @Index({ properties: ['organizationId', 'tenantId', 'status'] })
+@Index({ properties: ['organizationId', 'tenantId', 'category'] })
 @Index({ properties: ['inboxEmailId'] })
 export class InboxProposal {
-  [OptionalProps]?: 'status' | 'possiblyIncomplete' | 'workingLanguage' | 'translations' | 'isActive' | 'createdAt' | 'updatedAt' | 'deletedAt'
+  [OptionalProps]?: 'status' | 'category' | 'possiblyIncomplete' | 'workingLanguage' | 'translations' | 'isActive' | 'createdAt' | 'updatedAt' | 'deletedAt'
 
   @PrimaryKey({ type: 'uuid', defaultRaw: 'gen_random_uuid()' })
   id!: string
@@ -227,6 +238,9 @@ export class InboxProposal {
 
   @Property({ name: 'detected_language', type: 'text', nullable: true })
   detectedLanguage?: string | null
+
+  @Property({ name: 'category', type: 'text', nullable: true })
+  category?: InboxProposalCategory | null
 
   @Property({ name: 'status', type: 'text' })
   status: InboxProposalStatus = 'pending'

@@ -4,15 +4,20 @@ import { loadAuditLogDisplayMaps } from '@open-mercato/core/modules/audit_logs/a
 import { createRequestContainer } from '@open-mercato/shared/lib/di/container'
 import { getAuthFromRequest } from '@open-mercato/shared/lib/auth/server'
 import { resolveOrganizationScopeForRequest } from '@open-mercato/core/modules/directory/utils/organizationScope'
+import { resolveOrganizationScopeFilter } from '@open-mercato/core/modules/directory/utils/organizationScopeFilter'
 import { resolveTranslations } from '@open-mercato/shared/lib/i18n/server'
-import { CrudHttpError } from '@open-mercato/shared/lib/crud/errors'
+import { CrudHttpError, isCrudHttpError } from '@open-mercato/shared/lib/crud/errors'
 import { NextResponse } from 'next/server'
 import type { EntityManager } from '@mikro-orm/postgresql'
 import type { ActionLog } from '@open-mercato/core/modules/audit_logs/data/entities'
+import type { RbacService } from '@open-mercato/core/modules/auth/services/rbacService'
 import type { OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
 import { buildHistoryEntries } from '../../lib/historyHelpers'
 import { SalesNote } from '../../data/entities'
 import { findWithDecryption } from '@open-mercato/shared/lib/encryption/find'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('sales')
 
 // Spec: SPEC-006-2026-01-23-order-status-history
 
@@ -29,6 +34,26 @@ const querySchema = z.object({
   types: z.string().optional(), // comma-separated: status,action,comment
 })
 
+export type DocumentHistoryEntryKind = 'status' | 'action' | 'comment'
+
+const HISTORY_TYPES: ReadonlySet<DocumentHistoryEntryKind> = new Set(['status', 'action', 'comment'])
+
+export function parseDocumentHistoryTypes(input: string | null | undefined): Set<DocumentHistoryEntryKind> {
+  const raw = typeof input === 'string' ? input.trim() : ''
+  if (!raw) return new Set()
+  const values = raw
+    .split(',')
+    .map((part) => part.trim().toLowerCase())
+    .filter((value) => value.length > 0)
+  const result = new Set<DocumentHistoryEntryKind>()
+  values.forEach((value) => {
+    if (HISTORY_TYPES.has(value as DocumentHistoryEntryKind)) {
+      result.add(value as DocumentHistoryEntryKind)
+    }
+  })
+  return result
+}
+
 export async function GET(req: Request) {
   try {
     const url = new URL(req.url)
@@ -43,11 +68,21 @@ export async function GET(req: Request) {
     }
 
     const scope = await resolveOrganizationScopeForRequest({ container, auth, request: req })
-    const organizationId = scope?.selectedId ?? auth.orgId ?? null
-    if (!organizationId) {
-      throw new CrudHttpError(400, {
-        error: translate('sales.documents.errors.organization_required', 'Organization context is required'),
-      })
+    // Resolve the organization scope the same way every other scoped read does.
+    // Under "All organizations" (super-admin) `rbacOrganizationId` is null and
+    // `where` is empty, so the read scopes by tenant + resource only instead of
+    // failing — the document's `id` is a tenant-unique UUID, so no cross-org leak.
+    const orgFilter = resolveOrganizationScopeFilter(scope, auth)
+    const organizationId = orgFilter.rbacOrganizationId
+
+    const requiredFeature = query.kind === 'order' ? 'sales.orders.view' : 'sales.quotes.view'
+    const rbac = container.resolve('rbacService') as RbacService
+    const hasAccess = await rbac.userHasAllFeatures(auth.sub, [requiredFeature], {
+      tenantId: auth.tenantId,
+      organizationId,
+    })
+    if (!hasAccess) {
+      throw new CrudHttpError(403, { error: translate('api.errors.forbidden', 'Forbidden') })
     }
 
     const resourceKind = query.kind === 'order' ? 'sales.order' : 'sales.quote'
@@ -55,17 +90,17 @@ export async function GET(req: Request) {
     const actionLogService = container.resolve('actionLogService') as ActionLogService
     const em = (container.resolve('em') as EntityManager).fork()
 
-    const [logs, notes] = await Promise.all([
+    const [actionLogList, notes] = await Promise.all([
       actionLogService.list({
         tenantId: auth.tenantId,
-        organizationId,
+        organizationId: organizationId ?? undefined,
         resourceKind,
         resourceId: query.id,
         includeRelated: true,
         limit: query.limit,
         before: query.before ? new Date(query.before) : undefined,
         after: query.after ? new Date(query.after) : undefined,
-      }) as Promise<ActionLog[]>,
+      }),
       findWithDecryption(
         em,
         SalesNote,
@@ -73,13 +108,14 @@ export async function GET(req: Request) {
           contextType: query.kind,
           contextId: query.id,
           tenantId: auth.tenantId,
-          organizationId,
+          ...orgFilter.where,
           deletedAt: null,
         },
         { orderBy: { createdAt: 'DESC' } },
-        { tenantId: auth.tenantId, organizationId },
+        { tenantId: auth.tenantId, organizationId: organizationId ?? undefined },
       ),
     ])
+    const logs = actionLogList.items as ActionLog[]
 
     const allUserIds = [
       ...logs.map((l) => l.actorUserId).filter((v): v is string => !!v),
@@ -92,7 +128,11 @@ export async function GET(req: Request) {
       organizationIds: [],
     })
 
-    const items = buildHistoryEntries({ actionLogs: logs, notes, kind: query.kind, displayUsers: displayMaps.users })
+    let items = buildHistoryEntries({ actionLogs: logs, notes, kind: query.kind, displayUsers: displayMaps.users })
+    const typesFilter = parseDocumentHistoryTypes(query.types)
+    if (typesFilter.size > 0) {
+      items = items.filter((entry) => typesFilter.has(entry.kind as DocumentHistoryEntryKind))
+    }
 
     let nextCursor: string | undefined = undefined
     if (logs.length === query.limit && items.length > 0) {
@@ -102,10 +142,10 @@ export async function GET(req: Request) {
 
     return NextResponse.json({ items, nextCursor })
   } catch (err) {
-    if (err instanceof CrudHttpError) {
+    if (isCrudHttpError(err)) {
       return NextResponse.json(err.body, { status: err.status })
     }
-    console.error('sales.document-history.get failed', err)
+    logger.error('sales.document-history.get failed', { err })
     const { translate } = await resolveTranslations()
     return NextResponse.json(
       { error: translate('sales.documents.history.error', 'Failed to load history.') },
@@ -150,6 +190,7 @@ export const openApi: OpenApiRouteDoc = {
         { status: 200, description: 'History entries', schema: documentHistoryResponseSchema },
         { status: 400, description: 'Invalid query', schema: z.object({ error: z.string() }) },
         { status: 401, description: 'Unauthorized', schema: z.object({ error: z.string() }) },
+        { status: 403, description: 'Forbidden', schema: z.object({ error: z.string() }) },
         { status: 404, description: 'Document not found', schema: z.object({ error: z.string() }) },
       ],
     },

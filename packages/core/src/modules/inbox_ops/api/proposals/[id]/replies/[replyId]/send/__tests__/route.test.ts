@@ -22,6 +22,7 @@ jest.mock('@open-mercato/shared/lib/auth/server', () => ({
 const mockEm = {
   fork: jest.fn(),
   flush: jest.fn(),
+  nativeUpdate: jest.fn(),
 }
 
 const mockContainer = {
@@ -49,8 +50,14 @@ jest.mock('@open-mercato/core/modules/inbox_ops/lib/eventBus', () => ({
   resolveOptionalEventBus: jest.fn(() => mockEventBus),
 }))
 
+const mockEmitInboxOpsEvent = jest.fn()
 jest.mock('@open-mercato/core/modules/inbox_ops/events', () => ({
-  emitInboxOpsEvent: jest.fn(),
+  emitInboxOpsEvent: (...args: unknown[]) => mockEmitInboxOpsEvent(...args),
+}))
+
+const mockCreateMessageRecordForReply = jest.fn()
+jest.mock('@open-mercato/core/modules/inbox_ops/lib/messagesIntegration', () => ({
+  createMessageRecordForReply: (...args: unknown[]) => mockCreateMessageRecordForReply(...args),
 }))
 
 const originalEnv = process.env
@@ -100,7 +107,14 @@ describe('POST /api/inbox_ops/proposals/[id]/replies/[replyId]/send', () => {
     jest.clearAllMocks()
     mockEm.fork.mockReturnValue(mockEm)
     mockEm.flush.mockResolvedValue(undefined)
-    process.env = { ...originalEnv, RESEND_API_KEY: 'test-api-key' }
+    mockEm.nativeUpdate.mockResolvedValue(1)
+    mockEmitInboxOpsEvent.mockResolvedValue(undefined)
+    mockCreateMessageRecordForReply.mockResolvedValue(null)
+    process.env = {
+      ...originalEnv,
+      RESEND_API_KEY: 'test-api-key',
+      EMAIL_FROM: 'ops@example.com',
+    }
     mockResendSend.mockResolvedValue({ data: { id: 'sent-msg-1' }, error: null })
   })
 
@@ -130,7 +144,8 @@ describe('POST /api/inbox_ops/proposals/[id]/replies/[replyId]/send', () => {
     )
   })
 
-  it('returns 503 when RESEND_API_KEY is not set', async () => {
+  it('returns 503 when RESEND_API_KEY is not set and messages module unavailable', async () => {
+    setupHappyPath()
     delete process.env.RESEND_API_KEY
 
     const response = await POST(makeRequest())
@@ -140,7 +155,8 @@ describe('POST /api/inbox_ops/proposals/[id]/replies/[replyId]/send', () => {
     expect(payload.error).toContain('not configured')
   })
 
-  it('returns 503 when email delivery is disabled', async () => {
+  it('returns 503 when email delivery is disabled and messages module unavailable', async () => {
+    setupHappyPath()
     process.env.OM_DISABLE_EMAIL_DELIVERY = 'true'
 
     const response = await POST(makeRequest())
@@ -206,6 +222,81 @@ describe('POST /api/inbox_ops/proposals/[id]/replies/[replyId]/send', () => {
     expect(payload.error).toContain('must be accepted first')
   })
 
+  it('returns 409 when the reply was already sent (replySentAt set)', async () => {
+    const proposal = {
+      id: 'proposal-1',
+      inboxEmailId: 'email-1',
+      isActive: true,
+    } as unknown as InboxProposal
+
+    const action = {
+      id: 'reply-1',
+      proposalId: 'proposal-1',
+      actionType: 'draft_reply',
+      status: 'executed',
+      payload: { to: 'customer@example.com', subject: 'Re: Order inquiry', body: 'Thank you.' },
+      metadata: { replySentAt: '2026-06-07T10:00:00.000Z', sentMessageId: 'sent-msg-prev' },
+    } as unknown as InboxProposalAction
+
+    mockFindOneWithDecryption
+      .mockResolvedValueOnce(proposal)
+      .mockResolvedValueOnce(action)
+
+    const response = await POST(makeRequest())
+    const payload = await response.json()
+
+    expect(response.status).toBe(409)
+    expect(payload.error).toContain('already been sent')
+    expect(mockResendSend).not.toHaveBeenCalled()
+    expect(mockEm.flush).not.toHaveBeenCalled()
+  })
+
+  it('marks replySentAt after a successful send so a replay is rejected', async () => {
+    const { action } = setupHappyPath()
+
+    const first = await POST(makeRequest())
+    expect(first.status).toBe(200)
+    expect((action.metadata as Record<string, unknown>).replySentAt).toBeTruthy()
+
+    mockResendSend.mockClear()
+    mockFindOneWithDecryption
+      .mockResolvedValueOnce({ id: 'proposal-1', inboxEmailId: 'email-1', isActive: true } as unknown as InboxProposal)
+      .mockResolvedValueOnce(action)
+
+    const second = await POST(makeRequest())
+    const secondPayload = await second.json()
+
+    expect(second.status).toBe(409)
+    expect(secondPayload.error).toContain('already been sent')
+    expect(mockResendSend).not.toHaveBeenCalled()
+  })
+
+  it('claims the send before calling Resend so a concurrent request cannot double-send', async () => {
+    setupHappyPath()
+
+    const response = await POST(makeRequest())
+
+    expect(response.status).toBe(200)
+    expect(mockEm.nativeUpdate).toHaveBeenCalled()
+    // The claim must be issued before the external email provider is invoked.
+    expect(mockEm.nativeUpdate.mock.invocationCallOrder[0]).toBeLessThan(
+      mockResendSend.mock.invocationCallOrder[0],
+    )
+  })
+
+  it('returns 409 without calling Resend when the send is already claimed by a concurrent request', async () => {
+    setupHappyPath()
+    mockEm.nativeUpdate.mockResolvedValueOnce(0)
+
+    const response = await POST(makeRequest())
+    const payload = await response.json()
+
+    expect(response.status).toBe(409)
+    expect(payload.error).toContain('already in progress')
+    expect(mockResendSend).not.toHaveBeenCalled()
+    expect(mockEm.flush).not.toHaveBeenCalled()
+  })
+
   it('returns 502 when Resend fails', async () => {
     setupHappyPath()
     mockResendSend.mockResolvedValueOnce({
@@ -220,6 +311,20 @@ describe('POST /api/inbox_ops/proposals/[id]/replies/[replyId]/send', () => {
     expect(payload.error).toContain('Failed to send email')
   })
 
+  it('releases the send claim when Resend fails so the reply can be retried', async () => {
+    setupHappyPath()
+    mockResendSend.mockResolvedValueOnce({
+      data: null,
+      error: { message: 'Invalid API key' },
+    })
+
+    const response = await POST(makeRequest())
+
+    expect(response.status).toBe(502)
+    // The claim (nativeUpdate #1) plus the release (nativeUpdate #2) must both run.
+    expect(mockEm.nativeUpdate).toHaveBeenCalledTimes(2)
+  })
+
   it('returns 401 when not authenticated', async () => {
     const { getAuthFromRequest } = jest.requireMock('@open-mercato/shared/lib/auth/server') as {
       getAuthFromRequest: jest.Mock
@@ -228,5 +333,97 @@ describe('POST /api/inbox_ops/proposals/[id]/replies/[replyId]/send', () => {
 
     const response = await POST(makeRequest())
     expect(response.status).toBe(401)
+  })
+
+  describe('messages registration', () => {
+    it('records the sent reply in messages after external delivery succeeds', async () => {
+      const { action } = setupHappyPath()
+      mockCreateMessageRecordForReply.mockResolvedValueOnce({ messageId: 'msg-record-123' })
+
+      const response = await POST(makeRequest())
+      const payload = await response.json()
+
+      expect(response.status).toBe(200)
+      expect(payload.ok).toBe(true)
+      expect(payload.sentMessageId).toBe('sent-msg-1')
+      expect(payload.messageRecordId).toBe('msg-record-123')
+      expect(mockResendSend).toHaveBeenCalled()
+      expect(action.metadata).toEqual(expect.objectContaining({
+        sentMessageId: 'sent-msg-1',
+        messageRecordId: 'msg-record-123',
+      }))
+      expect(mockResendSend.mock.invocationCallOrder[0]).toBeLessThan(
+        mockCreateMessageRecordForReply.mock.invocationCallOrder[0],
+      )
+    })
+
+    it('emits reply.sent event with delivery and message record identifiers', async () => {
+      setupHappyPath()
+      mockCreateMessageRecordForReply.mockResolvedValueOnce({ messageId: 'msg-record-456' })
+
+      await POST(makeRequest())
+
+      expect(mockEmitInboxOpsEvent).toHaveBeenCalledWith(
+        'inbox_ops.reply.sent',
+        expect.objectContaining({
+          proposalId: 'proposal-1',
+          actionId: 'reply-1',
+          toAddress: 'customer@example.com',
+          sentMessageId: 'sent-msg-1',
+          messageRecordId: 'msg-record-456',
+        }),
+      )
+    })
+
+    it('calls createMessageRecordForReply with correct arguments', async () => {
+      setupHappyPath()
+      mockCreateMessageRecordForReply.mockResolvedValueOnce({ messageId: 'msg-123' })
+
+      await POST(makeRequest())
+
+      expect(mockCreateMessageRecordForReply).toHaveBeenCalledWith(
+        expect.objectContaining({
+          to: 'customer@example.com',
+          subject: 'Re: Order inquiry',
+          body: 'Thank you for your order.',
+        }),
+        'email-1',
+        expect.objectContaining({
+          scope: expect.objectContaining({
+            tenantId: 'tenant-1',
+            organizationId: 'org-1',
+            userId: 'user-1',
+          }),
+        }),
+      )
+    })
+
+    it('falls back to Resend when messages integration returns null', async () => {
+      setupHappyPath()
+      mockCreateMessageRecordForReply.mockResolvedValueOnce(null)
+
+      const response = await POST(makeRequest())
+      const payload = await response.json()
+
+      expect(response.status).toBe(200)
+      expect(payload.ok).toBe(true)
+      expect(payload.messageRecordId).toBeUndefined()
+      expect(mockResendSend).toHaveBeenCalled()
+    })
+
+    it('does not create a message record when external delivery fails', async () => {
+      setupHappyPath()
+      mockResendSend.mockResolvedValueOnce({
+        data: null,
+        error: { message: 'Invalid API key' },
+      })
+
+      const response = await POST(makeRequest())
+      const payload = await response.json()
+
+      expect(response.status).toBe(502)
+      expect(payload.error).toContain('Failed to send email')
+      expect(mockCreateMessageRecordForReply).not.toHaveBeenCalled()
+    })
   })
 })

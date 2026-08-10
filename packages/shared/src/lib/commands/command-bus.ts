@@ -2,6 +2,7 @@ import type { ActionLog } from '@open-mercato/core/modules/audit_logs/data/entit
 import type { ActionLogCreateInput } from '@open-mercato/core/modules/audit_logs/data/validators'
 import { commandRegistry } from './registry'
 import type {
+  BulkImportSuppression,
   CommandExecutionOptions,
   CommandExecuteResult,
   CommandHandler,
@@ -21,6 +22,18 @@ import {
   isCrudCacheDebugEnabled,
 } from '@open-mercato/shared/lib/crud/cache'
 import { normalizeCustomFieldKey } from '@open-mercato/shared/lib/custom-fields/keys'
+import { getAllCommandInterceptorInstances } from './command-interceptor-store'
+import {
+  runCommandInterceptorsBefore,
+  runCommandInterceptorsAfter,
+  runCommandInterceptorsBeforeUndo,
+  runCommandInterceptorsAfterUndo,
+} from './command-interceptor-runner'
+import type { CommandInterceptorContext } from './command-interceptor'
+import { CommandInterceptorError } from './errors'
+import { createLogger } from '../logger'
+
+const logger = createLogger('shared').child({ component: 'commands' })
 
 const SKIPPED_ACTION_LOG_RESOURCE_KINDS = new Set<string>([
   'audit_logs.access',
@@ -33,6 +46,28 @@ const SKIPPED_ACTION_LOG_RESOURCE_KINDS = new Set<string>([
 function asRecord(input: unknown): Record<string, unknown> | null {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return null
   return input as Record<string, unknown>
+}
+
+/** Command handlers often return domain keys (e.g. warehouseId) without `id`; cache invalidation must still resolve the record. */
+function extractPrimaryIdFromCommandResult(result: unknown): string | null {
+  const r = asRecord(result)
+  if (!r) return null
+  const direct = pickFirstIdentifier(r.id, r.entityId, r.recordId)
+  if (direct) return direct
+  for (const key of [
+    'warehouseId',
+    'zoneId',
+    'locationId',
+    'lotId',
+    'reservationId',
+    'profileId',
+    'movementId',
+    'balanceId',
+  ]) {
+    const v = r[key]
+    if (typeof v === 'string' && v.trim().length > 0) return v.trim()
+  }
+  return null
 }
 
 function toISOString(value: unknown): string | null {
@@ -153,6 +188,23 @@ function deriveChangesFromSnapshots(
   return Object.keys(changes).length ? changes : null
 }
 
+function invertRecordedChanges(
+  changes: unknown,
+): Record<string, { from: unknown; to: unknown }> | null {
+  const source = asRecord(changes)
+  if (!source) return null
+  const inverted: Record<string, { from: unknown; to: unknown }> = {}
+  for (const [key, value] of Object.entries(source)) {
+    const entry = asRecord(value)
+    if (!entry || (!('from' in entry) && !('to' in entry))) continue
+    inverted[key] = {
+      from: entry.to,
+      to: entry.from,
+    }
+  }
+  return Object.keys(inverted).length ? inverted : null
+}
+
 function extractAliasList(source: unknown): string[] {
   if (!source || typeof source !== 'object' || Array.isArray(source)) return []
   const record = source as Record<string, unknown>
@@ -172,18 +224,52 @@ export class CommandBus {
     commandId: string,
     options: CommandExecutionOptions<TInput>
   ): Promise<CommandExecuteResult<TResult>> {
-    const handler = this.resolveHandler<TInput, TResult>(commandId)
-    const snapshots = await this.prepareSnapshots(handler, options)
-    const result = await handler.execute(options.input, options.ctx)
-    const afterSnapshot = await this.captureAfter(handler, options, result)
+    const handler = await this.resolveHandler<TInput, TResult>(commandId)
+
+    // Run beforeExecute command interceptors
+    const allInterceptors = getAllCommandInterceptorInstances()
+    let interceptorMetadata = new Map<string, Record<string, unknown>>()
+    let effectiveOptions = options
+    const userFeatures = allInterceptors.length
+      ? await this.resolveUserFeaturesForInterceptors(options.ctx)
+      : []
+    if (allInterceptors.length) {
+      const interceptorCtx: CommandInterceptorContext = {
+        commandId,
+        auth: options.ctx.auth ?? null,
+        selectedOrganizationId: options.ctx.selectedOrganizationId ?? options.ctx.auth?.orgId ?? null,
+        container: options.ctx.container,
+      }
+      const beforeResult = await runCommandInterceptorsBefore(
+        allInterceptors, commandId, options.input, interceptorCtx, userFeatures,
+      )
+      if (!beforeResult.ok) {
+        throw new CommandInterceptorError(beforeResult.error!.message)
+      }
+      interceptorMetadata = beforeResult.metadataByInterceptor
+      if (beforeResult.modifiedInput) {
+        effectiveOptions = {
+          ...options,
+          input: { ...(options.input as object), ...beforeResult.modifiedInput } as TInput,
+        }
+      }
+    }
+
+    const snapshots = await this.prepareSnapshots(handler, effectiveOptions)
+    const redoLogEntry = effectiveOptions.redoLogEntry ?? null
+    const result =
+      redoLogEntry && typeof handler.redo === 'function'
+        ? await handler.redo({ input: effectiveOptions.input, ctx: effectiveOptions.ctx, logEntry: redoLogEntry })
+        : await handler.execute(effectiveOptions.input, effectiveOptions.ctx)
+    const afterSnapshot = await this.captureAfter(handler, effectiveOptions, result)
     const snapshotsWithAfter = { ...snapshots, after: afterSnapshot }
-    const logMeta = await this.buildLog(handler, options, result, snapshotsWithAfter)
-    let mergedMeta = this.mergeMetadata(options.metadata, logMeta)
+    const logMeta = await this.buildLog(handler, effectiveOptions, result, snapshotsWithAfter)
+    let mergedMeta = this.mergeMetadata(effectiveOptions.metadata, logMeta)
     const undoable = this.isUndoable(handler)
     if (undoable) {
       mergedMeta = mergedMeta ?? {}
       if (!mergedMeta.undoToken) mergedMeta.undoToken = defaultUndoToken()
-      if (mergedMeta.actorUserId === undefined) mergedMeta.actorUserId = options.ctx.auth?.sub ?? null
+      if (mergedMeta.actorUserId === undefined) mergedMeta.actorUserId = effectiveOptions.ctx.auth?.sub ?? null
     }
     if (afterSnapshot !== undefined && afterSnapshot !== null) {
       if (!mergedMeta) {
@@ -210,33 +296,179 @@ export class CommandBus {
         if (inferred) mergedMeta.changes = inferred
       }
     }
-    const logEntry = await this.persistLog(commandId, options, mergedMeta)
-    await this.invalidateCacheAfterExecute(commandId, options, result, mergedMeta)
-    await this.flushCrudSideEffects(options.ctx.container)
-    return { result, logEntry }
+    const logEntry = await this.persistLog(commandId, effectiveOptions, mergedMeta)
+
+    // Run afterExecute command interceptors
+    let finalResult = result
+    if (allInterceptors.length) {
+      const interceptorCtx: CommandInterceptorContext = {
+        commandId,
+        auth: effectiveOptions.ctx.auth ?? null,
+        selectedOrganizationId: effectiveOptions.ctx.selectedOrganizationId ?? effectiveOptions.ctx.auth?.orgId ?? null,
+        container: effectiveOptions.ctx.container,
+      }
+      const afterResult = await runCommandInterceptorsAfter(
+        allInterceptors, commandId, effectiveOptions.input, result, interceptorCtx,
+        userFeatures, interceptorMetadata,
+      )
+      if (afterResult.modifiedResult && typeof result === 'object' && result) {
+        finalResult = { ...(result as object), ...afterResult.modifiedResult } as Awaited<TResult>
+      }
+    }
+
+    if (!effectiveOptions.skipCacheInvalidation) {
+      await this.invalidateCacheAfterExecute(commandId, effectiveOptions, finalResult, mergedMeta)
+    }
+    // Bulk-import backfills defer heavy per-record side effects: the ctx flags are read here and
+    // threaded as a local into the flush (never stored on the shared dataEngine), so a concurrent
+    // command with different flags can't observe them. Reindex is restored by the caller's
+    // end-of-run `query_index rebuild`. Mirrors `skipCacheInvalidation` above.
+    await this.flushCrudSideEffects(effectiveOptions.ctx.container, effectiveOptions.ctx?.bulkImport)
+    return { result: finalResult, logEntry }
   }
 
   async undo(undoToken: string, ctx: CommandRuntimeContext): Promise<void> {
     const service = (ctx.container.resolve('actionLogService') as ActionLogService)
     const log = await service.findByUndoToken(undoToken)
     if (!log) throw new Error('Undo token expired or not found')
-    const handler = this.resolveHandler(log.commandId)
+    const handler = await this.resolveHandler(log.commandId)
     if (!handler.undo || this.isUndoable(handler) === false) {
       throw new Error(`Command ${log.commandId} is not undoable`)
     }
-    await handler.undo({
-      input: log.commandPayload as Parameters<NonNullable<typeof handler.undo>>[0]['input'],
-      ctx,
-      logEntry: log,
-    })
-    await service.markUndone(log.id)
-    await this.invalidateCacheAfterUndo(log, ctx)
-    await this.flushCrudSideEffects(ctx.container)
+
+    // Atomically claim the action-log row before running any undo side effects.
+    // Two concurrent requests holding the same undo token can both pass
+    // findByUndoToken/executionState checks; the compare-and-set below ensures
+    // only one transitions `done` -> `undoing` and proceeds, the other bails out.
+    const claimed = await service.claimForUndo(log.id)
+    if (!claimed) throw new Error('Undo token already consumed')
+
+    try {
+      // Run beforeUndo command interceptors
+      const allInterceptors = getAllCommandInterceptorInstances()
+      let undoInterceptorMetadata = new Map<string, Record<string, unknown>>()
+      const userFeatures = allInterceptors.length
+        ? await this.resolveUserFeaturesForInterceptors(ctx)
+        : []
+      if (allInterceptors.length) {
+        const undoCtx = { input: log.commandPayload, logEntry: log, undoToken }
+        const interceptorCtx: CommandInterceptorContext = {
+          commandId: log.commandId,
+          auth: ctx.auth ?? null,
+          selectedOrganizationId: ctx.selectedOrganizationId ?? ctx.auth?.orgId ?? null,
+          container: ctx.container,
+        }
+        const beforeResult = await runCommandInterceptorsBeforeUndo(
+          allInterceptors, log.commandId, undoCtx, interceptorCtx, userFeatures,
+        )
+        if (!beforeResult.ok) {
+          throw new CommandInterceptorError(beforeResult.error!.message)
+        }
+        undoInterceptorMetadata = beforeResult.metadataByInterceptor
+      }
+
+      await handler.undo({
+        input: log.commandPayload as Parameters<NonNullable<typeof handler.undo>>[0]['input'],
+        ctx,
+        logEntry: log,
+      })
+      await service.markUndone(log.id, this.buildUndoTraceLog(log, ctx))
+
+      // Run afterUndo command interceptors
+      if (allInterceptors.length) {
+        const undoCtx = { input: log.commandPayload, logEntry: log, undoToken }
+        const interceptorCtx: CommandInterceptorContext = {
+          commandId: log.commandId,
+          auth: ctx.auth ?? null,
+          selectedOrganizationId: ctx.selectedOrganizationId ?? ctx.auth?.orgId ?? null,
+          container: ctx.container,
+        }
+        await runCommandInterceptorsAfterUndo(
+          allInterceptors, log.commandId, undoCtx, interceptorCtx,
+          userFeatures, undoInterceptorMetadata,
+        )
+      }
+
+      await this.invalidateCacheAfterUndo(log, ctx)
+      await this.flushCrudSideEffects(ctx.container)
+    } catch (err) {
+      // Undo failed after claiming the row — release the claim so the action
+      // remains retryable instead of being stranded in the `undoing` state.
+      await service.releaseUndoClaim(log.id).catch(() => {})
+      throw err
+    }
   }
 
-  private resolveHandler<TInput, TResult>(commandId: string): CommandHandler<TInput, TResult> {
-    const handler = commandRegistry.get<TInput, TResult>(commandId)
-    if (!handler) throw new Error(`Command handler not registered for id ${commandId}`)
+  private buildUndoTraceLog(log: ActionLog, ctx: CommandRuntimeContext): ActionLogCreateInput | undefined {
+    const snapshotBefore = log.snapshotAfter ?? null
+    const snapshotAfter = log.snapshotBefore ?? null
+    const changes =
+      deriveChangesFromSnapshots(snapshotBefore, snapshotAfter)
+      ?? invertRecordedChanges(log.changesJson)
+      ?? undefined
+
+    const baseContext = asRecord(log.contextJson) ?? {}
+    const context = {
+      ...baseContext,
+      historyAction: 'undo',
+      sourceLogId: log.id,
+      sourceCommandId: log.commandId,
+    }
+
+    return {
+      tenantId: log.tenantId ?? ctx.auth?.tenantId ?? null,
+      organizationId: log.organizationId ?? ctx.selectedOrganizationId ?? ctx.auth?.orgId ?? null,
+      actorUserId: ctx.auth?.sub ?? log.actorUserId ?? null,
+      commandId: log.commandId,
+      actionLabel: log.actionLabel ?? undefined,
+      resourceKind: log.resourceKind ?? undefined,
+      resourceId: log.resourceId ?? undefined,
+      parentResourceKind: log.parentResourceKind ?? null,
+      parentResourceId: log.parentResourceId ?? null,
+      relatedResourceKind: log.relatedResourceKind ?? null,
+      relatedResourceId: log.relatedResourceId ?? null,
+      snapshotBefore,
+      snapshotAfter,
+      changes,
+      context,
+    }
+  }
+
+  private async resolveUserFeaturesForInterceptors(ctx: CommandRuntimeContext): Promise<string[]> {
+    if (!ctx.auth) return []
+    try {
+      type RbacLike = { getGrantedFeatures: (userId: string, opts: { tenantId: string | null; organizationId: string | null }) => Promise<string[]> }
+      const rbac = ctx.container.resolve('rbacService') as RbacLike | undefined
+      if (rbac?.getGrantedFeatures) {
+        return await rbac.getGrantedFeatures(ctx.auth.sub, {
+          tenantId: ctx.auth.tenantId,
+          organizationId: ctx.selectedOrganizationId ?? ctx.auth.orgId,
+        })
+      }
+    } catch {
+      // Intentional: rbacService is not registered in all runtime contexts (CLI, tests, bootstrap).
+      // Falling through to return [] is safe — interceptors without feature gating still run.
+    }
+    return []
+  }
+
+  private async resolveHandler<TInput, TResult>(commandId: string): Promise<CommandHandler<TInput, TResult>> {
+    const handler =
+      commandRegistry.get<TInput, TResult>(commandId) ??
+      ((await commandRegistry.load(commandId)) as CommandHandler<TInput, TResult> | null)
+    if (!handler) {
+      const moduleName = commandId.split('.')[0]
+      const registered = commandRegistry.list()
+      const sameModule = registered.filter((id) => id.split('.')[0] === moduleName)
+      const registeredLoaders = commandRegistry.listLoaders()
+      const sameModuleLoaders = registeredLoaders.filter((id) => id === commandId || id.startsWith(`${moduleName}:`))
+      const hint = sameModule.length > 0
+        ? ` Registered commands for module "${moduleName}": [${sameModule.join(', ')}].`
+        : sameModuleLoaders.length > 0
+          ? ` Command loaders for module "${moduleName}" were registered but none loaded "${commandId}".`
+          : ` No commands or command loaders registered for module "${moduleName}". Ensure the command file is imported or generated lazy command loaders are registered.`
+      throw new Error(`Command handler not registered for id ${commandId}.${hint}`)
+    }
     return handler
   }
 
@@ -280,6 +512,7 @@ export class CommandBus {
   private mergeMetadata(primary?: CommandLogMetadata | null, secondary?: CommandLogMetadata | null): CommandLogMetadata | null {
     if (!primary && !secondary) return null
     return {
+      skipLog: secondary?.skipLog ?? primary?.skipLog ?? false,
       tenantId: secondary?.tenantId ?? primary?.tenantId ?? null,
       organizationId: secondary?.organizationId ?? primary?.organizationId ?? null,
       actorUserId: secondary?.actorUserId ?? primary?.actorUserId ?? null,
@@ -288,6 +521,8 @@ export class CommandBus {
       resourceId: secondary?.resourceId ?? primary?.resourceId ?? null,
       parentResourceKind: secondary?.parentResourceKind ?? primary?.parentResourceKind ?? null,
       parentResourceId: secondary?.parentResourceId ?? primary?.parentResourceId ?? null,
+      relatedResourceKind: secondary?.relatedResourceKind ?? primary?.relatedResourceKind ?? null,
+      relatedResourceId: secondary?.relatedResourceId ?? primary?.relatedResourceId ?? null,
       undoToken: secondary?.undoToken ?? primary?.undoToken ?? null,
       payload: secondary?.payload ?? primary?.payload ?? null,
       snapshotBefore: secondary?.snapshotBefore ?? primary?.snapshotBefore ?? null,
@@ -303,6 +538,7 @@ export class CommandBus {
     metadata: CommandLogMetadata | null
   ): Promise<ActionLog | null> {
     if (!metadata) return null
+    if (metadata.skipLog) return null
     const resourceKind =
       typeof metadata.resourceKind === 'string' ? metadata.resourceKind : null
     if (resourceKind && SKIPPED_ACTION_LOG_RESOURCE_KINDS.has(resourceKind)) {
@@ -333,6 +569,8 @@ export class CommandBus {
       if ('resourceId' in metadata && metadata.resourceId != null) payload.resourceId = metadata.resourceId
       if ('parentResourceKind' in metadata && metadata.parentResourceKind != null) payload.parentResourceKind = metadata.parentResourceKind
       if ('parentResourceId' in metadata && metadata.parentResourceId != null) payload.parentResourceId = metadata.parentResourceId
+      if ('relatedResourceKind' in metadata && metadata.relatedResourceKind != null) payload.relatedResourceKind = metadata.relatedResourceKind
+      if ('relatedResourceId' in metadata && metadata.relatedResourceId != null) payload.relatedResourceId = metadata.relatedResourceId
       if ('undoToken' in metadata && metadata.undoToken != null) payload.undoToken = metadata.undoToken
       if ('payload' in metadata && metadata.payload !== undefined) payload.commandPayload = metadata.payload
       if ('snapshotBefore' in metadata && metadata.snapshotBefore !== undefined) payload.snapshotBefore = metadata.snapshotBefore
@@ -368,6 +606,7 @@ export class CommandBus {
 
       const recordId = pickFirstIdentifier(
         metadata?.resourceId,
+        extractPrimaryIdFromCommandResult(result),
         resultRecord?.entityId,
         resultRecord?.id,
         resultRecord?.recordId,
@@ -416,7 +655,7 @@ export class CommandBus {
     } catch (err) {
       if (isCrudCacheDebugEnabled()) {
         try {
-          console.debug('[crud][cache] execute-invalidation failed', { commandId, err })
+          logger.debug('Cache execute-invalidation failed', { commandId, err })
         } catch {}
       }
     }
@@ -448,16 +687,16 @@ export class CommandBus {
     } catch (err) {
       if (isCrudCacheDebugEnabled()) {
         try {
-          console.debug('[crud][cache] undo-invalidation failed', { commandId: log.commandId, err })
+          logger.debug('Cache undo-invalidation failed', { commandId: log.commandId, err })
         } catch {}
       }
     }
   }
 
-  private async flushCrudSideEffects(container: AwilixContainer): Promise<void> {
+  private async flushCrudSideEffects(container: AwilixContainer, suppress?: BulkImportSuppression): Promise<void> {
     try {
       const dataEngine = (container.resolve('dataEngine') as DataEngine)
-      await dataEngine.flushOrmEntityChanges()
+      await dataEngine.flushOrmEntityChanges(suppress)
     } catch {
       // best-effort: failures should not block command execution
     }

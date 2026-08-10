@@ -1,5 +1,6 @@
 import { asValue } from 'awilix'
-import type { Knex } from 'knex'
+import type { Kysely } from 'kysely'
+import type { FullTextSearchDriver } from './fulltext/types'
 import { SearchService } from './service'
 import { TokenSearchStrategy } from './strategies/token.strategy'
 import { VectorSearchStrategy, type EmbeddingService } from './strategies/vector.strategy'
@@ -17,12 +18,23 @@ import type {
 import type { VectorDriver } from './vector/types'
 import type { QueryEngine } from '@open-mercato/shared/lib/query/types'
 import type { EntityId } from '@open-mercato/shared/modules/entities'
+import type { SearchStrategyId } from '@open-mercato/shared/modules/search'
 import type { Queue } from '@open-mercato/queue'
 import type { FulltextIndexJobPayload } from './queue/fulltext-indexing'
 import type { VectorIndexJobPayload } from './queue/vector-indexing'
 import type { EncryptionMapEntry } from './lib/field-policy'
 import type { TenantDataEncryptionService } from '@open-mercato/shared/lib/encryption/tenantDataEncryptionService'
 import { createPresenterEnricher } from './lib/presenter-enricher'
+
+const FULLTEXT_DRIVER_KEY = '__omSearchFulltextDriver__'
+
+type SearchModuleGlobals = {
+  [FULLTEXT_DRIVER_KEY]?: FullTextSearchDriver
+}
+
+function getSearchModuleGlobals(): SearchModuleGlobals {
+  return globalThis as unknown as SearchModuleGlobals
+}
 
 /**
  * Check if encrypted fields should be excluded from search indexing.
@@ -39,7 +51,7 @@ function shouldExcludeEncryptedFields(): boolean {
  * Falls back to empty array if query fails.
  */
 function createEncryptionMapResolver(
-  knex: Knex,
+  db: Kysely<any>,
 ): (entityId: EntityId) => Promise<EncryptionMapEntry[]> {
   // Cache encryption maps per entity to avoid repeated queries
   const cache = new Map<string, { entries: EncryptionMapEntry[]; expiresAt: number }>()
@@ -52,14 +64,15 @@ function createEncryptionMapResolver(
     }
 
     try {
-      const rows = await knex('encryption_maps')
-        .select('fields_json')
-        .where('entity_id', entityId)
-        .where('is_active', true)
-        .whereNull('deleted_at')
-        .first()
+      const row = await db
+        .selectFrom('encryption_maps' as any)
+        .select(['fields_json' as any])
+        .where('entity_id' as any, '=', entityId)
+        .where('is_active' as any, '=', true)
+        .where('deleted_at' as any, 'is', null)
+        .executeTakeFirst() as { fields_json?: unknown } | undefined
 
-      const fieldsJson = rows?.fields_json
+      const fieldsJson = row?.fields_json
       const entries: EncryptionMapEntry[] = Array.isArray(fieldsJson)
         ? fieldsJson.map((f: { field: string; hashField?: string | null }) => ({
             field: f.field,
@@ -89,7 +102,7 @@ export interface SearchContainer {
  */
 export type SearchModuleOptions = {
   /** Override default strategies to use */
-  defaultStrategies?: string[]
+  defaultStrategies?: SearchStrategyId[]
   /** Override merge configuration */
   mergeConfig?: ResultMergeConfig
   /** Skip token strategy registration */
@@ -121,11 +134,11 @@ export function registerSearchModule(
   // Token strategy (always available unless explicitly skipped)
   if (!options?.skipTokens) {
     try {
-      const em = container.resolve<{ getConnection: () => { getKnex: () => Knex } }>('em')
-      const knex = em.getConnection().getKnex()
-      strategies.push(new TokenSearchStrategy(knex))
+      const em = container.resolve<any>('em')
+      const db = em.getKysely() as Kysely<any>
+      strategies.push(new TokenSearchStrategy(db))
     } catch {
-      // knex not available via em, skipping TokenSearchStrategy
+      // Kysely not available via em, skipping TokenSearchStrategy
     }
   }
 
@@ -158,25 +171,44 @@ export function registerSearchModule(
 
   // Fulltext strategy (requires driver configuration, e.g., MEILISEARCH_HOST)
   if (!options?.skipFulltext) {
-    // Build encryption map resolver if SEARCH_EXCLUDE_ENCRYPTED_FIELDS is enabled
-    let encryptionMapResolver: ((entityId: EntityId) => Promise<EncryptionMapEntry[]>) | undefined
-    if (shouldExcludeEncryptedFields()) {
-      try {
-        const em = container.resolve<{ getConnection: () => { getKnex: () => Knex } }>('em')
-        const knex = em.getConnection().getKnex()
-        encryptionMapResolver = createEncryptionMapResolver(knex)
-      } catch {
-        // Knex not available, encrypted field filtering disabled
+    const excludeEncrypted = shouldExcludeEncryptedFields()
+    const singletonCacheEnabled = process.env.SEARCH_DISABLE_SINGLETON_CACHE !== '1'
+    const g = getSearchModuleGlobals()
+
+    // The fulltext driver is safe to memoize only when SEARCH_EXCLUDE_ENCRYPTED_FIELDS is
+    // OFF — in that case the driver holds no request-scoped Kysely reference. When the flag
+    // is ON the encryptionMapResolver captures a per-request db handle and must stay
+    // per-request to avoid cross-request data leaks.
+    const canMemoize = singletonCacheEnabled && !excludeEncrypted
+
+    let fulltextDriver: FullTextSearchDriver | null = canMemoize
+      ? (g[FULLTEXT_DRIVER_KEY] ?? null)
+      : null
+
+    if (!fulltextDriver) {
+      let encryptionMapResolver: ((entityId: EntityId) => Promise<EncryptionMapEntry[]>) | undefined
+      if (excludeEncrypted) {
+        try {
+          const em = container.resolve<any>('em')
+          const db = em.getKysely() as Kysely<any>
+          encryptionMapResolver = createEncryptionMapResolver(db)
+        } catch {
+          // Kysely not available, encrypted field filtering disabled
+        }
+      }
+
+      fulltextDriver = createFulltextDriver({
+        fieldPolicyResolver: (entityId: EntityId): SearchFieldPolicy | undefined => {
+          const config = entityConfigMap.get(entityId)
+          return config?.fieldPolicy
+        },
+        encryptionMapResolver,
+      })
+
+      if (canMemoize && fulltextDriver) {
+        g[FULLTEXT_DRIVER_KEY] = fulltextDriver
       }
     }
-
-    const fulltextDriver = createFulltextDriver({
-      fieldPolicyResolver: (entityId: EntityId): SearchFieldPolicy | undefined => {
-        const config = entityConfigMap.get(entityId)
-        return config?.fieldPolicy
-      },
-      encryptionMapResolver,
-    })
 
     if (fulltextDriver) {
       strategies.push(new FullTextSearchStrategy(fulltextDriver))
@@ -205,11 +237,11 @@ export function registerSearchModule(
   // Create presenter enricher for database-based presenter resolution
   let presenterEnricher: PresenterEnricherFn | undefined
   try {
-    const em = container.resolve<{ getConnection: () => { getKnex: () => Knex } }>('em')
-    const knex = em.getConnection().getKnex()
-    presenterEnricher = createPresenterEnricher(knex, entityConfigMap, queryEngine, encryptionService)
+    const em = container.resolve<any>('em')
+    const db = em.getKysely() as Kysely<any>
+    presenterEnricher = createPresenterEnricher(db, entityConfigMap, queryEngine, encryptionService)
   } catch {
-    // knex not available, presenter enrichment disabled
+    // Kysely not available, presenter enrichment disabled
   }
 
   // Create search service
@@ -265,9 +297,9 @@ export function registerSearchModule(
  * Determine default strategy order based on available strategies.
  * Prefers fulltext > vector > tokens.
  */
-function determineDefaultStrategies(strategies: SearchStrategy[]): string[] {
+function determineDefaultStrategies(strategies: SearchStrategy[]): SearchStrategyId[] {
   const available = new Set(strategies.map((s) => s.id))
-  const defaults: string[] = []
+  const defaults: SearchStrategyId[] = []
 
   if (available.has('fulltext')) defaults.push('fulltext')
   if (available.has('vector')) defaults.push('vector')

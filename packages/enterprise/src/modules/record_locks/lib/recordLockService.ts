@@ -1,11 +1,13 @@
 import { randomUUID } from 'crypto'
 import { UniqueConstraintViolationException, type FilterQuery } from '@mikro-orm/core'
 import type { EntityManager } from '@mikro-orm/postgresql'
-import type { Knex } from 'knex'
+import { type Kysely, sql } from 'kysely'
 import type { ModuleConfigService } from '@open-mercato/core/modules/configs/lib/module-config-service'
 import { ActionLog } from '@open-mercato/core/modules/audit_logs/data/entities'
 import type { ActionLogService } from '@open-mercato/core/modules/audit_logs/services/actionLogService'
 import type { RbacService } from '@open-mercato/core/modules/auth/services/rbacService'
+import { findOneWithDecryption } from '@open-mercato/shared/lib/encryption/find'
+import { parseDecryptedFieldValue } from '@open-mercato/shared/lib/encryption/tenantDataEncryptionService'
 import { emitRecordLocksEvent } from '../events'
 import {
   RecordLock,
@@ -141,7 +143,9 @@ export type RecordLockAcquireResult = {
   lock: RecordLockView | null
 }
 
-export type RecordLockAcquireFailure = RecordLockValidationFailure & {
+export type RecordLockAcquireFailure = Omit<RecordLockValidationFailure, 'status' | 'code'> & {
+  status: RecordLockValidationFailure['status'] | 429
+  code: RecordLockValidationFailure['code'] | 'record_lock_quota_exceeded'
   allowForceUnlock: boolean
 }
 
@@ -268,8 +272,8 @@ function isActiveLockScopeUniqueViolation(error: unknown): boolean {
   return false
 }
 
-function getKnex(em: EntityManager): Knex {
-  return (em.getConnection() as unknown as { getKnex: () => Knex }).getKnex()
+function getKysely(em: EntityManager): Kysely<any> {
+  return (em as unknown as { getKysely: () => Kysely<any> }).getKysely()
 }
 
 const SKIPPED_CONFLICT_FIELDS = new Set([
@@ -293,6 +297,29 @@ const MISSING_CONFLICT_VALUE = Symbol('record_lock_conflict_missing_value')
 
 function isRecordValue(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value))
+}
+
+function parseDecryptedJsonLike(value: unknown): unknown {
+  return typeof value === 'string' ? parseDecryptedFieldValue(value) : value
+}
+
+function readJsonRecordValue(value: unknown): Record<string, unknown> | null {
+  const parsed = parseDecryptedJsonLike(value)
+  return isRecordValue(parsed) ? parsed : null
+}
+
+function readActionLogChangesJson(log: ActionLog | null): Record<string, unknown> | null {
+  return readJsonRecordValue(log?.changesJson ?? null)
+}
+
+function normalizeActionLogPayload(log: ActionLog | null): ActionLog | null {
+  if (!log) return null
+  log.changesJson = readJsonRecordValue(log.changesJson)
+  log.snapshotBefore = parseDecryptedJsonLike(log.snapshotBefore)
+  log.snapshotAfter = parseDecryptedJsonLike(log.snapshotAfter)
+  log.contextJson = readJsonRecordValue(log.contextJson)
+  log.commandPayload = parseDecryptedJsonLike(log.commandPayload)
+  return log
 }
 
 function toIsoDate(value: unknown): string | null {
@@ -463,7 +490,32 @@ export class RecordLockService {
     if (!this.moduleConfigService) return settings
 
     await this.moduleConfigService.setValue(RECORD_LOCKS_MODULE_ID, RECORD_LOCKS_SETTINGS_NAME, settings)
-    return settings
+    return settings // NOSONAR — both paths return settings by design; the branch controls persistence
+  }
+
+  /**
+   * Command-guard `resolveExpected` seam (Phase 0 / S1). Derives the expected
+   * version token the OSS command floor compares against the record's current
+   * server-side `updated_at`.
+   *
+   * The compare is server-authoritative: the command handler already loaded the
+   * record from the DB and passes its `updated_at` as `current`, so a stale
+   * write is detected from the version header alone — NEVER requiring a client
+   * record-lock token (H2). When record_locks is not enabled for the resource
+   * (settings off), this returns the header token unchanged so the floor still
+   * runs (pure floor behavior). The richer pessimistic/action-log conflict
+   * detection runs through `validateMutation` at the CRUD layer.
+   */
+  async resolveExpectedVersion(input: {
+    resourceKind: string
+    expectedFromHeader: string | null
+  }): Promise<string | null> {
+    // Enabled or not, the server-authoritative floor compares the header token
+    // against the DB `updated_at`, so resolution is unconditionally the header
+    // value. Gating (record_locks settings) only changes whether the richer
+    // CRUD-layer conflict enrichment runs in `validateMutation` — it never
+    // affects the version floor here.
+    return input.expectedFromHeader
   }
 
   async acquire(input: RecordLockAcquireInput): Promise<RecordLockAcquireResult | RecordLockAcquireFailure> {
@@ -542,26 +594,167 @@ export class RecordLockService {
       }
     }
 
-    const lock = this.em.create(RecordLock, {
-      resourceKind: input.resourceKind,
-      resourceId: input.resourceId,
-      token: randomUUID(),
-      strategy: settings.strategy,
-      status: ACTIVE_LOCK_STATUS,
-      lockedByUserId: input.userId,
-      lockedByIp: input.lockedByIp ?? null,
-      baseActionLogId: latest?.id ?? null,
-      lockedAt: now,
-      lastHeartbeatAt: now,
-      expiresAt: new Date(now.getTime() + settings.timeoutSeconds * 1000),
-      tenantId: input.tenantId,
-      organizationId: normalizeScopeOrganization(input.organizationId),
-    })
-
-    this.em.persist(lock)
-    let createdNewLock = true
+    let activeAfterAcquire: RecordLock[] = []
+    let ownedAfterAcquire: RecordLock | null = null
+    let createdNewLock = false
     try {
-      await this.em.flush()
+      const outcome = await this.em.transactional(async (tx) => {
+        const writeEm = tx as EntityManager
+        await this.lockUserQuotaScope(writeEm, input)
+
+        const activeLocksInTransaction = await this.findActiveLocks(input, now, writeEm)
+        const ownedLockInTransaction = activeLocksInTransaction.find((lock) => lock.lockedByUserId === input.userId) ?? null
+        const competingLockInTransaction = activeLocksInTransaction.find((lock) => lock.lockedByUserId !== input.userId) ?? null
+
+        if (settings.strategy === 'pessimistic' && !ownedLockInTransaction && competingLockInTransaction) {
+          return {
+            result: {
+              ok: false,
+              status: 423,
+              error: 'Record is currently locked by another user',
+              code: 'record_locked',
+              allowForceUnlock: settings.allowForceUnlock,
+              lock: this.toLockView(competingLockInTransaction, false, activeLocksInTransaction),
+            } satisfies RecordLockAcquireFailure,
+            contentionLock: competingLockInTransaction,
+            createdNewLock: false,
+            activeAfterAcquire: activeLocksInTransaction,
+            ownedAfterAcquire: null,
+          }
+        }
+
+        if (ownedLockInTransaction) {
+          ownedLockInTransaction.strategy = settings.strategy
+          ownedLockInTransaction.lockedByIp = input.lockedByIp ?? ownedLockInTransaction.lockedByIp ?? null
+          ownedLockInTransaction.lastHeartbeatAt = now
+          ownedLockInTransaction.expiresAt = new Date(now.getTime() + settings.timeoutSeconds * 1000)
+          await writeEm.flush()
+
+          const renewedActiveLocks = await this.findActiveLocks(input, now, writeEm)
+          return {
+            result: {
+              ok: true,
+              enabled: settings.enabled,
+              resourceEnabled: true,
+              strategy: settings.strategy,
+              allowForceUnlock: settings.allowForceUnlock,
+              heartbeatSeconds: settings.heartbeatSeconds,
+              acquired: false,
+              latestActionLogId: latest?.id ?? null,
+              lock: this.toLockView(ownedLockInTransaction, true, renewedActiveLocks),
+            } satisfies RecordLockAcquireResult,
+            createdNewLock: false,
+            activeAfterAcquire: renewedActiveLocks,
+            ownedAfterAcquire: ownedLockInTransaction,
+          }
+        }
+
+        const activeLocksForUser = await this.countActiveLocksForUser(input, now, writeEm)
+        if (activeLocksForUser >= settings.maxActiveLocksPerUser) {
+          return {
+            result: {
+              ok: false,
+              status: 429,
+              error: 'Active record lock limit reached',
+              code: 'record_lock_quota_exceeded',
+              allowForceUnlock: false,
+              lock: null,
+            } satisfies RecordLockAcquireFailure,
+            createdNewLock: false,
+            activeAfterAcquire: activeLocksInTransaction,
+            ownedAfterAcquire: null,
+          }
+        }
+
+        const lock = writeEm.create(RecordLock, {
+          resourceKind: input.resourceKind,
+          resourceId: input.resourceId,
+          token: randomUUID(),
+          strategy: settings.strategy,
+          status: ACTIVE_LOCK_STATUS,
+          lockedByUserId: input.userId,
+          lockedByIp: input.lockedByIp ?? null,
+          baseActionLogId: latest?.id ?? null,
+          lockedAt: now,
+          lastHeartbeatAt: now,
+          expiresAt: new Date(now.getTime() + settings.timeoutSeconds * 1000),
+          tenantId: input.tenantId,
+          organizationId: normalizeScopeOrganization(input.organizationId),
+        })
+
+        writeEm.persist(lock)
+        await writeEm.flush()
+
+        const acquiredActiveLocks = await this.findActiveLocks(input, now, writeEm)
+        const acquiredOwnedLock = acquiredActiveLocks.find((item) => item.lockedByUserId === input.userId)
+          ?? await this.findOwnedActiveLock(input, writeEm)
+          ?? lock
+          ?? null
+
+        if (!acquiredOwnedLock) {
+          const fallbackLock = acquiredActiveLocks[0] ?? null
+          return {
+            result: {
+              ok: true,
+              enabled: settings.enabled,
+              resourceEnabled: true,
+              strategy: settings.strategy,
+              allowForceUnlock: settings.allowForceUnlock,
+              heartbeatSeconds: settings.heartbeatSeconds,
+              acquired: false,
+              latestActionLogId: latest?.id ?? null,
+              lock: fallbackLock ? this.toLockView(fallbackLock, false, acquiredActiveLocks) : null,
+            } satisfies RecordLockAcquireResult,
+            createdNewLock: false,
+            activeAfterAcquire: acquiredActiveLocks,
+            ownedAfterAcquire: null,
+          }
+        }
+
+        return {
+          result: {
+            ok: true,
+            enabled: settings.enabled,
+            resourceEnabled: true,
+            strategy: settings.strategy,
+            allowForceUnlock: settings.allowForceUnlock,
+            heartbeatSeconds: settings.heartbeatSeconds,
+            acquired: true,
+            latestActionLogId: latest?.id ?? null,
+            lock: this.toLockView(acquiredOwnedLock, true, acquiredActiveLocks),
+          } satisfies RecordLockAcquireResult,
+          createdNewLock: true,
+          activeAfterAcquire: acquiredActiveLocks,
+          ownedAfterAcquire: acquiredOwnedLock,
+        }
+      })
+
+      if (outcome.contentionLock && shouldEmitLockContentionEvent({
+        tenantId: outcome.contentionLock.tenantId,
+        organizationId: outcome.contentionLock.organizationId,
+        resourceKind: outcome.contentionLock.resourceKind,
+        resourceId: outcome.contentionLock.resourceId,
+        lockedByUserId: outcome.contentionLock.lockedByUserId,
+        attemptedByUserId: input.userId,
+      })) {
+        await emitRecordLocksEvent('record_locks.lock.contended', {
+          lockId: outcome.contentionLock.id,
+          resourceKind: outcome.contentionLock.resourceKind,
+          resourceId: outcome.contentionLock.resourceId,
+          tenantId: outcome.contentionLock.tenantId,
+          organizationId: outcome.contentionLock.organizationId,
+          lockedByUserId: outcome.contentionLock.lockedByUserId,
+          attemptedByUserId: input.userId,
+        })
+      }
+
+      activeAfterAcquire = outcome.activeAfterAcquire
+      ownedAfterAcquire = outcome.ownedAfterAcquire
+      createdNewLock = outcome.createdNewLock
+
+      if (!outcome.result.ok || !createdNewLock) {
+        return outcome.result
+      }
     } catch (error) {
       if (!isActiveLockScopeUniqueViolation(error)) throw error
       const clear = (this.em as { clear?: () => void }).clear
@@ -603,16 +796,8 @@ export class RecordLockService {
       existingOwned.lastHeartbeatAt = now
       existingOwned.expiresAt = new Date(now.getTime() + settings.timeoutSeconds * 1000)
       await this.em.flush()
-      createdNewLock = false
-    }
-
-    const activeAfterAcquire = await this.findActiveLocks(input, now)
-    const ownedAfterAcquire = activeAfterAcquire.find((item) => item.lockedByUserId === input.userId)
-      ?? await this.findOwnedActiveLock(input)
-      ?? lock
-      ?? null
-    if (!ownedAfterAcquire) {
-      const fallbackLock = activeAfterAcquire[0] ?? null
+      activeAfterAcquire = await this.findActiveLocks(input, now)
+      ownedAfterAcquire = existingOwned
       return {
         ok: true,
         enabled: settings.enabled,
@@ -622,11 +807,11 @@ export class RecordLockService {
         heartbeatSeconds: settings.heartbeatSeconds,
         acquired: false,
         latestActionLogId: latest?.id ?? null,
-        lock: fallbackLock ? this.toLockView(fallbackLock, false, activeAfterAcquire) : null,
+        lock: this.toLockView(existingOwned, true, activeAfterAcquire),
       }
     }
 
-    if (createdNewLock) {
+    if (createdNewLock && ownedAfterAcquire) {
       await emitRecordLocksEvent('record_locks.lock.acquired', {
         lockId: ownedAfterAcquire.id,
         resourceKind: ownedAfterAcquire.resourceKind,
@@ -675,7 +860,7 @@ export class RecordLockService {
       heartbeatSeconds: settings.heartbeatSeconds,
       acquired: createdNewLock,
       latestActionLogId: latest?.id ?? null,
-      lock: this.toLockView(ownedAfterAcquire, true, activeAfterAcquire),
+      lock: ownedAfterAcquire ? this.toLockView(ownedAfterAcquire, true, activeAfterAcquire) : null,
     }
   }
 
@@ -1260,39 +1445,44 @@ export class RecordLockService {
 
   private async cleanupHistoricalRecords(tenantId: string): Promise<void> {
     try {
-      const knex = getKnex(this.em)
+      const db = getKysely(this.em)
       const now = Date.now()
       const lockCutoff = new Date(now - LOCK_RETENTION_MS)
       const resolvedConflictCutoff = new Date(now - RESOLVED_CONFLICT_RETENTION_MS)
       const pendingConflictCutoff = new Date(now - PENDING_CONFLICT_RETENTION_MS)
       const deletedAt = new Date(now)
 
-      await knex('record_locks')
-        .where({ tenant_id: tenantId })
-        .whereNull('deleted_at')
-        .whereNot('status', ACTIVE_LOCK_STATUS)
-        .andWhere('updated_at', '<', lockCutoff)
-        .update({
+      await db
+        .updateTable('record_locks' as any)
+        .set({
           deleted_at: deletedAt,
           updated_at: deletedAt,
-        })
+        } as any)
+        .where('tenant_id' as any, '=', tenantId)
+        .where('deleted_at' as any, 'is', null as any)
+        .where('status' as any, '!=', ACTIVE_LOCK_STATUS)
+        .where('updated_at' as any, '<', lockCutoff)
+        .execute()
 
-      await knex('record_lock_conflicts')
-        .where({ tenant_id: tenantId })
-        .whereNull('deleted_at')
-        .andWhere((query) => {
-          query
-            .where((pending) => {
-              pending.where('status', 'pending').andWhere('created_at', '<', pendingConflictCutoff)
-            })
-            .orWhere((resolved) => {
-              resolved.whereNot('status', 'pending').andWhere('updated_at', '<', resolvedConflictCutoff)
-            })
-        })
-        .update({
+      await db
+        .updateTable('record_lock_conflicts' as any)
+        .set({
           deleted_at: deletedAt,
           updated_at: deletedAt,
-        })
+        } as any)
+        .where('tenant_id' as any, '=', tenantId)
+        .where('deleted_at' as any, 'is', null as any)
+        .where((eb: any) => eb.or([
+          eb.and([
+            eb('status' as any, '=', 'pending'),
+            eb('created_at' as any, '<', pendingConflictCutoff),
+          ]),
+          eb.and([
+            eb('status' as any, '!=', 'pending'),
+            eb('updated_at' as any, '<', resolvedConflictCutoff),
+          ]),
+        ]))
+        .execute()
     } catch {
       // Best-effort cleanup must never fail lock workflows.
     }
@@ -1328,6 +1518,7 @@ export class RecordLockService {
   private async findActiveLocks(
     input: Pick<RecordLockScope, 'tenantId' | 'organizationId'> & RecordLockResource,
     now: Date,
+    em: EntityManager = this.em,
   ): Promise<RecordLock[]> {
     const legacyFinder = (this as unknown as {
       findActiveLock?: (args: Pick<RecordLockScope, 'tenantId' | 'organizationId'> & RecordLockResource, at: Date) => Promise<RecordLock | null>
@@ -1344,7 +1535,7 @@ export class RecordLockService {
       status: ACTIVE_LOCK_STATUS,
     }
 
-    const locks = await this.em.find(RecordLock, where, { orderBy: { updatedAt: 'desc' } })
+    const locks = await em.find(RecordLock, where, { orderBy: { updatedAt: 'desc' } })
     if (!Array.isArray(locks) || !locks.length) return []
 
     let dirty = false
@@ -1367,7 +1558,7 @@ export class RecordLockService {
       active.push(lock)
     }
 
-    if (dirty) await this.em.flush()
+    if (dirty) await em.flush()
     if (expiredLocks.length) {
       const recipientUserIds = active.map((lock) => lock.lockedByUserId)
       for (const expiredLock of expiredLocks) {
@@ -1385,6 +1576,36 @@ export class RecordLockService {
       }
     }
     return active
+  }
+
+  private async countActiveLocksForUser(
+    input: Pick<RecordLockScope, 'tenantId' | 'organizationId' | 'userId'>,
+    now: Date,
+    em: EntityManager = this.em,
+  ): Promise<number> {
+    const where: FilterQuery<RecordLock> = {
+      ...this.buildScopeWhere(input),
+      lockedByUserId: input.userId,
+      status: ACTIVE_LOCK_STATUS,
+      expiresAt: { $gt: now },
+    }
+
+    return em.count(RecordLock, where)
+  }
+
+  private async lockUserQuotaScope(
+    em: EntityManager,
+    input: Pick<RecordLockScope, 'tenantId' | 'organizationId' | 'userId'>,
+  ): Promise<void> {
+    const lockKey = [
+      'record_locks',
+      'quota',
+      input.tenantId,
+      normalizeScopeOrganization(input.organizationId) ?? 'global',
+      input.userId,
+    ].join(':')
+
+    await em.getConnection().execute('select pg_advisory_xact_lock(hashtext(?))', [lockKey])
   }
 
   private async findOwnedLockByToken(
@@ -1406,6 +1627,7 @@ export class RecordLockService {
 
   private async findOwnedActiveLock(
     input: Pick<RecordLockScope, 'tenantId' | 'organizationId' | 'userId'> & RecordLockResource,
+    em: EntityManager = this.em,
   ): Promise<RecordLock | null> {
     const where: FilterQuery<RecordLock> = {
       ...this.buildScopeWhere(input),
@@ -1414,7 +1636,7 @@ export class RecordLockService {
       lockedByUserId: input.userId,
       status: ACTIVE_LOCK_STATUS,
     }
-    return this.em.findOne(RecordLock, where)
+    return em.findOne(RecordLock, where)
   }
 
   private async hasRecentSavedRelease(input: {
@@ -1486,7 +1708,13 @@ export class RecordLockService {
       where.organizationId = normalizeScopeOrganization(input.organizationId)
     }
 
-    return this.em.findOne(ActionLog, where, { orderBy: { createdAt: 'desc' } })
+    return normalizeActionLogPayload(await findOneWithDecryption(
+      this.em,
+      ActionLog,
+      where,
+      { orderBy: { createdAt: 'desc' } },
+      { tenantId: input.tenantId, organizationId: normalizeScopeOrganization(input.organizationId) },
+    ))
   }
 
   private async findLatestActionLogWithScopeFallback(
@@ -1519,14 +1747,21 @@ export class RecordLockService {
       where.organizationId = normalizeScopeOrganization(input.organizationId)
     }
 
-    return this.em.findOne(ActionLog, where, { orderBy: { createdAt: 'desc' } })
+    return normalizeActionLogPayload(await findOneWithDecryption(
+      this.em,
+      ActionLog,
+      where,
+      { orderBy: { createdAt: 'desc' } },
+      { tenantId: input.tenantId, organizationId: normalizeScopeOrganization(input.organizationId) },
+    ))
   }
 
   private summarizeChangedFieldsFromActionLog(log: ActionLog | null): string {
     if (!log) return ''
 
-    if (isRecordValue(log.changesJson)) {
-      const fromChanges = Object.keys(log.changesJson)
+    const changesJson = readActionLogChangesJson(log)
+    if (changesJson) {
+      const fromChanges = Object.keys(changesJson)
         .filter((field) => !shouldSkipConflictField(field))
         .slice(0, 12)
         .map(formatChangedFieldLabel)
@@ -1534,8 +1769,8 @@ export class RecordLockService {
       if (fromChanges) return fromChanges
     }
 
-    const before = isRecordValue(log.snapshotBefore) ? log.snapshotBefore : null
-    const after = isRecordValue(log.snapshotAfter) ? log.snapshotAfter : null
+    const before = readJsonRecordValue(log.snapshotBefore)
+    const after = readJsonRecordValue(log.snapshotAfter)
     if (!before || !after) return ''
 
     const diffPaths = new Set<string>()
@@ -1554,10 +1789,11 @@ export class RecordLockService {
     incoming: string
     current: string
   }> {
-    if (!log || !isRecordValue(log.changesJson)) return []
+    const changesJson = readActionLogChangesJson(log)
+    if (!changesJson) return []
 
     const rows: Array<{ field: string; incoming: string; current: string }> = []
-    for (const [rawField, rawChange] of Object.entries(log.changesJson)) {
+    for (const [rawField, rawChange] of Object.entries(changesJson)) {
       if (rows.length >= 12) break
       if (shouldSkipConflictField(rawField)) continue
 
@@ -1644,8 +1880,8 @@ export class RecordLockService {
 
     const result = await this.em.transactional(async (tx) => {
       try {
-        const knex = getKnex(tx as EntityManager)
-        await knex.raw('select pg_advisory_xact_lock(hashtext(?))', [dedupeKey])
+        const db = getKysely(tx as EntityManager)
+        await sql`select pg_advisory_xact_lock(hashtext(${dedupeKey}))`.execute(db)
       } catch {
         // Best-effort lock; fallback to find-first behavior below.
       }
@@ -1787,8 +2023,15 @@ export class RecordLockService {
       ? await this.actionLogService.findById(logId)
       : null
     if (!resolved) {
-      resolved = await this.em.findOne(ActionLog, { id: logId, deletedAt: null })
+      resolved = await findOneWithDecryption(
+        this.em,
+        ActionLog,
+        { id: logId, deletedAt: null },
+        undefined,
+        { tenantId: scope.tenantId, organizationId: normalizeScopeOrganization(scope.organizationId) },
+      )
     }
+    resolved = normalizeActionLogPayload(resolved)
     if (!resolved || resolved.deletedAt) return null
 
     if (resolved.tenantId !== scope.tenantId) return null
@@ -1852,14 +2095,14 @@ export class RecordLockService {
     const baseLog = await this.findActionLogById(conflict.baseActionLogId, scope)
     const incomingLog = await this.findActionLogById(conflict.incomingActionLogId, scope)
 
-    const baseSnapshot = isRecordValue(baseLog?.snapshotAfter) ? baseLog.snapshotAfter : null
-    const incomingBeforeSnapshot = isRecordValue(incomingLog?.snapshotBefore) ? incomingLog.snapshotBefore : null
-    const incomingAfterSnapshot = isRecordValue(incomingLog?.snapshotAfter) ? incomingLog.snapshotAfter : null
+    const baseSnapshot = readJsonRecordValue(baseLog?.snapshotAfter ?? null)
+    const incomingBeforeSnapshot = readJsonRecordValue(incomingLog?.snapshotBefore ?? null)
+    const incomingAfterSnapshot = readJsonRecordValue(incomingLog?.snapshotAfter ?? null)
     const fallbackBaseSnapshot = baseSnapshot ?? incomingBeforeSnapshot
 
     const changeMap = new Map<string, { baseValue: unknown; incomingValue: unknown }>()
 
-    const incomingChanges = isRecordValue(incomingLog?.changesJson) ? incomingLog.changesJson : null
+    const incomingChanges = readActionLogChangesJson(incomingLog)
     if (incomingChanges) {
       for (const [fieldPathRaw, rawChange] of Object.entries(incomingChanges)) {
         const fieldPath = fieldPathRaw.trim()

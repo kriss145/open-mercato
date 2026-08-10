@@ -5,10 +5,9 @@ import type { OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
 import { resolveTranslations } from '@open-mercato/shared/lib/i18n/server'
 import { SalesTaxRate } from '../../data/entities'
 import { taxRateCreateSchema, taxRateUpdateSchema } from '../../data/validators'
-import { parseScopedCommandInput, resolveCrudRecordId } from '../utils'
+import { buildAggregateSearchFilter, parseScopedCommandInput, resolveCrudRecordId } from '../utils'
 import { E } from '#generated/entities.ids.generated'
 import * as F from '#generated/entities/sales_tax_rate'
-import { escapeLikePattern } from '@open-mercato/shared/lib/db/escapeLikePattern'
 import { parseBooleanToken } from '@open-mercato/shared/lib/boolean'
 
 const rawBodySchema = z.object({}).passthrough()
@@ -21,6 +20,7 @@ const listSchema = z
     country: z.string().optional(),
     region: z.string().optional(),
     channelId: z.string().uuid().optional(),
+    id: z.string().uuid().optional(),
     isCompound: z.string().optional(),
     sortField: z.string().optional(),
     sortDir: z.enum(['asc', 'desc']).optional(),
@@ -76,17 +76,8 @@ const taxRateDeleteSchema = z.object({
 
 function buildFilters(query: z.infer<typeof listSchema>): Record<string, unknown> {
   const filters: Record<string, unknown> = {}
-  if (query.search && query.search.trim().length > 0) {
-    const term = `%${escapeLikePattern(query.search.trim())}%`
-    filters.$or = [
-      { name: { $ilike: term } },
-      { code: { $ilike: term } },
-      { country_code: { $ilike: term } },
-      { region_code: { $ilike: term } },
-      { postal_code: { $ilike: term } },
-      { city: { $ilike: term } },
-    ]
-  }
+  const searchFilter = buildAggregateSearchFilter(query.search)
+  if (searchFilter) Object.assign(filters, searchFilter)
   if (query.country && query.country.trim().length > 0) {
     filters.country_code = query.country.trim().toUpperCase()
   }
@@ -95,6 +86,9 @@ function buildFilters(query: z.infer<typeof listSchema>): Record<string, unknown
   }
   if (query.channelId) {
     filters.channel_id = query.channelId
+  }
+  if (query.id) {
+    filters.id = { $eq: query.id }
   }
   const isCompound = parseBooleanToken(query.isCompound)
   if (isCompound !== null) filters.is_compound = isCompound
@@ -110,6 +104,7 @@ const crud = makeCrudRoute({
     tenantField: 'tenantId',
     softDeleteField: 'deletedAt',
   },
+  indexer: { entityType: E.sales.sales_tax_rate },
   list: {
     schema: listSchema,
     entityId: E.sales.sales_tax_rate,

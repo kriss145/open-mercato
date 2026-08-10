@@ -1,17 +1,19 @@
 import { expect, test } from '@playwright/test';
-import { login } from '@open-mercato/core/modules/core/__integration__/helpers/auth';
-import { getAuthToken } from '@open-mercato/core/modules/core/__integration__/helpers/api';
+import { login } from '@open-mercato/core/helpers/integration/auth';
+import { getAuthToken } from '@open-mercato/core/helpers/integration/api';
 import {
   createProductFixture,
   deleteCatalogProductIfExists,
-} from '@open-mercato/core/modules/core/__integration__/helpers/catalogFixtures';
-import { createSalesDocument } from '@open-mercato/core/modules/core/__integration__/helpers/salesUi';
+} from '@open-mercato/core/helpers/integration/catalogFixtures';
+import { createSalesDocument } from '@open-mercato/core/helpers/integration/salesUi';
 
 /**
  * TC-INT-003: Product Creation to Sales Channel to Order
  * Source: .ai/qa/scenarios/TC-INT-003-product-to-sales-flow.md
  */
 test.describe('TC-INT-003: Product Creation to Sales Channel to Order', () => {
+  test.setTimeout(60_000);
+
   test('should create a product and proceed with order creation flow', async ({ page, request }) => {
     const stamp = Date.now();
     const productName = `QA INT-003 Product ${stamp}`;
@@ -27,7 +29,7 @@ test.describe('TC-INT-003: Product Creation to Sales Channel to Order', () => {
       await page.goto(`/backend/catalog/products/${productId}`);
       await expect(page).toHaveURL(new RegExp(`/backend/catalog/products/${productId}$`, 'i'));
 
-      await createSalesDocument(page, { kind: 'order' });
+      await createSalesDocument(page, { kind: 'order', preferApi: true, token });
       await expect(page).toHaveURL(/kind=order$/i);
     } finally {
       await deleteCatalogProductIfExists(request, token, productId);

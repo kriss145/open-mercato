@@ -1,7 +1,19 @@
 import { NextResponse } from 'next/server'
+import { sql } from 'kysely'
 import type { OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
+import { runWithCacheTenant } from '@open-mercato/cache'
 import { InboxProposal } from '../../../data/entities'
+import { ALL_CATEGORIES } from '../../../data/validators'
 import { resolveRequestContext, UnauthorizedError } from '../../routeHelpers'
+import {
+  resolveCache,
+  createCountsCacheKey,
+  createCountsCacheTag,
+  COUNTS_CACHE_TTL_MS,
+} from '../../../lib/cache'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('inbox_ops').child({ component: 'proposals-counts' })
 
 export const metadata = {
   GET: { requireAuth: true, requireFeatures: ['inbox_ops.proposals.view'] },
@@ -10,6 +22,15 @@ export const metadata = {
 export async function GET(req: Request) {
   try {
     const ctx = await resolveRequestContext(req)
+    const cache = resolveCache(ctx.container)
+
+    if (cache) {
+      const cacheKey = createCountsCacheKey(ctx.tenantId)
+      const cached = await runWithCacheTenant(ctx.tenantId, () => cache.get(cacheKey))
+      if (cached) {
+        return NextResponse.json(cached)
+      }
+    }
 
     const scope = {
       organizationId: ctx.organizationId,
@@ -19,7 +40,7 @@ export async function GET(req: Request) {
     }
 
     // em.count() is safe here — filter fields (status, organizationId, tenantId,
-    // deletedAt, isActive) are not encrypted, so decryption helpers are not needed.
+    // deletedAt, isActive, category) are not encrypted, so decryption helpers are not needed.
     const [pending, partial, accepted, rejected] = await Promise.all([
       ctx.em.count(InboxProposal, { ...scope, status: 'pending' }),
       ctx.em.count(InboxProposal, { ...scope, status: 'partial' }),
@@ -27,12 +48,49 @@ export async function GET(req: Request) {
       ctx.em.count(InboxProposal, { ...scope, status: 'rejected' }),
     ])
 
-    return NextResponse.json({ pending, partial, accepted, rejected })
+    // Single GROUP BY query for category counts — O(1) queries
+    const db = ctx.em.getKysely<any>() as any
+    const categoryRows = await db
+      .selectFrom('inbox_proposals')
+      .select(['category', sql<string>`count(*)`.as('count')])
+      .where('organization_id', '=', ctx.organizationId)
+      .where('tenant_id', '=', ctx.tenantId)
+      .where('is_active', '=', true)
+      .where('deleted_at', 'is', null)
+      .groupBy('category')
+      .execute() as Array<{ category: string | null; count: string | number }>
+
+    const byCategory: Record<string, number> = {}
+    for (const cat of ALL_CATEGORIES) {
+      byCategory[cat] = 0
+    }
+    for (const row of categoryRows) {
+      const cat = row.category as string | null
+      if (cat && cat in byCategory) {
+        byCategory[cat] = Number(row.count)
+      }
+    }
+
+    const responseBody = { pending, partial, accepted, rejected, byCategory }
+
+    if (cache) {
+      const cacheKey = createCountsCacheKey(ctx.tenantId)
+      const tag = createCountsCacheTag(ctx.tenantId)
+      try {
+        await runWithCacheTenant(ctx.tenantId, () =>
+          cache.set(cacheKey, responseBody, { ttl: COUNTS_CACHE_TTL_MS, tags: [tag] }),
+        )
+      } catch (err) {
+        logger.warn('Failed to set cache', { err })
+      }
+    }
+
+    return NextResponse.json(responseBody)
   } catch (err) {
     if (err instanceof UnauthorizedError) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
-    console.error('[inbox_ops:proposals:counts] Error:', err)
+    logger.error('Failed to get counts', { err })
     return NextResponse.json({ error: 'Failed to get counts' }, { status: 500 })
   }
 }
@@ -42,10 +100,10 @@ export const openApi: OpenApiRouteDoc = {
   summary: 'Proposal counts',
   methods: {
     GET: {
-      summary: 'Get proposal status counts',
-      description: 'Returns counts by status for tab badges',
+      summary: 'Get proposal status and category counts',
+      description: 'Returns counts by status and by category for tab badges and filter dropdowns',
       responses: [
-        { status: 200, description: 'Status counts object' },
+        { status: 200, description: 'Status and category counts object' },
       ],
     },
   },

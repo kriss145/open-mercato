@@ -1,7 +1,7 @@
-import type { ModuleCli } from '@open-mercato/shared/modules/registry'
+import { getCliModules, getDefaultEncryptionMaps, type Module, type ModuleCli } from '@open-mercato/shared/modules/registry'
 import { createRequestContainer } from '@open-mercato/shared/lib/di/container'
 import type { CacheStrategy } from '@open-mercato/cache/types'
-import { CustomEntity, CustomFieldDef, EncryptionMap } from '@open-mercato/core/modules/entities/data/entities'
+import { CustomEntity, CustomFieldDef, EncryptionMap } from './data/entities'
 import {
   installCustomEntitiesFromModules,
   getAggregatedCustomEntityConfigs,
@@ -9,8 +9,8 @@ import {
 import readline from 'node:readline/promises'
 import { stdin as input, stdout as output } from 'node:process'
 import { isTenantDataEncryptionEnabled } from '@open-mercato/shared/lib/encryption/toggles'
-import { DEFAULT_ENCRYPTION_MAPS } from '@open-mercato/core/modules/entities/lib/encryptionDefaults'
 import { parseBooleanToken } from '@open-mercato/shared/lib/boolean'
+import { parseCommaSeparatedList } from '@open-mercato/shared/lib/string'
 import { createKmsService, type KmsService, type TenantDek } from '@open-mercato/shared/lib/encryption/kms'
 import {
   decryptWithAesGcm,
@@ -18,9 +18,12 @@ import {
   TenantDataEncryptionError,
   TenantDataEncryptionErrorCode,
 } from '@open-mercato/shared/lib/encryption/aes'
-import { TenantDataEncryptionService } from '@open-mercato/shared/lib/encryption/tenantDataEncryptionService'
+import {
+  TenantDataEncryptionService,
+  parseDecryptedFieldValue,
+} from '@open-mercato/shared/lib/encryption/tenantDataEncryptionService'
 import { resolveEntityIdFromMetadata } from '@open-mercato/shared/lib/encryption/entityIds'
-import { Organization } from '@open-mercato/core/modules/directory/data/entities'
+import { Organization } from '../directory/data/entities'
 import crypto from 'node:crypto'
 
 function parseArgs(rest: string[]) {
@@ -191,7 +194,7 @@ const addField: ModuleCli = {
       let options: string[] | undefined
       if (kind === 'select') {
         const raw = (args.options as string) || await ask('Options (comma-separated)', 'low,medium,high')
-        options = raw.split(',').map((s) => s.trim()).filter(Boolean)
+        options = parseCommaSeparatedList(raw)
       }
       let defaultValue: any = undefined
       const defRaw = (args.default as string) ?? (args.defaultValue as string)
@@ -224,7 +227,7 @@ const addField: ModuleCli = {
       if (description !== undefined) configJson.description = description
 
       if (!existing) {
-        await em.persistAndFlush(em.create(CustomFieldDef, {
+        await em.persist(em.create(CustomFieldDef, {
           entityId,
           organizationId: orgId,
           tenantId: tenantId,
@@ -232,7 +235,7 @@ const addField: ModuleCli = {
           kind,
           configJson,
           isActive: true,
-        }))
+        })).flush()
         console.log(`Created custom field: ${entityId}.${key} (${kind})${orgId == null ? ' [global]' : ` [org=${orgId}, tenant=${tenantId}]`}`)
       } else {
         existing.kind = kind as any
@@ -249,8 +252,19 @@ const addField: ModuleCli = {
   },
 }
 
+function resolveEncryptionMapModules(): Module[] {
+  const cliModules = getCliModules()
+  if (cliModules.length > 0) return cliModules
+  try {
+    const { getModules } = require('@open-mercato/shared/lib/modules/registry')
+    return getModules()
+  } catch {
+    return []
+  }
+}
+
 async function upsertEncryptionMaps(em: any, tenantId: string, organizationId: string | null, logger: (msg: string) => void) {
-  for (const spec of DEFAULT_ENCRYPTION_MAPS) {
+  for (const spec of getDefaultEncryptionMaps(resolveEncryptionMapModules())) {
     const existing = await em.findOne(EncryptionMap, {
       entityId: spec.entityId,
       tenantId,
@@ -262,7 +276,7 @@ async function upsertEncryptionMaps(em: any, tenantId: string, organizationId: s
       existing.isActive = true
       existing.updatedAt = new Date()
       logger(`🔒 Updated encryption map for ${spec.entityId} ✨`)
-      await em.persistAndFlush(existing)
+      await em.persist(existing).flush()
       continue
     }
     const map = em.create(EncryptionMap, {
@@ -272,7 +286,7 @@ async function upsertEncryptionMaps(em: any, tenantId: string, organizationId: s
       fieldsJson: spec.fields,
       isActive: true,
     })
-    await em.persistAndFlush(map)
+    await em.persist(map).flush()
     logger(`Created encryption map for ${spec.entityId}`)
   }
 }
@@ -302,7 +316,7 @@ const seedEncryptionMaps: ModuleCli = {
 }
 
 function normalizeKeyInput(value: string): string {
-  return value.trim().replace(/^['"]|['"]$/g, '')
+  return value.trim().replace(/(?:^['"]|['"]$)/g, '')
 }
 
 class DerivedKeyKmsService implements KmsService {
@@ -553,11 +567,7 @@ const rotateEncryptionKey: ModuleCli = {
             if (typeof value !== 'string' || !isEncryptedPayload(value)) continue
             const decrypted = decryptWithOldKey(value, oldDek)
             if (decrypted === null) continue
-            try {
-              payload[rule.field] = JSON.parse(decrypted)
-            } catch {
-              payload[rule.field] = decrypted
-            }
+            payload[rule.field] = parseDecryptedFieldValue(decrypted)
           }
         }
         const encrypted = await encryptionService.encryptEntityPayload(

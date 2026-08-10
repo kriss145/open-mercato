@@ -3,8 +3,10 @@
 import * as React from 'react'
 import { z } from 'zod'
 import { Button } from '../../primitives/button'
+import { IconButton } from '../../primitives/icon-button'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@open-mercato/ui/primitives/dialog'
 import { Input } from '@open-mercato/ui/primitives/input'
+import { Tabs, TabsList, TabsTrigger } from '@open-mercato/ui/primitives/tabs'
 import { TagsInput } from '@open-mercato/ui/backend/inputs/TagsInput'
 import { CrudForm, type CrudField, type CrudFormGroup } from '@open-mercato/ui/backend/CrudForm'
 import { collectCustomFieldValues } from '@open-mercato/ui/backend/utils/customFieldValues'
@@ -13,6 +15,7 @@ import { flash } from '@open-mercato/ui/backend/FlashMessages'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
 import { cn } from '@open-mercato/shared/lib/utils'
 import { Copy, Download, Trash2 } from 'lucide-react'
+import { useDialogKeyHandler } from '@open-mercato/ui/hooks/useDialogKeyHandler'
 import { AttachmentContentPreview } from '@open-mercato/core/modules/attachments/components/AttachmentContentPreview'
 import { buildAttachmentFileUrl, buildAttachmentImageUrl, slugifyAttachmentFileName } from '@open-mercato/core/modules/attachments/lib/imageUrls'
 import { E } from '@open-mercato/core/generated-shims/entities.ids.generated'
@@ -94,7 +97,7 @@ type AttachmentMetadataDialogProps = {
 }
 
 function formatFileSize(value: number): string {
-  if (!Number.isFinite(value)) return '—'
+  if (!Number.isFinite(value)) return '\u2014'
   if (value <= 0) return '0 B'
   const units = ['B', 'KB', 'MB', 'GB', 'TB']
   let idx = 0
@@ -166,54 +169,87 @@ function AssignmentInputRow({
   disabled?: boolean
   onRemove: () => void
 }) {
+  const trimmedLabel = value.label?.trim() ?? ''
+  const trimmedType = value.type?.trim() ?? ''
+  const trimmedId = value.id?.trim() ?? ''
+  const primaryLabel = trimmedLabel || trimmedType || trimmedId
+  const secondaryLabel = [
+    trimmedLabel ? trimmedType : '',
+    trimmedId && trimmedId !== primaryLabel ? trimmedId : '',
+  ]
+    .filter(Boolean)
+    .join(' - ')
+
   return (
-    <div className="grid grid-cols-1 gap-2 rounded-md border border-border/70 bg-background p-3 sm:grid-cols-2 lg:grid-cols-[1.2fr_1.2fr_1.6fr_1fr_auto]">
-      <div className="space-y-1">
-        <label className="text-xs font-medium">{labels.type}</label>
-        <Input
-          value={value.type}
-          onChange={(event) => onChange({ ...value, type: event.target.value })}
-          placeholder="catalog.product"
+    <div data-assignment-card className="min-w-0 rounded-md border border-border/70 bg-background p-3">
+      <div className="mb-3 flex min-w-0 items-start justify-between gap-3">
+        <div className="min-w-0">
+          {primaryLabel ? (
+            <p className="truncate text-sm font-medium text-foreground">{primaryLabel}</p>
+          ) : null}
+          {secondaryLabel ? (
+            <p className="truncate text-xs text-muted-foreground">{secondaryLabel}</p>
+          ) : null}
+        </div>
+        <IconButton
+          type="button"
+          variant="ghost"
+          size="default"
+          aria-label={labels.remove}
+          onClick={onRemove}
           disabled={disabled}
-        />
+          className="shrink-0"
+        >
+          <Trash2 className="size-4" />
+        </IconButton>
       </div>
-      <div className="space-y-1">
-        <label className="text-xs font-medium">{labels.id}</label>
-        <Input
-          value={value.id}
-          onChange={(event) => onChange({ ...value, id: event.target.value })}
-          placeholder="Record ID"
-          disabled={disabled}
-        />
-      </div>
-      <div className="space-y-1">
-        <label className="text-xs font-medium">{labels.href}</label>
-        <Input
-          value={value.href ?? ''}
-          onChange={(event) => onChange({ ...value, href: event.target.value })}
-          placeholder="https://"
-          disabled={disabled}
-        />
-      </div>
-      <div className="space-y-1">
-        <label className="text-xs font-medium">{labels.label}</label>
-        <Input
-          value={value.label ?? ''}
-          onChange={(event) => onChange({ ...value, label: event.target.value })}
-          placeholder="Optional label"
-          disabled={disabled}
-        />
-      </div>
-      <div className="flex items-end">
-        <Button type="button" variant="ghost" size="icon" onClick={onRemove} disabled={disabled}>
-          <Trash2 className="h-4 w-4" />
-        </Button>
+      <div className="grid min-w-0 grid-cols-1 gap-3 md:grid-cols-2">
+        <div className="min-w-0 space-y-1">
+          <label className="text-xs font-medium">{labels.type}</label>
+          <Input
+            className="w-full min-w-0"
+            value={value.type}
+            onChange={(event) => onChange({ ...value, type: event.target.value })}
+            placeholder="catalog.product"
+            disabled={disabled}
+          />
+        </div>
+        <div className="min-w-0 space-y-1">
+          <label className="text-xs font-medium">{labels.id}</label>
+          <Input
+            className="w-full min-w-0"
+            value={value.id}
+            onChange={(event) => onChange({ ...value, id: event.target.value })}
+            placeholder="Record ID"
+            disabled={disabled}
+          />
+        </div>
+        <div className="min-w-0 space-y-1 md:col-span-2">
+          <label className="text-xs font-medium">{labels.href}</label>
+          <Input
+            className="w-full min-w-0"
+            value={value.href ?? ''}
+            onChange={(event) => onChange({ ...value, href: event.target.value })}
+            placeholder="https://"
+            disabled={disabled}
+          />
+        </div>
+        <div className="min-w-0 space-y-1 md:col-span-2">
+          <label className="text-xs font-medium">{labels.label}</label>
+          <Input
+            className="w-full min-w-0"
+            value={value.label ?? ''}
+            onChange={(event) => onChange({ ...value, label: event.target.value })}
+            placeholder="Optional label"
+            disabled={disabled}
+          />
+        </div>
       </div>
     </div>
   )
 }
 
-function AttachmentAssignmentsEditor({
+export function AttachmentAssignmentsEditor({
   value,
   onChange,
   labels,
@@ -254,7 +290,7 @@ function AttachmentAssignmentsEditor({
       <div className="space-y-2">
         {value.length ? value.map((entry, idx) => (
           <AssignmentInputRow
-            key={`${entry.type}-${entry.id}-${idx}`}
+            key={idx}
             value={entry}
             labels={labels}
             disabled={disabled}
@@ -304,7 +340,7 @@ export function AttachmentMetadataDialog({ open, onOpenChange, item, availableTa
       tags: item.tags ?? [],
       assignments: prepareAssignmentsForForm(item.assignments),
     })
-    setExtractedContent(item.content ?? null)
+    setExtractedContent(item.content && item.content.trim() ? item.content : null)
     const loadDetails = async () => {
       try {
         const call = await apiCall<AttachmentMetadataResponse>(`/api/attachments/library/${encodeURIComponent(item.id)}`)
@@ -321,7 +357,7 @@ export function AttachmentMetadataDialog({ open, onOpenChange, item, availableTa
             assignments: prepareAssignmentsForForm(payload.assignments ?? item.assignments),
             ...prefixedCustom,
           })
-          const nextContent = typeof payload.content === 'string' ? payload.content : null
+          const nextContent = typeof payload.content === 'string' && payload.content.trim() ? payload.content : null
           setExtractedContent(nextContent)
         }
       } catch (err: any) {
@@ -476,15 +512,9 @@ export function AttachmentMetadataDialog({ open, onOpenChange, item, availableTa
     [item, onSave],
   )
 
-  const handleKeyDown = React.useCallback(
-    (event: React.KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        event.preventDefault()
-        onOpenChange(false)
-      }
-    },
-    [onOpenChange],
-  )
+  const handleKeyDown = useDialogKeyHandler({
+    onCancel: () => onOpenChange(false),
+  })
 
   const handleCopyResizedUrl = React.useCallback(async () => {
     if (!item) return
@@ -517,7 +547,7 @@ export function AttachmentMetadataDialog({ open, onOpenChange, item, availableTa
     }
   }, [item, sizeHeight, sizeWidth, t])
 
-  const loadMessage = t('attachments.library.metadata.loading', 'Loading attachment details…')
+  const loadMessage = t('attachments.library.metadata.loading', 'Loading attachment details\u2026')
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -533,7 +563,7 @@ export function AttachmentMetadataDialog({ open, onOpenChange, item, availableTa
                   {item.fileName}
                 </div>
                 <div className="text-xs text-muted-foreground">
-                  {formatFileSize(item.fileSize)} • {item.partitionTitle ?? item.partitionCode}
+                  {formatFileSize(item.fileSize)} {'\u2022'} {item.partitionTitle ?? item.partitionCode}
                 </div>
               </div>
               {downloadUrl ? (
@@ -547,29 +577,21 @@ export function AttachmentMetadataDialog({ open, onOpenChange, item, availableTa
             </div>
             {isImage ? (
               <div className="rounded border">
-                <div className="flex flex-wrap gap-4 border-b px-3 py-2 text-sm font-medium" role="tablist">
-                  {(['preview', 'resize'] as const).map((tab) => (
-                    <Button
-                      key={tab}
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      role="tab"
-                      aria-selected={imageTab === tab}
-                      onClick={() => setImageTab(tab)}
-                      className={cn(
-                        'h-auto -mb-px rounded-none border-b-2 border-transparent px-0 py-1',
-                        imageTab === tab
-                          ? 'border-primary text-foreground'
-                          : 'text-muted-foreground hover:text-foreground',
-                      )}
-                    >
-                      {tab === 'preview'
-                        ? t('attachments.library.metadata.preview', 'Preview')
-                        : t('attachments.library.metadata.resizeTool.title', 'Generate resized URL')}
-                    </Button>
-                  ))}
-                </div>
+                <Tabs
+                  value={imageTab}
+                  onValueChange={(value) => setImageTab(value as 'preview' | 'resize')}
+                  variant="underline"
+                >
+                  <TabsList className="w-full flex-wrap px-3">
+                    {(['preview', 'resize'] as const).map((tab) => (
+                      <TabsTrigger key={tab} value={tab}>
+                        {tab === 'preview'
+                          ? t('attachments.library.metadata.preview', 'Preview')
+                          : t('attachments.library.metadata.resizeTool.title', 'Generate resized URL')}
+                      </TabsTrigger>
+                    ))}
+                  </TabsList>
+                </Tabs>
                 <div className="space-y-3 p-3">
                   {imageTab === 'preview' ? (
                     previewUrl ? (
@@ -634,7 +656,7 @@ export function AttachmentMetadataDialog({ open, onOpenChange, item, availableTa
                 {loadError}
               </div>
             ) : null}
-            <div className="rounded border border-border/60 bg-muted/30 px-3 py-2">
+            <div className="rounded border border-border/70 bg-muted/30 px-3 py-2">
               <div className="text-xs font-semibold text-muted-foreground">
                 {t('attachments.library.metadata.extractedTitle', 'Extracted text')}
               </div>

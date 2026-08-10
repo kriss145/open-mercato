@@ -7,7 +7,7 @@ import { Page, PageBody } from '@open-mercato/ui/backend/Page'
 import { Button } from '@open-mercato/ui/primitives/button'
 import { apiCall } from '@open-mercato/ui/backend/utils/apiCall'
 import { flash } from '@open-mercato/ui/backend/FlashMessages'
-import { LoadingMessage, ErrorMessage } from '@open-mercato/ui/backend/detail'
+import { LoadingMessage, ErrorMessage, RecordNotFoundState } from '@open-mercato/ui/backend/detail'
 import { useT, useLocale } from '@open-mercato/shared/lib/i18n/context'
 import { useConfirmDialog } from '@open-mercato/ui/backend/confirm-dialog'
 import { useGuardedMutation } from '@open-mercato/ui/backend/injection/useGuardedMutation'
@@ -22,10 +22,12 @@ import {
   RefreshCw,
   Users,
   Languages,
+  Pencil,
 } from 'lucide-react'
 import type { ProposalTranslationEntry } from '../../../../data/entities'
 import type { ProposalDetail, ActionDetail, DiscrepancyDetail, EmailDetail } from '../../../../components/proposals/types'
 import { ActionCard, ConfidenceBadge, useActionTypeLabels, useDiscrepancyDescriptions } from '../../../../components/proposals/ActionCard'
+import { CategoryBadge, CATEGORY_CONFIG, ALL_CATEGORIES, useCategoryLabels } from '../../../../components/proposals/CategoryBadge'
 import { hasContactNameIssue } from '../../../../lib/contactValidation'
 import { EditActionDialog } from '../../../../components/proposals/EditActionDialog'
 
@@ -66,6 +68,82 @@ function EmailThreadViewer({ email }: { email: EmailDetail | null }) {
   )
 }
 
+function CategoryEditDropdown({
+  currentCategory,
+  onSelect,
+  disabled,
+}: {
+  currentCategory: string | null | undefined
+  onSelect: (category: string) => void
+  disabled: boolean
+}) {
+  const t = useT()
+  const labels = useCategoryLabels()
+  const [isOpen, setIsOpen] = React.useState(false)
+  const dropdownRef = React.useRef<HTMLDivElement>(null)
+
+  React.useEffect(() => {
+    function handleClickOutside(event: MouseEvent) {
+      if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
+        setIsOpen(false)
+      }
+    }
+    function handleEscape(event: KeyboardEvent) {
+      if (event.key === 'Escape') setIsOpen(false)
+    }
+    if (isOpen) {
+      document.addEventListener('mousedown', handleClickOutside)
+      document.addEventListener('keydown', handleEscape)
+    }
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside)
+      document.removeEventListener('keydown', handleEscape)
+    }
+  }, [isOpen])
+
+  return (
+    <div className="relative inline-block" ref={dropdownRef}>
+      <div className="flex items-center gap-1">
+        <CategoryBadge category={currentCategory} />
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          className="h-6 w-6 p-0"
+          onClick={() => setIsOpen(!isOpen)}
+          disabled={disabled}
+          title={t('inbox_ops.recategorize', 'Change Category')}
+        >
+          <Pencil className="h-3 w-3" />
+        </Button>
+      </div>
+      {isOpen && (
+        <div className="absolute top-full left-0 mt-1 z-dropdown w-48 rounded-md border bg-popover shadow-md">
+          <div className="p-1">
+            {ALL_CATEGORIES.map((cat) => {
+              const config = CATEGORY_CONFIG[cat]
+              const { Icon } = config
+              return (
+                <Button
+                  key={cat}
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className={`flex items-center gap-2 w-full justify-start rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground ${currentCategory === cat ? 'bg-accent' : ''}`}
+                  onClick={() => { onSelect(cat); setIsOpen(false) }}
+                >
+                  <Icon className="h-3.5 w-3.5" />
+                  {labels[cat] || cat}
+                </Button>
+              )
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 export default function ProposalDetailPage({ params }: { params?: { id?: string } }) {
   const t = useT()
   const locale = useLocale()
@@ -78,6 +156,7 @@ export default function ProposalDetailPage({ params }: { params?: { id?: string 
   const [email, setEmail] = React.useState<EmailDetail | null>(null)
   const [isLoading, setIsLoading] = React.useState(true)
   const [error, setError] = React.useState<string | null>(null)
+  const [isNotFound, setIsNotFound] = React.useState(false)
   const [isProcessing, setIsProcessing] = React.useState(false)
 
   const { confirm, ConfirmDialogElement } = useConfirmDialog()
@@ -146,10 +225,27 @@ export default function ProposalDetailPage({ params }: { params?: { id?: string 
     setIsTranslating(false)
   }, [proposalId, locale, t, runMutation])
 
+  const handleCategorize = React.useCallback(async (category: string) => {
+    if (!proposalId) return
+    const result = await runMutation({
+      operation: () => apiCall<{ ok: boolean; category: string; previousCategory: string | null }>(
+        `/api/inbox_ops/proposals/${proposalId}/categorize`,
+        { method: 'POST', body: JSON.stringify({ category }) },
+      ),
+      context: {},
+    })
+    if (result?.ok && result.result?.ok) {
+      setProposal((prev) => prev ? { ...prev, category: result.result!.category } : prev)
+    } else {
+      flash(t('inbox_ops.flash.save_failed', 'Failed to save'), 'error')
+    }
+  }, [proposalId, t, runMutation])
+
   const loadData = React.useCallback(async () => {
     if (!proposalId) return
     setIsLoading(true)
     setError(null)
+    setIsNotFound(false)
     try {
       const result = await apiCall<{
         proposal: ProposalDetail
@@ -162,6 +258,8 @@ export default function ProposalDetailPage({ params }: { params?: { id?: string 
         setActions(result.result.actions || [])
         setDiscrepancies(result.result.discrepancies || [])
         setEmail(result.result.email)
+      } else if (result?.status === 404) {
+        setIsNotFound(true)
       } else {
         setError(t('inbox_ops.flash.load_failed', 'Failed to load proposal'))
       }
@@ -306,8 +404,37 @@ export default function ProposalDetailPage({ params }: { params?: { id?: string 
     setSendingReplyId(null)
   }, [proposalId, t, loadData, runMutation])
 
-  if (isLoading) return <LoadingMessage label={t('inbox_ops.loading_proposal', 'Loading proposal...')} />
-  if (error) return <ErrorMessage label={error} />
+  if (isLoading) {
+    return (
+      <Page>
+        <PageBody>
+          <LoadingMessage label={t('inbox_ops.loading_proposal', 'Loading proposal...')} />
+        </PageBody>
+      </Page>
+    )
+  }
+  if (isNotFound) {
+    return (
+      <Page>
+        <PageBody>
+          <RecordNotFoundState
+            label={t('inbox_ops.proposal.notFound', 'Proposal not found.')}
+            backHref="/backend/inbox-ops"
+            backLabel={t('inbox_ops.proposal.backToList', 'Back to inbox')}
+          />
+        </PageBody>
+      </Page>
+    )
+  }
+  if (error) {
+    return (
+      <Page>
+        <PageBody>
+          <ErrorMessage label={error} />
+        </PageBody>
+      </Page>
+    )
+  }
 
   const pendingActions = actions.filter((a) => a.status === 'pending')
   const emailIsProcessing = email?.status === 'processing'
@@ -377,13 +504,13 @@ export default function ProposalDetailPage({ params }: { params?: { id?: string 
                 <p className="text-sm text-muted-foreground">{t('inbox_ops.extraction_loading', 'AI is analyzing this thread...')}</p>
               </div>
             ) : emailFailed ? (
-              <div className="border rounded-lg p-4 bg-red-50 dark:bg-red-950/20">
+              <div className="border rounded-lg p-4 bg-status-error-bg border-status-error-border">
                 <div className="flex items-center gap-2 mb-2">
-                  <AlertTriangle className="h-5 w-5 text-red-600" />
-                  <span className="text-sm font-medium text-red-700">{t('inbox_ops.extraction_failed', 'Extraction failed')}</span>
+                  <AlertTriangle className="h-5 w-5 text-status-error-icon" />
+                  <span className="text-sm font-medium text-status-error-text">{t('inbox_ops.extraction_failed', 'Extraction failed')}</span>
                 </div>
                 {email?.processingError && (
-                  <p className="text-xs text-red-600 mb-3">{email.processingError}</p>
+                  <p className="text-xs text-status-error-text mb-3">{email.processingError}</p>
                 )}
                 <Button type="button" size="sm" variant="outline" onClick={handleRetryExtraction} disabled={isProcessing}>
                   <RefreshCw className="h-4 w-4 mr-1" />
@@ -420,15 +547,23 @@ export default function ProposalDetailPage({ params }: { params?: { id?: string 
                     {showTranslation && translation ? translation.summary : proposal.summary}
                   </p>
 
-                  <div className="flex items-center gap-4 mb-3">
+                  <div className="flex items-center gap-4 mb-3 flex-wrap">
                     <div>
                       <span className="text-xs text-muted-foreground">{t('inbox_ops.confidence', 'Confidence')}</span>
                       <ConfidenceBadge value={proposal.confidence} />
                     </div>
+                    <div>
+                      <span className="text-xs text-muted-foreground block">{t('inbox_ops.category', 'Category')}</span>
+                      <CategoryEditDropdown
+                        currentCategory={proposal.category}
+                        onSelect={handleCategorize}
+                        disabled={isProcessing}
+                      />
+                    </div>
                   </div>
 
                   {proposal.possiblyIncomplete && (
-                    <div className="flex items-center gap-2 text-xs text-yellow-600 bg-yellow-50 dark:bg-yellow-950/20 rounded px-2 py-1 mb-3">
+                    <div className="flex items-center gap-2 text-xs text-status-warning-text bg-status-warning-bg rounded px-2 py-1 mb-3">
                       <AlertTriangle className="h-3 w-3" />
                       {t('inbox_ops.possibly_incomplete', 'This thread appears to be a partial forward')}
                     </div>
@@ -444,7 +579,7 @@ export default function ProposalDetailPage({ params }: { params?: { id?: string 
                             <Users className="h-3 w-3 text-muted-foreground" />
                             <span>{p.name}</span>
                             <span className="text-xs text-muted-foreground">({p.role})</span>
-                            {p.matchedContactId && <CheckCircle className="h-3 w-3 text-green-500" />}
+                            {p.matchedContactId && <CheckCircle className="h-3 w-3 text-status-success-icon" />}
                           </div>
                         ))}
                       </div>
@@ -458,21 +593,21 @@ export default function ProposalDetailPage({ params }: { params?: { id?: string 
                   const general = discrepancies.filter((d) => !d.resolved && (!d.actionId || !actionIds.has(d.actionId)))
                   if (general.length === 0) return null
                   return (
-                    <div className="border rounded-lg p-3 md:p-4 bg-yellow-50 dark:bg-yellow-950/20">
+                    <div className="border rounded-lg p-3 md:p-4 bg-status-warning-bg border-status-warning-border">
                       <div className="flex items-center gap-2 mb-2">
-                        <AlertTriangle className="h-4 w-4 text-yellow-600" />
-                        <h3 className="font-semibold text-sm text-yellow-800 dark:text-yellow-300">{t('inbox_ops.discrepancies', 'Issues Detected')}</h3>
+                        <AlertTriangle className="h-4 w-4 text-status-warning-icon" />
+                        <h3 className="font-semibold text-sm text-status-warning-text">{t('inbox_ops.discrepancies', 'Issues Detected')}</h3>
                       </div>
                       <div className="space-y-1.5">
                         {general.map((d) => (
                           <div key={d.id} className={`flex items-start gap-2 text-xs rounded px-2 py-1.5 ${
-                            d.severity === 'error' ? 'bg-red-100 text-red-700 dark:bg-red-950/30' : 'bg-yellow-100 text-yellow-700 dark:bg-yellow-950/30'
+                            d.severity === 'error' ? 'bg-status-error-bg text-status-error-text' : 'bg-status-warning-bg text-status-warning-text'
                           }`}>
                             <AlertTriangle className="h-3 w-3 mt-0.5 flex-shrink-0" />
                             <div>
                               <span>{resolveDiscrepancyDescription(d.description, d.foundValue)}</span>
                               {(d.expectedValue || d.foundValue) && (
-                                <div className="mt-0.5 text-[11px] opacity-80">
+                                <div className="mt-0.5 text-overline opacity-80">
                                   {d.expectedValue && <span>{t('inbox_ops.discrepancy.expected', 'Expected')}: {d.expectedValue}</span>}
                                   {d.expectedValue && d.foundValue && <span> · </span>}
                                   {d.foundValue && <span>{t('inbox_ops.discrepancy.found', 'Found')}: {d.foundValue}</span>}

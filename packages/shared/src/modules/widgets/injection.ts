@@ -38,6 +38,15 @@ export type AppEventPayload = {
 }
 
 /**
+ * Filter which operations trigger widget event handlers.
+ * When set, handlers only fire for the specified operations.
+ */
+export type WidgetInjectionEventFilter = {
+  /** Only run handlers for these operations. Omit to run for all. */
+  operations?: ('create' | 'update' | 'delete')[]
+}
+
+/**
  * Widget injection event handlers for lifecycle management.
  *
  * Handlers are classified into two categories:
@@ -45,6 +54,9 @@ export type AppEventPayload = {
  * - **Transformer events**: Pipeline handlers where output of widget N becomes input of widget N+1
  */
 export type WidgetInjectionEventHandlers<TContext = unknown, TData = unknown> = {
+  /** Filter which operations trigger these event handlers */
+  filter?: WidgetInjectionEventFilter
+
   // === Existing: Lifecycle Actions ===
 
   /**
@@ -122,8 +134,12 @@ export type WidgetInjectionEventHandlers<TContext = unknown, TData = unknown> = 
   /**
    * Transform form data before submission. Output of widget N becomes input of widget N+1.
    * Transformer event — pipeline dispatch.
+   *
+   * Return `{ data, applyToForm: true }` to also reflect the transformed values back into
+   * the visible form fields (opt-in). Default behavior (returning plain `TData`) only
+   * modifies the submit payload and leaves the visible form unchanged.
    */
-  transformFormData?: (data: TData, context: TContext) => Promise<TData>
+  transformFormData?: (data: TData, context: TContext) => Promise<TData | { data: TData; applyToForm: true }>
 
   /**
    * Transform data for display purposes. Output of widget N becomes input of widget N+1.
@@ -148,6 +164,24 @@ export type InjectionWidgetMetadata = {
   features?: string[]
   priority?: number
   enabled?: boolean
+  /**
+   * Module IDs that MUST be enabled in `modules.ts` for this widget to be loaded.
+   * When any listed module is missing from the enabled module set, the widget is
+   * skipped at load time — its component is never imported and never rendered.
+   *
+   * Use this when a widget integrates with another module's runtime surface
+   * (for example a customers AI trigger that calls `/api/ai_assistant/...`).
+   * Feature flags alone are insufficient because a superadmin / wildcard grant
+   * may still pass the feature gate even when the dependency module is absent.
+   */
+  requiredModules?: string[]
+  /**
+   * Field ids that this widget treats as required (enforced by its own
+   * `onBeforeSave` validation). Host forms add a visual required marker to the
+   * matching fields while the widget is active. The marker is presentational
+   * only — enforcement still comes from the widget's `onBeforeSave` result.
+   */
+  requiredFields?: string[]
 }
 
 /**
@@ -214,6 +248,13 @@ export type InjectionWidgetModule<TContext = unknown, TData = unknown> = {
 
 export type InjectionColumnDefinition = {
   id: string
+  /**
+   * i18n translation key for the column header.
+   * When present, consumers should call `t(headerKey, header)` instead of treating `header` as a key.
+   * Follows the same `label`/`labelKey` convention used by `InjectionFieldDefinition`.
+   */
+  headerKey?: string
+  /** Display text (and i18n fallback) for the column header. */
   header: string
   accessorKey: string
   cell?: (props: { getValue: () => unknown }) => ReactNode
@@ -234,7 +275,16 @@ export type InjectionBulkActionDefinition = {
   id: string
   label: string
   icon?: string
-  onExecute: (selectedRows: unknown[], context: unknown) => Promise<void>
+  requiresSelection?: boolean
+  onExecute: (
+    selectedRows: unknown[],
+    context: unknown,
+  ) => Promise<void | {
+    ok: boolean
+    message?: string
+    affectedCount?: number
+    progressJobId?: string | null
+  }>
 }
 
 export type InjectionFilterDefinition = {
@@ -245,12 +295,21 @@ export type InjectionFilterDefinition = {
   strategy: 'server' | 'client'
   queryParam?: string
   enrichedField?: string
+  filterFn?: (row: unknown, value: unknown) => boolean
 }
 
-export type FieldVisibilityCondition<TContext = unknown> = (
-  values: Record<string, unknown>,
-  context: TContext,
-) => boolean
+export type FieldVisibilityRule = {
+  field: string
+  operator: 'eq' | 'neq' | 'in' | 'notIn' | 'truthy' | 'falsy'
+  value?: unknown
+}
+
+export type FieldVisibilityCondition<TContext = unknown> =
+  | FieldVisibilityRule
+  | ((
+      values: Record<string, unknown>,
+      context: TContext,
+    ) => boolean)
 
 export type CustomFieldProps<TContext = unknown> = {
   value: unknown
@@ -269,9 +328,10 @@ export type FieldContext = {
 export type InjectionFieldDefinition = {
   id: string
   label: string
+  labelKey?: string
   type: 'text' | 'select' | 'number' | 'date' | 'boolean' | 'textarea' | 'custom'
-  options?: { value: string; label: string }[]
-  optionsLoader?: (context: FieldContext) => Promise<{ value: string; label: string }[]>
+  options?: Array<{ value: string; label: string; labelKey?: string }>
+  optionsLoader?: (context: FieldContext) => Promise<Array<{ value: string; label: string; labelKey?: string }>>
   optionsCacheTtl?: number
   customComponent?: LazyExoticComponent<ComponentType<CustomFieldProps>>
   group: string
@@ -297,12 +357,13 @@ export type InjectionContext = {
 export type InjectionWizardStep = {
   id: string
   label: string
+  description?: string
   fields?: InjectionFieldDefinition[]
   customComponent?: LazyExoticComponent<ComponentType<WizardStepProps>>
   validate?: (
     data: Record<string, unknown>,
     context: InjectionContext,
-  ) => Promise<{ ok: boolean; message?: string }>
+  ) => Promise<{ ok: boolean; message?: string; fieldErrors?: Record<string, string> }>
 }
 
 export type InjectionWizardWidget = {

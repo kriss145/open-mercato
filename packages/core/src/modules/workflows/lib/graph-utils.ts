@@ -1,4 +1,4 @@
-import { Node, Edge } from '@xyflow/react'
+import type { Node, Edge } from '@xyflow/react'
 import type { WorkflowDefinition } from '../data/entities'
 
 /**
@@ -126,7 +126,7 @@ export function graphToDefinition(
       transition.priority = edgeData.priority
     }
 
-    // Add continueOnActivityFailure if present (default true)
+    // Add continueOnActivityFailure if present (default false)
     if (edgeData?.continueOnActivityFailure !== undefined) {
       transition.continueOnActivityFailure = edgeData.continueOnActivityFailure
     }
@@ -321,7 +321,7 @@ export function definitionToGraph(
         priority: (transition as any).priority !== undefined ? (transition as any).priority : 0,
         continueOnActivityFailure: (transition as any).continueOnActivityFailure !== undefined
           ? (transition as any).continueOnActivityFailure
-          : true,
+          : false,
         preConditions: transition.preConditions || [],
         postConditions: transition.postConditions || [],
         activities: transition.activities || [],
@@ -388,10 +388,15 @@ function calculateSmartLayout(
     const { id, level } = queue.shift()!
     const currentLevel = levels.get(id)
 
-    // Take the maximum level (longest path)
-    if (currentLevel === undefined || level > currentLevel) {
-      levels.set(id, level)
-    }
+    // Only propagate when this path improves the node's level (longest path).
+    // Without this guard a cyclic graph (renegotiation/revision loops) keeps
+    // re-enqueuing children forever and freezes the browser (script timeout).
+    if (currentLevel !== undefined && level <= currentLevel) continue
+    levels.set(id, level)
+
+    // Safety cap: in a DAG a node's level is bounded by the node count; a
+    // higher value means we are walking a cycle, so stop descending.
+    if (level > steps.length) continue
 
     const children = outgoing.get(id) || []
     for (const child of children) {
@@ -452,6 +457,7 @@ function mapNodeTypeToStepType(nodeType: string): string {
     automated: 'AUTOMATED',
     decision: 'DECISION',
     waitForSignal: 'WAIT_FOR_SIGNAL',
+    waitForTimer: 'WAIT_FOR_TIMER',
   }
   return mapping[nodeType] || 'AUTOMATED'
 }
@@ -467,6 +473,7 @@ function mapStepTypeToNodeType(stepType: string): string {
     AUTOMATED: 'automated',
     DECISION: 'decision',
     WAIT_FOR_SIGNAL: 'waitForSignal',
+    WAIT_FOR_TIMER: 'waitForTimer',
   }
   return mapping[stepType] || 'automated'
 }
@@ -482,6 +489,7 @@ function getBadgeForNodeType(nodeType: string): string {
     automated: 'Automated',
     decision: 'Decision',
     waitForSignal: 'Wait for Signal',
+    waitForTimer: 'Wait for Timer',
   }
   return badges[nodeType] || 'Task'
 }
@@ -631,7 +639,7 @@ export function sanitizeId(input: string): string {
     .toLowerCase()
     .replace(/[^a-z0-9_-]/g, '_')
     .replace(/_{2,}/g, '_') // Replace multiple underscores with single
-    .replace(/^_|_$/g, '') // Remove leading/trailing underscores
+    .replace(/(?:^_|_$)/g, '') // Remove leading/trailing underscores
 }
 
 /**
@@ -655,4 +663,24 @@ export function generateStepId(prefix: string = 'step'): string {
 export function generateTransitionId(fromStepId: string, toStepId: string): string {
   const id = `e_${fromStepId}_${toStepId}`
   return sanitizeId(id)
+}
+
+/**
+ * Append a new edge to the list, skipping duplicate connections.
+ *
+ * A plain-data replacement for React Flow's `addEdge` so the visual editor
+ * page does not pull the `@xyflow/react` runtime out of its lazy boundary
+ * (#3169). Mirrors `addEdge`'s dedup rule: an edge is dropped when one with
+ * the same source/target endpoints (and handles) already exists.
+ */
+export function appendWorkflowEdge(edges: Edge[], edge: Edge): Edge[] {
+  const isDuplicate = edges.some(
+    (existing) =>
+      existing.source === edge.source &&
+      existing.target === edge.target &&
+      // Match addEdge: empty-string and nullish handles are equivalent.
+      (existing.sourceHandle || null) === (edge.sourceHandle || null) &&
+      (existing.targetHandle || null) === (edge.targetHandle || null),
+  )
+  return isDuplicate ? edges : [...edges, edge]
 }

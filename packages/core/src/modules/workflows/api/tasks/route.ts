@@ -10,6 +10,7 @@ import type { OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
 import { createRequestContainer } from '@open-mercato/shared/lib/di/container'
 import { getAuthFromRequest } from '@open-mercato/shared/lib/auth/server'
 import { resolveOrganizationScopeForRequest } from '@open-mercato/core/modules/directory/utils/organizationScope'
+import { resolveOrganizationScopeFilter } from '@open-mercato/core/modules/directory/utils/organizationScopeFilter'
 import { UserTask } from '../../data/entities'
 import {
   workflowsTag,
@@ -17,6 +18,9 @@ import {
   userTaskListResponseSchema,
   workflowErrorSchema,
 } from '../openapi'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('workflows')
 
 export const metadata = {
   requireAuth: true,
@@ -49,11 +53,11 @@ export async function GET(request: NextRequest) {
 
     const scope = await resolveOrganizationScopeForRequest({ container, auth, request })
     const tenantId = auth.tenantId
-    const organizationId = scope?.selectedId ?? auth.orgId
+    const orgFilter = resolveOrganizationScopeFilter(scope, auth)
 
-    if (!tenantId || !organizationId) {
+    if (!tenantId) {
       return NextResponse.json(
-        { error: 'Missing tenant or organization context' },
+        { error: 'Missing tenant context' },
         { status: 400 }
       )
     }
@@ -70,7 +74,7 @@ export async function GET(request: NextRequest) {
     // Build where clause with tenant scoping
     const where: any = {
       tenantId,
-      organizationId,
+      ...orgFilter.where,
     }
 
     if (status) {
@@ -124,7 +128,7 @@ export async function GET(request: NextRequest) {
       },
     })
   } catch (error) {
-    console.error('Error listing user tasks:', error)
+    logger.error('Error listing user tasks', { err: error })
     return NextResponse.json(
       {
         error: 'Failed to list user tasks',

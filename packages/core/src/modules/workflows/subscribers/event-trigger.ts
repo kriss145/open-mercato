@@ -8,6 +8,9 @@
 
 import type { EntityManager } from '@mikro-orm/core'
 import type { AwilixContainer } from 'awilix'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('workflows').child({ component: 'event-trigger' })
 
 export const metadata = {
   event: '*', // Subscribe to ALL events
@@ -33,11 +36,16 @@ function isExcludedEvent(eventName: string): boolean {
 
 export default async function handle(
   payload: unknown,
-  ctx: { resolve: <T = unknown>(name: string) => T; eventName?: string }
+  ctx: {
+    resolve: <T = unknown>(name: string) => T
+    eventName?: string
+    tenantId?: string | null
+    organizationId?: string | null
+  }
 ): Promise<void> {
   const eventName = ctx.eventName
   if (!eventName) {
-    // Skip if no event name (shouldn't happen, but be safe)
+    logger.warn('Skipping trigger evaluation because subscriber context is missing eventName')
     return
   }
 
@@ -49,11 +57,14 @@ export default async function handle(
   // Ensure payload is an object
   const eventPayload = (payload && typeof payload === 'object' ? payload : {}) as Record<string, unknown>
 
-  // Extract tenant/org from payload
-  const tenantId = eventPayload?.tenantId as string | undefined
-  const organizationId = eventPayload?.organizationId as string | undefined
+  // Only trust scope attached by the emitter via event bus options.
+  const tenantId = typeof ctx.tenantId === 'string' && ctx.tenantId.length > 0 ? ctx.tenantId : undefined
+  const organizationId =
+    typeof ctx.organizationId === 'string' && ctx.organizationId.length > 0
+      ? ctx.organizationId
+      : undefined
 
-  // Skip events without tenant context
+  // Skip events without trusted tenant context
   if (!tenantId || !organizationId) {
     return
   }
@@ -75,7 +86,7 @@ export default async function handle(
     } as unknown as AwilixContainer
   } catch (error) {
     // DI not available - skip
-    console.warn(`[workflow-trigger] Cannot resolve dependencies for event "${eventName}":`, error)
+    logger.warn('Cannot resolve dependencies for event', { event: eventName, err: error })
     return
   }
 
@@ -90,20 +101,31 @@ export default async function handle(
       organizationId,
     })
 
+    logger.debug('Evaluated triggers', {
+      event: eventName,
+      tenantId,
+      organizationId,
+      matched: result.triggered + result.skipped + result.errors.length,
+      triggered: result.triggered,
+      skipped: result.skipped,
+      errors: result.errors.length,
+    })
+
     if (result.triggered > 0) {
-      console.log(
-        `[workflow-trigger] Triggered ${result.triggered} workflow(s) for "${eventName}"` +
-        (result.skipped > 0 ? ` (${result.skipped} skipped)` : '') +
-        (result.errors.length > 0 ? ` (${result.errors.length} errors)` : '')
-      )
+      logger.info('Triggered workflows for event', {
+        event: eventName,
+        triggered: result.triggered,
+        skipped: result.skipped,
+        errors: result.errors.length,
+      })
     }
 
     if (result.errors.length > 0) {
       for (const err of result.errors) {
-        console.error(`[workflow-trigger] Trigger ${err.triggerId} failed:`, err.error)
+        logger.error('Trigger failed', { triggerId: err.triggerId, err: err.error })
       }
     }
   } catch (error) {
-    console.error(`[workflow-trigger] Error processing triggers for "${eventName}":`, error)
+    logger.error('Error processing triggers for event', { event: eventName, err: error })
   }
 }

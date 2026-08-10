@@ -1,10 +1,12 @@
 "use client"
 import * as React from 'react'
 import { Bell } from 'lucide-react'
+import { usePathname, useSearchParams } from 'next/navigation'
 import { IconButton } from '../../primitives/icon-button'
 import { cn } from '@open-mercato/shared/lib/utils'
-import { useNotificationsPoll } from './useNotificationsPoll'
+import { useNotifications } from './useNotifications'
 import { NotificationPanel } from './NotificationPanel'
+import { NotificationCountBadge } from './NotificationCountBadge'
 import type { TranslateFn } from '@open-mercato/shared/lib/i18n/context'
 import type { NotificationRenderers } from './NotificationPanel'
 
@@ -16,6 +18,8 @@ export type NotificationBellProps = {
 
 export function NotificationBell({ className, t, customRenderers }: NotificationBellProps) {
   const [panelOpen, setPanelOpen] = React.useState(false)
+  const pathname = usePathname()
+  const searchParams = useSearchParams()
   const {
     unreadCount,
     hasNew,
@@ -26,8 +30,13 @@ export function NotificationBell({ className, t, customRenderers }: Notification
     dismissUndo,
     undoDismiss,
     markAllRead,
-  } = useNotificationsPoll()
+  } = useNotifications()
   const prevCountRef = React.useRef(unreadCount)
+  const routeKey = React.useMemo(() => {
+    const query = searchParams.toString()
+    return query ? `${pathname}?${query}` : pathname
+  }, [pathname, searchParams])
+  const previousRouteKeyRef = React.useRef(routeKey)
   const [pulse, setPulse] = React.useState(false)
 
   React.useEffect(() => {
@@ -39,6 +48,13 @@ export function NotificationBell({ className, t, customRenderers }: Notification
     prevCountRef.current = unreadCount
   }, [unreadCount, hasNew])
 
+  React.useEffect(() => {
+    if (panelOpen && routeKey !== previousRouteKeyRef.current) {
+      setPanelOpen(false)
+    }
+    previousRouteKeyRef.current = routeKey
+  }, [panelOpen, routeKey])
+
   const ariaLabel = unreadCount > 0
     ? t('notifications.badge.unread', '{count} unread notifications', { count: unreadCount })
     : t('notifications.title', 'Notifications')
@@ -48,16 +64,13 @@ export function NotificationBell({ className, t, customRenderers }: Notification
       <IconButton
         variant="ghost"
         size="sm"
+        type="button"
         className={cn('relative', className)}
         onClick={() => setPanelOpen(true)}
         aria-label={ariaLabel}
       >
         <Bell className={cn('h-5 w-5', pulse && 'animate-pulse')} />
-        {unreadCount > 0 && (
-          <span className="absolute -top-1 -right-1 flex h-5 w-5 items-center justify-center rounded-full bg-orange-500 text-[10px] font-medium text-white dark:bg-destructive dark:text-destructive-foreground">
-            {unreadCount > 99 ? '99+' : unreadCount}
-          </span>
-        )}
+        <NotificationCountBadge count={unreadCount} />
       </IconButton>
 
       <NotificationPanel

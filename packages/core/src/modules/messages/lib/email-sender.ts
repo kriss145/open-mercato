@@ -1,8 +1,8 @@
 import * as React from 'react'
-import crypto from 'node:crypto'
 import { promises as fs } from 'fs'
 import type { EntityManager } from '@mikro-orm/postgresql'
 import { sendEmail } from '@open-mercato/shared/lib/email/send'
+import { resolveDefaultEmailFromAddress } from '@open-mercato/shared/lib/email/config'
 import { loadDictionary } from '@open-mercato/shared/lib/i18n/server'
 import { defaultLocale } from '@open-mercato/shared/lib/i18n/config'
 import { createFallbackTranslator } from '@open-mercato/shared/lib/i18n/translate'
@@ -10,10 +10,13 @@ import type { Message, MessageObject } from '../data/entities'
 import { MessageAccessToken } from '../data/entities'
 import MessageEmail from '../emails/MessageEmail'
 import { resolveAttachmentAbsolutePath } from '../../attachments/lib/storage'
+import { generateAuthToken, hashAuthToken } from '../../auth/lib/tokenHash'
 import type { MessageEmailAttachment } from './attachments'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('messages').child({ component: 'email-sender' })
 
 const ACCESS_TOKEN_EXPIRY_HOURS = 24 * 7
-const DEBUG = process.env.MESSAGES_EMAIL_DEBUG === 'true'
 const MAX_EMAIL_ATTACHMENTS = 10
 const MAX_TOTAL_ATTACHMENT_BYTES = 20 * 1024 * 1024
 
@@ -23,12 +26,7 @@ export type SenderIdentity = {
 }
 
 function logDebug(message: string, details?: Record<string, unknown>) {
-  if (!DEBUG) return
-  if (details) {
-    console.log(`[messages:email-sender] ${message}`, details)
-    return
-  }
-  console.log(`[messages:email-sender] ${message}`)
+  logger.debug(message, details)
 }
 
 function resolveAppUrl(): string | null {
@@ -43,10 +41,6 @@ function buildSenderLabel(sender: SenderIdentity): string {
   const email = sender.email?.trim()
   if (email) return email
   return 'System'
-}
-
-function generateAccessToken(): string {
-  return crypto.randomBytes(32).toString('hex')
 }
 
 function resolveObjectLabels(objects: MessageObject[]): string[] {
@@ -148,22 +142,22 @@ export async function createMessageAccessToken(
   messageId: string,
   recipientUserId: string,
 ): Promise<string> {
-  const token = generateAccessToken()
+  const rawToken = generateAuthToken()
   const expiresAt = new Date(Date.now() + ACCESS_TOKEN_EXPIRY_HOURS * 60 * 60 * 1000)
   const record = em.create(MessageAccessToken, {
     messageId,
     recipientUserId,
-    token,
+    token: hashAuthToken(rawToken),
     expiresAt,
     useCount: 0,
   })
-  await em.persistAndFlush(record)
+  await em.persist(record).flush()
   logDebug('Created access token', {
     messageId,
     recipientUserId,
     expiresAt: expiresAt.toISOString(),
   })
-  return token
+  return rawToken
 }
 
 export async function sendMessageEmailToRecipient(params: {
@@ -192,7 +186,7 @@ export async function sendMessageEmailToRecipient(params: {
     hasViewUrl: Boolean(viewUrl),
     attachmentsCount: resendAttachments.length,
     hasApiKey: Boolean(process.env.RESEND_API_KEY),
-    from: process.env.EMAIL_FROM ?? null,
+    from: resolveDefaultEmailFromAddress() ?? null,
   })
 
   await sendEmail({
@@ -229,7 +223,7 @@ export async function sendMessageEmailToExternal(params: {
     email,
     attachmentsCount: resendAttachments.length,
     hasApiKey: Boolean(process.env.RESEND_API_KEY),
-    from: process.env.EMAIL_FROM ?? null,
+    from: resolveDefaultEmailFromAddress() ?? null,
   })
 
   await sendEmail({

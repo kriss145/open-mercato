@@ -1,3 +1,4 @@
+import { createLogger } from '@open-mercato/shared/lib/logger'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
@@ -7,50 +8,17 @@ import { executeTool } from './tool-executor'
 import { loadAllModuleTools, indexToolsForSearch } from './tool-loader'
 import { authenticateMcpRequest, extractApiKeyFromHeaders, hasRequiredFeatures } from './auth'
 import { jsonSchemaToZod } from './schema-utils'
+import { getApiKeyFromMcpJson } from './mcp-dev-key-resolution'
 import type { McpToolContext } from './types'
 import type { SearchService } from '@open-mercato/search/service'
 import type { RbacService } from '@open-mercato/core/modules/auth/services/rbacService'
 
+const logger = createLogger('ai_assistant')
+
 const DEFAULT_PORT = 3001
 
 const log = (message: string, ...args: unknown[]) => {
-  console.error(`[MCP Dev] ${message}`, ...args)
-}
-
-async function getApiKeyFromMcpJson(): Promise<string | undefined> {
-  const { readFile, access } = await import('node:fs/promises')
-  const { resolve, dirname } = await import('node:path')
-
-  // Search for .mcp.json starting from cwd and walking up to project root
-  const findMcpJson = async (startDir: string): Promise<string | null> => {
-    let dir = startDir
-    const root = resolve('/')
-    while (dir !== root) {
-      const candidate = resolve(dir, '.mcp.json')
-      try {
-        await access(candidate)
-        return candidate
-      } catch {
-        dir = dirname(dir)
-      }
-    }
-    return null
-  }
-
-  try {
-    const mcpJsonPath = await findMcpJson(process.cwd())
-    if (!mcpJsonPath) {
-      return undefined
-    }
-
-    const content = await readFile(mcpJsonPath, 'utf-8')
-    const config = JSON.parse(content)
-    const serverConfig = config?.mcpServers?.['open-mercato']
-
-    return serverConfig?.headers?.['x-api-key']
-  } catch {
-    return undefined
-  }
+  logger.info(message, args.length > 0 ? { details: args.map((arg) => String(arg)).join(' ') } : undefined)
 }
 
 /**
@@ -265,18 +233,25 @@ export async function runMcpDevServer(): Promise<void> {
     log('Entity graph generation skipped:', error instanceof Error ? error.message : error)
   }
 
-  // Index tools, API endpoints, and entity schemas for search (if search service available)
+  // Pre-cache rich OpenAPI spec for Code Mode search tool (prefers runtime module registry over static JSON)
+  try {
+    const { loadRichOpenApiSpec } = await import('./api-endpoint-index')
+    const spec = await loadRichOpenApiSpec()
+    if (spec) {
+      log('Rich OpenAPI spec cached for Code Mode (with requestBody schemas)')
+    } else {
+      log('OpenAPI spec not available')
+    }
+  } catch (error) {
+    log('OpenAPI spec caching skipped:', error instanceof Error ? error.message : error)
+  }
+
+  // Index tools and entity schemas for search (if search service available)
   try {
     const searchService = container.resolve('searchService') as SearchService
     await indexToolsForSearch(searchService)
 
-    const { indexApiEndpoints } = await import('./api-endpoint-index')
-    const endpointCount = await indexApiEndpoints(searchService)
-    if (endpointCount > 0) {
-      log(`Indexed ${endpointCount} API endpoints for discovery`)
-    }
-
-    // Index entity schemas for discover_schema tool
+    // Index entity schemas for hybrid search
     try {
       const { getCachedEntityGraph } = await import('./entity-graph')
       const { indexEntitiesForSearch } = await import('./entity-index')
@@ -294,6 +269,11 @@ export async function runMcpDevServer(): Promise<void> {
     log('Search indexing skipped (search service not available)')
   }
 
+  // Generate a stable session ID for dev mode (enables session memory / caching)
+  const { randomBytes } = await import('node:crypto')
+  const devSessionId = 'dev_' + randomBytes(8).toString('hex')
+  log(`Session ID: ${devSessionId} (stable for this server instance)`)
+
   // Create tool context from auth result
   const toolContext: McpToolContext = {
     tenantId: authResult.tenantId,
@@ -303,6 +283,7 @@ export async function runMcpDevServer(): Promise<void> {
     userFeatures: authResult.features,
     isSuperAdmin: authResult.isSuperAdmin,
     apiKeySecret: apiKey,
+    sessionId: devSessionId,
   }
 
   const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {

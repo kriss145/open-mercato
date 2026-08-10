@@ -3,6 +3,38 @@
  */
 import * as React from 'react'
 import { render, screen, waitFor, fireEvent } from '@testing-library/react'
+
+// Radix Select / Radio use pointer capture / scrollIntoView APIs that jsdom doesn't implement.
+if (typeof window !== 'undefined') {
+  if (!Element.prototype.hasPointerCapture) Element.prototype.hasPointerCapture = () => false
+  if (!Element.prototype.releasePointerCapture) Element.prototype.releasePointerCapture = () => undefined
+  if (!Element.prototype.scrollIntoView) Element.prototype.scrollIntoView = () => undefined
+}
+
+// Mock Radix-based Radio primitives — keeps tests independent of Radix focus internals
+jest.mock('@open-mercato/ui/primitives/radio', () => {
+  const React2 = require('react') as typeof import('react')
+  return {
+    RadioGroup: ({ children, value, onValueChange, name }: any) => (
+      <div role="radiogroup" data-value={value} data-name={name}>
+        {React2.Children.map(children, (child: any) =>
+          React2.cloneElement(child, { __groupValue: value, __onChange: onValueChange })
+        )}
+      </div>
+    ),
+    Radio: ({ value, __groupValue, __onChange, ...props }: any) => (
+      <input
+        type="radio"
+        role="radio"
+        value={value}
+        checked={__groupValue === value}
+        onChange={() => __onChange?.(value)}
+        {...props}
+      />
+    ),
+  }
+})
+
 import { PriceKindSettings } from '../PriceKindSettings'
 import CategoriesDataTable from '../categories/CategoriesDataTable'
 import { CategorySelect } from '../categories/CategorySelect'
@@ -39,6 +71,10 @@ jest.mock('@open-mercato/ui/backend/utils/crud', () => ({
 }))
 
 jest.mock('@open-mercato/ui/backend/DataTable', () => ({
+  withDataTableNamespaces: (mappedRow: Record<string, unknown>, sourceItem: Record<string, unknown>) => ({
+    ...mappedRow,
+    ...Object.fromEntries(Object.entries(sourceItem).filter(([key]) => key.startsWith('_'))),
+  }),
   DataTable: ({ title, actions, children, data = [] }: any) => (
     <div data-testid="data-table">
       <h2>{title}</h2>

@@ -8,6 +8,7 @@ jest.mock('../../FlashMessages', () => ({
 import { flash } from '../../FlashMessages'
 import {
   ForbiddenError,
+  UnauthorizedError,
   apiFetch,
 } from '../../utils/api'
 
@@ -54,19 +55,58 @@ describe('apiFetch', () => {
     jest.restoreAllMocks()
   })
 
-  it('throws ForbiddenError when backend returns ACL hints', async () => {
+  it('throws ForbiddenError and flashes a non-redirecting banner when backend returns ACL hints', async () => {
     ;(window as unknown as Record<string, unknown>).__omOriginalFetch = jest.fn(async () =>
       createMockResponse(403, {
         error: 'Forbidden',
         requiredRoles: ['Admin'],
       }),
     )
+    const initialPath = window.location.pathname
 
     await expect(apiFetch('/api/private')).rejects.toBeInstanceOf(ForbiddenError)
     expect(flash).toHaveBeenCalledWith(
-      'Insufficient permissions. Redirecting to login…',
+      expect.stringContaining('Access denied'),
       'warning',
     )
+    expect(flash).toHaveBeenCalledWith(
+      expect.stringContaining('Admin'),
+      'warning',
+    )
+
+    // Regression for GH #2070: authenticated 403 must not redirect to /login.
+    jest.advanceTimersByTime(1000)
+    expect(window.location.pathname).toBe(initialPath)
+    expect(window.location.pathname).not.toContain('/login')
+  })
+
+  it('includes the missing feature name in the flash so the user sees the actual permission required', async () => {
+    ;(window as unknown as Record<string, unknown>).__omOriginalFetch = jest.fn(async () =>
+      createMockResponse(403, {
+        error: 'Forbidden',
+        requiredFeatures: ['sales.channels.manage'],
+      }),
+    )
+
+    await expect(apiFetch('/api/sales/channels')).rejects.toBeInstanceOf(ForbiddenError)
+    expect(flash).toHaveBeenCalledWith(
+      expect.stringContaining('sales.channels.manage'),
+      'warning',
+    )
+  })
+
+  it('attaches requiredFeatures to ForbiddenError so callers can name the missing permission', async () => {
+    ;(window as unknown as Record<string, unknown>).__omOriginalFetch = jest.fn(async () =>
+      createMockResponse(403, {
+        error: 'Forbidden',
+        requiredFeatures: ['wms.manage_locations'],
+      }),
+    )
+
+    const rejection = await apiFetch('/api/wms/locations').catch((error: unknown) => error)
+    expect(rejection).toBeInstanceOf(ForbiddenError)
+    expect((rejection as ForbiddenError).requiredFeatures).toEqual(['wms.manage_locations'])
+    expect((rejection as ForbiddenError).status).toBe(403)
   })
 
   it('throws ForbiddenError when ACL hints are missing', async () => {
@@ -91,5 +131,60 @@ describe('apiFetch', () => {
     const result = await apiFetch('/api/private')
     expect(result).toBe(response)
     expect(flash).not.toHaveBeenCalled()
+  })
+
+  it('returns 401 payload when unauthorized redirect is disabled', async () => {
+    const response = createMockResponse(401, {
+      error: 'checkout.payPage.errors.password',
+    })
+    ;(window as unknown as Record<string, unknown>).__omOriginalFetch = jest.fn(async () => response)
+
+    const result = await apiFetch('/api/private', {
+      headers: {
+        'x-om-unauthorized-redirect': '0',
+      },
+    })
+
+    expect(result).toBe(response)
+    expect(flash).not.toHaveBeenCalled()
+  })
+
+  it('stays silent when a login-page 401 lands after the post-login navigation', async () => {
+    window.history.pushState({}, '', '/login')
+    ;(window as unknown as Record<string, unknown>).__omOriginalFetch = jest.fn(async () => {
+      // The sign-in completes while the pre-auth probe is still in flight, so the
+      // app has already client-navigated to /backend when the 401 arrives.
+      window.history.pushState({}, '', '/backend')
+      return createMockResponse(401, { error: 'Unauthorized' })
+    })
+
+    const result = await apiFetch('/api/auth/feature-check', { method: 'POST' })
+
+    expect(result.status).toBe(401)
+    expect(flash).not.toHaveBeenCalled()
+  })
+
+  it('stays silent when a 401 lands after navigating to the login page', async () => {
+    ;(window as unknown as Record<string, unknown>).__omOriginalFetch = jest.fn(async () => {
+      window.history.pushState({}, '', '/login')
+      return createMockResponse(401, { error: 'Unauthorized' })
+    })
+
+    const result = await apiFetch('/api/private')
+
+    expect(result.status).toBe(401)
+    expect(flash).not.toHaveBeenCalled()
+  })
+
+  it('throws UnauthorizedError for 401 responses by default', async () => {
+    ;(window as unknown as Record<string, unknown>).__omOriginalFetch = jest.fn(async () =>
+      createMockResponse(401, { error: 'Unauthorized' }),
+    )
+
+    await expect(apiFetch('/api/private')).rejects.toBeInstanceOf(UnauthorizedError)
+    expect(flash).toHaveBeenCalledWith(
+      'Session expired. Redirecting to sign in…',
+      'warning',
+    )
   })
 })

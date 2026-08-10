@@ -6,6 +6,10 @@ import type {
   SearchResultLink,
   SearchIndexSource,
 } from '@open-mercato/shared/modules/search'
+import { CUSTOMER_INTERACTION_TASK_SOURCE, EXAMPLE_TODO_SOURCE } from './lib/interactionCompatibility'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('customers')
 
 // =============================================================================
 // Context Types
@@ -172,10 +176,11 @@ async function loadCustomerEntityBundle(ctx: SearchContext, opts: CustomerEntity
   const resolvedEntityId = typeof opts.entityId === 'string' && opts.entityId.length ? opts.entityId : null
   const resolvedProfileId =
     opts.profileId != null && String(opts.profileId).trim().length > 0 ? String(opts.profileId).trim() : null
+  const shouldJoinProfileSource = Boolean(opts.profileKind && resolvedProfileId && !resolvedEntityId)
   if (resolvedEntityId) {
     filters.id = { $eq: resolvedEntityId }
   }
-  if (opts.profileKind && resolvedProfileId) {
+  if (shouldJoinProfileSource) {
     const alias = opts.profileKind === 'person' ? 'person_profile' : 'company_profile'
     filters[`${alias}.id`] = { $eq: resolvedProfileId }
   }
@@ -186,7 +191,7 @@ async function loadCustomerEntityBundle(ctx: SearchContext, opts: CustomerEntity
       organizationId: ctx.organizationId ?? undefined,
       filters,
       includeCustomFields: true,
-      customFieldSources: CUSTOMER_CUSTOM_FIELD_SOURCES,
+      ...(shouldJoinProfileSource ? { customFieldSources: CUSTOMER_CUSTOM_FIELD_SOURCES } : {}),
       fields: CUSTOMER_ENTITY_FIELDS,
       page: { page: 1, pageSize: 1 },
     })
@@ -196,11 +201,12 @@ async function loadCustomerEntityBundle(ctx: SearchContext, opts: CustomerEntity
     const customFields = extractCustomFieldMap(row)
     return { entity, customFields }
   } catch (error) {
-    console.warn('[search.customers] Failed to load customer entity via QueryEngine', {
+    logger.warn('Failed to load customer entity via QueryEngine', {
+      component: 'search',
       entityId: resolvedEntityId ?? null,
       profileKind: opts.profileKind ?? null,
       profileId: resolvedProfileId ?? null,
-      error: error instanceof Error ? error.message : error,
+      err: error,
     })
     return null
   }
@@ -346,9 +352,9 @@ async function getLinkedTodo(ctx: SearchContext) {
   if (todoCache.has(ctx.record)) {
     return todoCache.get(ctx.record)
   }
-  const sourceRaw = typeof ctx.record.todo_source === 'string' ? ctx.record.todo_source : 'example:todo'
+  const sourceRaw = typeof ctx.record.todo_source === 'string' ? ctx.record.todo_source : EXAMPLE_TODO_SOURCE
   const [moduleId, entityName] = sourceRaw.split(':')
-  const entityId = moduleId && entityName ? `${moduleId}:${entityName}` : 'example:todo'
+  const entityId = moduleId && entityName ? `${moduleId}:${entityName}` : CUSTOMER_INTERACTION_TASK_SOURCE
   const todo = await loadRecord(ctx, entityId, ctx.record.todo_id as string ?? ctx.record.todoId as string)
   todoCache.set(ctx.record, todo ?? null)
   return todo ?? null
@@ -361,9 +367,9 @@ async function getLinkedTodo(ctx: SearchContext) {
 function buildCustomerUrl(kind: string | null | undefined, id?: string | null): string | null {
   if (!id) return null
   const encoded = encodeURIComponent(id)
-  if (kind === 'person') return `/backend/customers/people/${encoded}`
-  if (kind === 'company') return `/backend/customers/companies/${encoded}`
-  return `/backend/customers/companies/${encoded}`
+  if (kind === 'person') return `/backend/customers/people-v2/${encoded}`
+  if (kind === 'company') return `/backend/customers/companies-v2/${encoded}`
+  return `/backend/customers/companies-v2/${encoded}`
 }
 
 function formatDealValue(record: Record<string, unknown>): string | undefined {
@@ -550,7 +556,8 @@ function resolveCompanyPresenter(
   )
   if (summary) subtitlePieces.push(summary)
   if (!entity && (!title || title === fallbackEntityId)) {
-    console.warn('[search.customers] Missing customer entity during company presenter build', {
+    logger.warn('Missing customer entity during company presenter build', {
+      component: 'search',
       recordId: record.id ?? null,
       entityId: fallbackEntityId,
       recordKeys: Object.keys(record),
@@ -573,11 +580,12 @@ function logMissingPresenterTitle(
   const fallbackId = record.id ?? record.entity_id ?? resolveCustomerEntityId(record)
   if (!fallbackId) return
   if (presenter.title && presenter.title !== String(fallbackId)) return
-  console.warn('[search.customers] Presenter fell back to record id', {
+  logger.warn('Presenter fell back to record id', {
+    component: 'search',
     kind,
     recordId: fallbackId,
     entityId: resolveCustomerEntityId(record),
-    entityDisplayName: entity?.display_name ?? null,
+    hasEntityDisplayName: entity?.display_name != null,
   })
 }
 
@@ -616,7 +624,8 @@ export const searchConfig: SearchModuleConfig = {
           appendCustomFieldLines(lines, entityOnlyCustomFields, 'Customer custom')
         }
         if (!entity) {
-          console.warn('[search.customers] Failed to load customer entity for person profile', {
+          logger.warn('Failed to load customer entity for person profile', {
+            component: 'search',
             recordId: record.id,
             entityId,
             recordKeys: Object.keys(record),
@@ -627,7 +636,8 @@ export const searchConfig: SearchModuleConfig = {
         if (!lines.length) return null
 
         if (!entityId) {
-          console.warn('[search.customers] person profile missing entity id', {
+          logger.warn('Person profile missing entity id', {
+            component: 'search',
             recordId: record.id,
             recordKeys: Object.keys(record),
           })
@@ -691,6 +701,7 @@ export const searchConfig: SearchModuleConfig = {
         hashOnly: ['primary_email', 'primary_phone', 'personal_email'],
         excluded: ['date_of_birth', 'government_id', 'ssn', 'tax_id'],
       },
+      aclFeatures: ['customers.people.view'],
     },
 
     // =========================================================================
@@ -780,6 +791,7 @@ export const searchConfig: SearchModuleConfig = {
         hashOnly: ['tax_id', 'registration_number'],
         excluded: ['bank_account', 'billing_info', 'credit_info'],
       },
+      aclFeatures: ['customers.companies.view'],
     },
 
     // =========================================================================
@@ -856,6 +868,7 @@ export const searchConfig: SearchModuleConfig = {
         hashOnly: [],
         excluded: [],
       },
+      aclFeatures: ['customers.activities.view'],
     },
 
     // =========================================================================
@@ -942,6 +955,7 @@ export const searchConfig: SearchModuleConfig = {
         hashOnly: [],
         excluded: ['value_amount', 'value_currency'],
       },
+      aclFeatures: ['customers.deals.view'],
     },
 
     // =========================================================================
@@ -1014,6 +1028,7 @@ export const searchConfig: SearchModuleConfig = {
         hashOnly: [],
         excluded: [],
       },
+      aclFeatures: ['customers.activities.view'],
     },
 
     // =========================================================================
@@ -1080,6 +1095,7 @@ export const searchConfig: SearchModuleConfig = {
         hashOnly: [],
         excluded: [],
       },
+      aclFeatures: ['customers.activities.view'],
     },
   ],
 }

@@ -98,10 +98,18 @@ export function JobLogsModal({
           <DialogTitle>
             {t('scheduler.job_logs.title', 'Queue Job')}: {scheduleName}
           </DialogTitle>
-          <p 
+          <p
             className="text-sm text-muted-foreground font-mono truncate cursor-pointer hover:text-primary transition-colors"
             title={queueJobId ?? undefined}
             onClick={() => queueJobId && navigator.clipboard.writeText(queueJobId)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault()
+                if (queueJobId) navigator.clipboard.writeText(queueJobId)
+              }
+            }}
+            role="button"
+            tabIndex={0}
           >
             {t('scheduler.job_logs.job_id', 'Job ID')}: {queueJobId}
           </p>
@@ -211,7 +219,7 @@ export function JobLogsModal({
               <TabsContent value="error" className="space-y-4">
                 <div>
                   <Label className="text-sm font-medium">{t('scheduler.job_logs.error_message', 'Error Message')}</Label>
-                  <pre className="mt-1 bg-red-50 dark:bg-red-950 p-3 rounded text-sm text-red-900 dark:text-red-100">
+                  <pre className="mt-1 bg-status-error-bg p-3 rounded text-sm text-status-error-text">
                     {job.failedReason}
                   </pre>
                 </div>

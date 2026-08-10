@@ -10,7 +10,12 @@ import { z } from 'zod'
 import { createRequestContainer } from '@open-mercato/shared/lib/di/container'
 import { getAuthFromRequest } from '@open-mercato/shared/lib/auth/server'
 import { resolveOrganizationScopeForRequest } from '@open-mercato/core/modules/directory/utils/organizationScope'
+import { resolveOrganizationScopeFilter } from '@open-mercato/core/modules/directory/utils/organizationScopeFilter'
 import { WorkflowInstance, WorkflowEvent } from '../../../../data/entities'
+import { workflowEventRowSchema, paginationSchema } from '../../../openapi'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('workflows')
 
 export const metadata = {
   requireAuth: true,
@@ -44,11 +49,11 @@ export async function GET(
 
     const scope = await resolveOrganizationScopeForRequest({ container, auth, request })
     const tenantId = auth.tenantId
-    const organizationId = scope?.selectedId ?? auth.orgId
+    const orgFilter = resolveOrganizationScopeFilter(scope, auth)
 
-    if (!tenantId || !organizationId) {
+    if (!tenantId) {
       return NextResponse.json(
-        { error: 'Missing tenant or organization context' },
+        { error: 'Missing tenant context' },
         { status: 400 }
       )
     }
@@ -57,7 +62,7 @@ export async function GET(
     const instance = await em.findOne(WorkflowInstance, {
       id: params.id,
       tenantId,
-      organizationId,
+      ...orgFilter.where,
     })
 
     if (!instance) {
@@ -76,7 +81,7 @@ export async function GET(
     const where: any = {
       workflowInstanceId: params.id,
       tenantId,
-      organizationId,
+      ...orgFilter.where,
     }
 
     if (eventType) {
@@ -103,7 +108,7 @@ export async function GET(
       },
     })
   } catch (error) {
-    console.error('Error getting workflow events:', error)
+    logger.error('Error getting workflow events', { err: error })
     return NextResponse.json(
       { error: 'Failed to get workflow events' },
       { status: 500 }
@@ -130,13 +135,8 @@ export const openApi = {
           status: 200,
           description: 'List of workflow events',
           schema: z.object({
-            data: z.array(z.any()),
-            pagination: z.object({
-              total: z.number(),
-              limit: z.number(),
-              offset: z.number(),
-              hasMore: z.boolean(),
-            }),
+            data: z.array(workflowEventRowSchema),
+            pagination: paginationSchema,
           }),
         },
         {

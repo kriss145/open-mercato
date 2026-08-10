@@ -1,3 +1,4 @@
+import { createLogger } from '@open-mercato/shared/lib/logger'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
@@ -9,10 +10,14 @@ import { executeTool } from './tool-executor'
 import { loadAllModuleTools, indexToolsForSearch } from './tool-loader'
 import { authenticateMcpRequest, extractApiKeyFromHeaders, hasRequiredFeatures } from './auth'
 import { jsonSchemaToZod, toSafeZodSchema } from './schema-utils'
+import { redactSecretForLog, deriveApiKeySessionId } from './log-redaction'
 import type { McpServerConfig, McpToolContext } from './types'
 import type { SearchService } from '@open-mercato/search/service'
 import type { RbacService } from '@open-mercato/core/modules/auth/services/rbacService'
+import type { ApiKey } from '@open-mercato/core/modules/api_keys/data/entities'
 import { findApiKeyBySecret, findSessionApiKeyWithSecret } from '@open-mercato/core/modules/api_keys/services/apiKeyService'
+
+const logger = createLogger('ai_assistant').child({ component: 'mcp-http' })
 
 /**
  * Options for the HTTP MCP server.
@@ -41,7 +46,7 @@ async function resolveSessionContext(
     const sessionResult = await findSessionApiKeyWithSecret(em, sessionToken)
     if (!sessionResult) {
       if (debug) {
-        console.error(`[MCP HTTP] Session token not found, expired, or secret unavailable: ${sessionToken}`)
+        logger.debug('Session token not found, expired, or secret unavailable', { sessionToken: redactSecretForLog(sessionToken) })
       }
       return null
     }
@@ -52,7 +57,7 @@ async function resolveSessionContext(
     const userId = sessionKey.sessionUserId || sessionKey.createdBy
     if (!userId) {
       if (debug) {
-        console.error(`[MCP HTTP] Session key has no associated user`)
+        logger.debug('Session key has no associated user')
       }
       return null
     }
@@ -63,7 +68,8 @@ async function resolveSessionContext(
     })
 
     if (debug) {
-      console.error(`[MCP HTTP] Session context resolved for user ${userId}:`, {
+      logger.debug('Session context resolved', {
+        userId,
         tenantId: sessionKey.tenantId,
         organizationId: sessionKey.organizationId,
         features: acl.features.length,
@@ -84,7 +90,58 @@ async function resolveSessionContext(
     }
   } catch (error) {
     if (debug) {
-      console.error(`[MCP HTTP] Error resolving session context:`, error)
+      logger.debug('Error resolving session context', { err: error })
+    }
+    return null
+  }
+}
+
+/**
+ * Resolve user context from the server-level API key (header-based auth fallback).
+ * Used when no session token is provided — loads the API key's ACL for RBAC.
+ */
+async function resolveApiKeyContext(
+  apiKeyRecord: ApiKey,
+  baseContext: McpToolContext,
+  debug?: boolean
+): Promise<McpToolContext | null> {
+  try {
+    const rbacService = baseContext.container.resolve<RbacService>('rbacService')
+    const userId = apiKeyRecord.sessionUserId ?? apiKeyRecord.createdBy
+    if (!userId) {
+      if (debug) {
+        logger.debug('API key has no associated user')
+      }
+      return null
+    }
+
+    const acl = await rbacService.loadAcl(`api_key:${apiKeyRecord.id}`, {
+      tenantId: apiKeyRecord.tenantId ?? null,
+      organizationId: apiKeyRecord.organizationId ?? null,
+    })
+
+    if (debug) {
+      logger.debug('API key context resolved', {
+        userId,
+        tenantId: apiKeyRecord.tenantId,
+        organizationId: apiKeyRecord.organizationId,
+        features: acl.features.length,
+        isSuperAdmin: acl.isSuperAdmin,
+      })
+    }
+
+    return {
+      tenantId: apiKeyRecord.tenantId ?? null,
+      organizationId: apiKeyRecord.organizationId ?? null,
+      userId,
+      container: baseContext.container,
+      userFeatures: acl.features,
+      isSuperAdmin: acl.isSuperAdmin,
+      apiKeySecret: baseContext.apiKeySecret,
+    }
+  } catch (error) {
+    if (debug) {
+      logger.debug('Error resolving API key context', { err: error })
     }
     return null
   }
@@ -97,7 +154,8 @@ async function resolveSessionContext(
  */
 function createMcpServerForRequest(
   config: McpServerConfig,
-  toolContext: McpToolContext
+  toolContext: McpToolContext,
+  apiKeyRecord: ApiKey
 ): McpServer {
   const server = new McpServer(
     { name: config.name, version: config.version },
@@ -108,13 +166,13 @@ function createMcpServerForRequest(
   const tools = Array.from(registry.getTools().values())
 
   if (config.debug) {
-    console.error(`[MCP HTTP] Registering ${tools.length} tools (ACL checked per-call via session token)`)
+    logger.debug('Registering tools (ACL checked per-call via session token)', { toolCount: tools.length })
   }
 
   // Register ALL tools - permission checks happen at execution time via session token
   for (const tool of tools) {
     if (config.debug) {
-      console.error(`[MCP HTTP] Registering tool: ${tool.name}`)
+      logger.debug('Registering tool', { toolName: tool.name })
     }
 
     // Convert Zod schema to a "safe" schema without Date types
@@ -130,7 +188,7 @@ function createMcpServerForRequest(
         const properties = (jsonSchema.properties ?? {}) as Record<string, unknown>
         properties._sessionToken = {
           type: 'string',
-          description: 'Session authorization token (REQUIRED for all tool calls)',
+          description: 'Session authorization token. If omitted, the server API key roles are used instead.',
         }
         jsonSchema.properties = properties
 
@@ -140,10 +198,7 @@ function createMcpServerForRequest(
         safeSchema = (converted as z.ZodObject<any>).passthrough()
       } catch (error) {
         if (config.debug) {
-          console.error(
-            `[MCP HTTP] Skipping tool ${tool.name} - schema conversion failed:`,
-            error instanceof Error ? error.message : error
-          )
+          logger.debug('Skipping tool: schema conversion failed', { toolName: tool.name, err: error })
         }
         continue
       }
@@ -173,9 +228,10 @@ function createMcpServerForRequest(
           delete toolArgs._sessionToken // Remove before passing to tool handler
 
           // Always log tool calls for debugging
-          console.error(`[MCP HTTP] ▶ Tool call: ${tool.name}`, {
+          logger.debug('Tool call received', {
+            toolName: tool.name,
             hasSessionToken: !!sessionToken,
-            args: JSON.stringify(toolArgs).slice(0, 200),
+            argKeys: Object.keys(toolArgs ?? {}).join(','),
           })
 
           // Resolve user context from session token
@@ -183,8 +239,8 @@ function createMcpServerForRequest(
           if (sessionToken) {
             const sessionContext = await resolveSessionContext(sessionToken, toolContext, config.debug)
             if (sessionContext) {
-              // Session context includes the decrypted API key secret
-              effectiveContext = sessionContext
+              // Session context includes the decrypted API key secret + session ID for memory layer
+              effectiveContext = { ...sessionContext, sessionId: sessionToken }
             } else {
               // Session token expired - return user-friendly error for AI to relay
               return {
@@ -201,19 +257,31 @@ function createMcpServerForRequest(
               }
             }
           } else {
-            // No session token provided - reject if base context has no permissions
-            if (!effectiveContext.userId && effectiveContext.userFeatures.length === 0) {
+            // No session token — fall back to header API key auth
+            const apiKeyContext = await resolveApiKeyContext(apiKeyRecord, toolContext, config.debug)
+            if (apiKeyContext) {
+              effectiveContext = apiKeyContext
+            } else if (!effectiveContext.userId && effectiveContext.userFeatures.length === 0) {
               return {
                 content: [
                   {
                     type: 'text' as const,
                     text: JSON.stringify({
-                      error: 'Session token required (_sessionToken parameter)',
+                      error: 'Authentication failed: provide a session token (_sessionToken) or a valid API key with assigned roles',
                       code: 'UNAUTHORIZED',
                     }),
                   },
                 ],
                 isError: true,
+              }
+            }
+
+            // Derive a fallback sessionId from the API key so all tool calls
+            // within the same MCP connection share a session memory cache
+            if (!effectiveContext.sessionId && effectiveContext.apiKeySecret) {
+              effectiveContext = {
+                ...effectiveContext,
+                sessionId: deriveApiKeySessionId(effectiveContext.apiKeySecret),
               }
             }
           }
@@ -247,7 +315,7 @@ function createMcpServerForRequest(
             const result = await executeTool(tool.name, toolArgs, effectiveContext)
 
             if (!result.success) {
-              console.error(`[MCP HTTP] ✗ Tool error: ${tool.name}`, { error: result.error, code: result.errorCode })
+              logger.error('Tool call failed', { toolName: tool.name, err: result.error, code: result.errorCode })
               return {
                 content: [
                   {
@@ -259,9 +327,7 @@ function createMcpServerForRequest(
               }
             }
 
-            console.error(`[MCP HTTP] ✓ Tool success: ${tool.name}`, {
-              resultPreview: JSON.stringify(result.result).slice(0, 200)
-            })
+            logger.debug('Tool call succeeded', { toolName: tool.name })
             return {
               content: [
                 {
@@ -271,7 +337,7 @@ function createMcpServerForRequest(
               ],
             }
           } catch (err) {
-            console.error(`[MCP HTTP] ✗ Tool exception: ${tool.name}`, err)
+            logger.error('Tool call threw', { toolName: tool.name, err })
             return {
               content: [
                 {
@@ -287,10 +353,7 @@ function createMcpServerForRequest(
     } catch (error) {
       // Skip tools with schemas that can't be registered
       if (config.debug) {
-        console.error(
-          `[MCP HTTP] Skipping tool ${tool.name} - registration failed:`,
-          error instanceof Error ? error.message : error
-        )
+        logger.debug('Skipping tool: registration failed', { toolName: tool.name, err: error })
       }
       continue
     }
@@ -353,26 +416,32 @@ export async function runMcpHttpServer(options: McpHttpServerOptions): Promise<v
     const orm = await getOrm()
     const graph = await extractEntityGraph(orm)
     cacheEntityGraph(graph)
-    console.error(`[MCP HTTP] Entity graph: ${graph.nodes.length} entities, ${graph.edges.length} relationships`)
+    logger.info('Entity graph generated', { entities: graph.nodes.length, relationships: graph.edges.length })
   } catch (error) {
-    console.error('[MCP HTTP] Entity graph generation skipped:', error instanceof Error ? error.message : error)
+    logger.warn('Entity graph generation skipped', { err: error })
   }
 
-  // Index tools, API endpoints, and entity schemas for hybrid search discovery (if search service available)
+  // Pre-cache rich OpenAPI spec for Code Mode search tool (prefers runtime module registry over static JSON)
+  try {
+    const { loadRichOpenApiSpec } = await import('./api-endpoint-index')
+    const spec = await loadRichOpenApiSpec()
+    if (spec) {
+      logger.info('Rich OpenAPI spec cached for Code Mode (with requestBody schemas)')
+    } else {
+      logger.warn('OpenAPI spec not available')
+    }
+  } catch (error) {
+    logger.warn('OpenAPI spec caching skipped', { err: error })
+  }
+
+  // Index tools and entity schemas for hybrid search discovery (if search service available)
   try {
     const searchService = container.resolve('searchService') as SearchService
 
     // Index MCP tools
     await indexToolsForSearch(searchService)
 
-    // Index API endpoints for find_api
-    const { indexApiEndpoints } = await import('./api-endpoint-index')
-    const endpointCount = await indexApiEndpoints(searchService)
-    if (endpointCount > 0) {
-      console.error(`[MCP HTTP] Indexed ${endpointCount} API endpoints for hybrid search`)
-    }
-
-    // Index entity schemas for discover_schema
+    // Index entity schemas for hybrid search
     try {
       const { getCachedEntityGraph } = await import('./entity-graph')
       const { indexEntitiesForSearch } = await import('./entity-index')
@@ -380,15 +449,15 @@ export async function runMcpHttpServer(options: McpHttpServerOptions): Promise<v
       if (graph) {
         const { count } = await indexEntitiesForSearch(searchService, graph)
         if (count > 0) {
-          console.error(`[MCP HTTP] Indexed ${count} entity schemas for hybrid search`)
+          logger.info('Indexed entity schemas for hybrid search', { count })
         }
       }
     } catch (entityError) {
-      console.error('[MCP HTTP] Entity schema indexing skipped:', entityError instanceof Error ? entityError.message : entityError)
+      logger.warn('Entity schema indexing skipped', { err: entityError })
     }
   } catch (error) {
     // Search service might not be configured - discovery will use fallback
-    console.error('[MCP HTTP] Search indexing skipped (search service not available):', error)
+    logger.warn('Search indexing skipped (search service not available)', { err: error })
   }
 
   const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
@@ -411,7 +480,7 @@ export async function runMcpHttpServer(options: McpHttpServerOptions): Promise<v
       return
     }
 
-    console.error(`[MCP HTTP] ← Request: ${req.method} ${url.pathname}`)
+    logger.debug('Request received', { method: req.method, path: url.pathname })
 
     // Extract headers
     const headers: Record<string, string | undefined> = {}
@@ -437,7 +506,7 @@ export async function runMcpHttpServer(options: McpHttpServerOptions): Promise<v
     }
 
     if (config.debug) {
-      console.error(`[MCP HTTP] Server-level auth passed (${req.method}) - API key: ${apiKeyRecord.keyPrefix}...`)
+      logger.debug('Server-level auth passed', { method: req.method, keyPrefix: apiKeyRecord.keyPrefix })
     }
 
     // Create base tool context using API key's tenant/org scope
@@ -460,13 +529,13 @@ export async function runMcpHttpServer(options: McpHttpServerOptions): Promise<v
       })
 
       // Create new server for this request
-      const mcpServer = createMcpServerForRequest(config, toolContext)
+      const mcpServer = createMcpServerForRequest(config, toolContext, apiKeyRecord)
 
       if (config.debug) {
         // Check registered tools on the server
         const registeredTools = (mcpServer as any)._registeredTools || {}
-        console.error(`[MCP HTTP] Registered tools in McpServer:`, Object.keys(registeredTools))
-        console.error(`[MCP HTTP] Tool handlers initialized:`, (mcpServer as any)._toolHandlersInitialized)
+        logger.debug('Registered tools in McpServer', { toolNames: Object.keys(registeredTools).join(',') })
+        logger.debug('Tool handlers initialized', { initialized: (mcpServer as any)._toolHandlersInitialized })
       }
 
       // Connect server to transport
@@ -485,11 +554,11 @@ export async function runMcpHttpServer(options: McpHttpServerOptions): Promise<v
         transport.close()
         mcpServer.close()
         if (config.debug) {
-          console.error(`[MCP HTTP] Request completed, cleaned up`)
+          logger.debug('Request completed, cleaned up')
         }
       })
     } catch (error) {
-      console.error('[MCP HTTP] Error handling request:', error)
+      logger.error('Error handling request', { err: error })
       if (!res.headersSent) {
         // Handle payload too large error
         if (error instanceof Error && error.message === 'Request payload too large') {
@@ -515,24 +584,24 @@ export async function runMcpHttpServer(options: McpHttpServerOptions): Promise<v
 
   const toolCount = getToolRegistry().listToolNames().length
 
-  console.error(`[MCP HTTP] Starting ${config.name} v${config.version}`)
-  console.error(`[MCP HTTP] Endpoint: http://localhost:${port}/mcp`)
-  console.error(`[MCP HTTP] Health: http://localhost:${port}/health`)
-  console.error(`[MCP HTTP] Tools registered: ${toolCount}`)
-  console.error(`[MCP HTTP] Mode: Stateless (new server per request)`)
-  console.error(`[MCP HTTP] Server Auth: API key validated against database (x-api-key header)`)
-  console.error(`[MCP HTTP] User Auth: Session token in _sessionToken parameter`)
+  logger.info('Starting MCP HTTP server', { name: config.name, version: config.version })
+  logger.info('Endpoint ready', { endpoint: `http://localhost:${port}/mcp` })
+  logger.info('Health endpoint ready', { endpoint: `http://localhost:${port}/health` })
+  logger.info('Tools registered', { toolCount })
+  logger.info('Mode: stateless (new server per request)')
+  logger.info('Server auth: API key validated against database (x-api-key header)')
+  logger.info('User auth: session token (_sessionToken) preferred, falls back to API key roles')
 
   // Return a Promise that keeps the process alive until shutdown
   return new Promise<void>((resolve) => {
     httpServer.listen(port, () => {
-      console.error(`[MCP HTTP] Server listening on port ${port}`)
+      logger.info('Server listening', { port })
     })
 
     const shutdown = async () => {
-      console.error('[MCP HTTP] Shutting down...')
+      logger.info('Shutting down')
       httpServer.close(() => {
-        console.error('[MCP HTTP] Server closed')
+        logger.info('Server closed')
         resolve()
       })
     }

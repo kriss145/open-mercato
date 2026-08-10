@@ -1,9 +1,13 @@
 import type { EntityManager } from '@mikro-orm/postgresql'
 import { CustomerDeal, CustomerEntity, CustomerTag, CustomerTagAssignment, CustomerDictionaryEntry, type CustomerEntityKind } from '../data/entities'
-import { CrudHttpError } from '@open-mercato/shared/lib/crud/errors'
+import { CrudHttpError, notFound } from '@open-mercato/shared/lib/crud/errors'
 import type { CommandRuntimeContext } from '@open-mercato/shared/lib/commands'
 import { ensureOrganizationScope, ensureSameScope } from '@open-mercato/shared/lib/commands/scope'
 import { findWithDecryption } from '@open-mercato/shared/lib/encryption/find'
+import type { EventBus } from '@open-mercato/events'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('customers')
 export { ensureOrganizationScope, ensureSameScope, ensureTenantScope } from '@open-mercato/shared/lib/commands/scope'
 export { extractUndoPayload } from '@open-mercato/shared/lib/commands/undo'
 
@@ -25,18 +29,58 @@ export function normalizeDictionaryIcon(input: unknown): string | null {
 
 export { assertFound } from '@open-mercato/shared/lib/crud/errors'
 
+export type CustomerEntityScope = {
+  tenantId: string
+  organizationId: string
+}
+
 export async function requireCustomerEntity(
   em: EntityManager,
   id: string,
+  scope: CustomerEntityScope,
   kind?: CustomerEntityKind,
   message = 'Customer entity not found'
 ): Promise<CustomerEntity> {
-  const entity = await em.findOne(CustomerEntity, { id, deletedAt: null })
-  if (!entity) throw new CrudHttpError(404, { error: message })
+  const entity = await em.findOne(CustomerEntity, {
+    id,
+    deletedAt: null,
+    tenantId: scope.tenantId,
+    organizationId: scope.organizationId,
+  })
+  if (!entity) throw notFound(message)
   if (kind && entity.kind !== kind) {
     throw new CrudHttpError(400, { error: 'Invalid entity type' })
   }
   return entity
+}
+
+export async function requireTimelineParentEntity(
+  em: EntityManager,
+  id: string,
+  scope: CustomerEntityScope,
+): Promise<CustomerEntity> {
+  const entity = await em.findOne(CustomerEntity, {
+    id,
+    deletedAt: null,
+    tenantId: scope.tenantId,
+    organizationId: scope.organizationId,
+  })
+  if (entity) {
+    if (entity.kind !== 'person' && entity.kind !== 'company') {
+      throw new CrudHttpError(422, { error: 'entityId must reference a person or company' })
+    }
+    return entity
+  }
+  const deal = await em.findOne(CustomerDeal, {
+    id,
+    deletedAt: null,
+    tenantId: scope.tenantId,
+    organizationId: scope.organizationId,
+  })
+  if (deal) {
+    throw new CrudHttpError(422, { error: 'entityId must reference a person or company, not a deal' })
+  }
+  throw notFound('Customer not found')
 }
 
 export async function syncEntityTags(
@@ -92,7 +136,7 @@ export async function requireDealInScope(
   organizationId: string
 ): Promise<CustomerDeal | null> {
   if (!dealId) return null
-  const deal = await em.findOne(CustomerDeal, { id: dealId, deletedAt: null })
+  const deal = await em.findOne(CustomerDeal, { id: dealId, deletedAt: null, tenantId, organizationId })
   if (!deal) throw new CrudHttpError(400, { error: 'Deal not found' })
   ensureSameScope(deal, organizationId, tenantId)
   return deal
@@ -108,23 +152,20 @@ const DICTIONARY_KINDS = new Set([
   'pipeline_stage',
   'job_title',
   'industry',
+  'temperature',
+  'renewal_quarter',
+  'person_company_role',
+  'interaction_status',
 ])
+
+const CUSTOM_DICTIONARY_KIND_PATTERN = /^[a-z0-9]+(?:[-_][a-z0-9]+)*$/
 
 export async function ensureDictionaryEntry(
   em: EntityManager,
   params: {
     tenantId: string
     organizationId: string
-    kind:
-      | 'status'
-      | 'source'
-      | 'lifecycle_stage'
-      | 'address_type'
-      | 'activity_type'
-      | 'deal_status'
-      | 'pipeline_stage'
-      | 'job_title'
-      | 'industry'
+    kind: string
     value: string
     label?: string | null
     color?: string | null | undefined
@@ -133,7 +174,7 @@ export async function ensureDictionaryEntry(
 ): Promise<CustomerDictionaryEntry | null> {
   const trimmed = params.value?.trim()
   if (!trimmed) return null
-  if (!DICTIONARY_KINDS.has(params.kind)) {
+  if (!DICTIONARY_KINDS.has(params.kind) && !CUSTOM_DICTIONARY_KIND_PATTERN.test(params.kind)) {
     throw new CrudHttpError(400, { error: 'Unsupported dictionary kind' })
   }
   const normalized = trimmed.toLowerCase()
@@ -227,10 +268,11 @@ async function emitQueryIndexEvents(
   const normalized = normalizeEventEntries(entries)
   if (!normalized.length) return
 
-  let bus: { emitEvent(event: string, payload: any, options?: any): Promise<void> } | null = null
+  let bus: EventBus | null = null
   try {
-    bus = ctx.container.resolve('eventBus')
-  } catch {
+    bus = ctx.container.resolve<EventBus>('eventBus')
+  } catch (err) {
+    logger.warn('eventBus resolve failed; skipping query index events', { component: 'commands.shared', err })
     bus = null
   }
   if (!bus) return
@@ -250,8 +292,15 @@ async function emitQueryIndexEvents(
             tenantId: entry.tenantId ?? null,
             crudAction,
           },
+          {
+            tenantId: entry.tenantId ?? null,
+            organizationId: entry.organizationId ?? null,
+          },
         )
-        .catch(() => undefined),
+        .catch((err) => {
+          logger.warn('Query index emitEvent failed', { component: 'commands.shared', entry, err })
+          return undefined
+        }),
     ),
   )
 }

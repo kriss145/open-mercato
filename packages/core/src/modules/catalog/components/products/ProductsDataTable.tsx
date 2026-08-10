@@ -4,19 +4,23 @@ import * as React from 'react'
 import Link from 'next/link'
 import type { ColumnDef, SortingState } from '@tanstack/react-table'
 import { DataTable, type DataTableExportFormat } from '@open-mercato/ui/backend/DataTable'
+import { ListEmptyState } from '@open-mercato/ui/backend/filters/ListEmptyState'
 import { Button } from '@open-mercato/ui/primitives/button'
 import { RowActions } from '@open-mercato/ui/backend/RowActions'
-import { apiCall, readApiResultOrThrow } from '@open-mercato/ui/backend/utils/apiCall'
+import { apiCall, readApiResultOrThrow, withScopedApiRequestHeaders } from '@open-mercato/ui/backend/utils/apiCall'
 import { flash } from '@open-mercato/ui/backend/FlashMessages'
 import { deleteCrud, buildCrudExportUrl } from '@open-mercato/ui/backend/utils/crud'
+import { buildOptimisticLockHeader } from '@open-mercato/ui/backend/utils/optimisticLock'
 import { useCustomFieldDefs } from '@open-mercato/ui/backend/utils/customFieldDefs'
 import { applyCustomFieldVisibility } from '@open-mercato/ui/backend/utils/customFieldColumns'
 import type { FilterDef, FilterValues } from '@open-mercato/ui/backend/FilterBar'
 import type { FilterOption } from '@open-mercato/ui/backend/FilterOverlay'
 import { BooleanIcon } from '@open-mercato/ui/backend/ValueIcons'
+import { markdownToPlainText } from '@open-mercato/ui/backend/markdown/markdownToPlainText'
 import { useOrganizationScopeVersion } from '@open-mercato/shared/lib/frontend/useOrganizationScope'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
 import { useConfirmDialog } from '@open-mercato/ui/backend/confirm-dialog'
+import { useAppEvent } from '@open-mercato/ui/backend/injection/useAppEvent'
 import { E } from '#generated/entities.ids.generated'
 import { ProductImageCell } from './ProductImageCell'
 
@@ -139,7 +143,31 @@ function renderPrice(pricing: PricingInfo | undefined, currency?: string | null,
   )
 }
 
-export default function ProductsDataTable() {
+export type ProductsDataTableSnapshot = {
+  search: string
+  filterValues: FilterValues
+  total: number
+}
+
+export type ProductsDataTableProps = {
+  /**
+   * Extra actions rendered alongside the built-in Create button in the
+   * DataTable header. Used by the Step 4.9 AI merchandising sheet
+   * trigger without coupling DataTable to the AI module.
+   */
+  extraActions?: React.ReactNode
+  /**
+   * Optional callback invoked whenever the table's search / filter /
+   * total-matching snapshot changes. Used by the Step 4.9 AI merchandising
+   * sheet to form a selection-aware pageContext per spec §10.1.
+   */
+  onSnapshotChange?: (snapshot: ProductsDataTableSnapshot) => void
+}
+
+export default function ProductsDataTable({
+  extraActions,
+  onSnapshotChange,
+}: ProductsDataTableProps = {}) {
   const t = useT()
   const { confirm, ConfirmDialogElement } = useConfirmDialog()
   const scopeVersion = useOrganizationScopeVersion()
@@ -147,11 +175,21 @@ export default function ProductsDataTable() {
   const [page, setPage] = React.useState(1)
   const [total, setTotal] = React.useState(0)
   const [totalPages, setTotalPages] = React.useState(1)
+  const [cacheStatus, setCacheStatus] = React.useState<'hit' | 'miss' | null>(null)
   const [sorting, setSorting] = React.useState<SortingState>([{ id: 'title', desc: false }])
   const [search, setSearch] = React.useState('')
   const [filterValues, setFilterValues] = React.useState<FilterValues>({})
   const [isLoading, setIsLoading] = React.useState(false)
   const [reloadToken, setReloadToken] = React.useState(0)
+  // Step 5.18 (spec §10 line 836, D18 demo): refresh the list when a
+  // catalog.product.* event arrives via the DOM event bridge. Confirmed
+  // AI bulk mutations (one `ai.action.confirmed` + one
+  // `catalog.product.updated` per record) and direct API writes both
+  // surface here so the table reflects the new state without a manual
+  // reload.
+  useAppEvent('catalog.product.*', () => {
+    setReloadToken((token) => token + 1)
+  })
   const [customFieldsetFilter, setCustomFieldsetFilter] = React.useState<string | null>(null)
   const { data: customFieldDefs = [] } = useCustomFieldDefs(ENTITY_ID, {
     keyExtras: [scopeVersion, reloadToken],
@@ -379,7 +417,7 @@ export default function ProductsDataTable() {
               <span className="text-xs text-muted-foreground">/{row.original.handle}</span>
             ) : null}
             {row.original.description ? (
-              <span className="text-xs text-muted-foreground">{row.original.description}</span>
+              <span className="text-xs text-muted-foreground">{markdownToPlainText(row.original.description)}</span>
             ) : null}
           </div>
         ),
@@ -536,6 +574,7 @@ export default function ProductsDataTable() {
     let cancelled = false
     async function load() {
       setIsLoading(true)
+      setCacheStatus(null)
       try {
         const fallback: ProductsResponse = { items: [], total: 0, totalPages: 1 }
         const call = await apiCall<ProductsResponse>(
@@ -546,10 +585,12 @@ export default function ProductsDataTable() {
         if (!call.ok) {
           const message = t('catalog.products.list.error.load', 'Failed to load products')
           flash(message, 'error')
+          if (!cancelled) setCacheStatus(null)
           return
         }
         const payload = call.result ?? fallback
         if (cancelled) return
+        setCacheStatus(call.cacheStatus ?? null)
         const items = Array.isArray(payload.items) ? payload.items : []
         const normalized = items.filter((item): item is ProductRow => typeof item?.id === 'string')
         setRows(normalized)
@@ -557,6 +598,7 @@ export default function ProductsDataTable() {
         setTotalPages(typeof payload.totalPages === 'number' ? payload.totalPages : 1)
       } catch (error) {
         if (!cancelled) {
+          setCacheStatus(null)
           const message =
             error instanceof Error
               ? error.message
@@ -580,9 +622,12 @@ export default function ProductsDataTable() {
     })
     if (!confirmed) return
     try {
-      await deleteCrud('catalog/products', row.id, {
-        errorMessage: t('catalog.products.list.error.delete', 'Failed to delete product'),
-      })
+      const headers = buildOptimisticLockHeader(typeof row.updated_at === 'string' ? row.updated_at : null)
+      await withScopedApiRequestHeaders(headers, () => (
+        deleteCrud('catalog/products', row.id, {
+          errorMessage: t('catalog.products.list.error.delete', 'Failed to delete product'),
+        })
+      ))
       flash(t('catalog.products.flash.deleted', 'Product deleted'), 'success')
       setReloadToken((token) => token + 1)
     } catch (error) {
@@ -593,6 +638,11 @@ export default function ProductsDataTable() {
       flash(message, 'error')
     }
   }, [confirm, t])
+
+  React.useEffect(() => {
+    if (!onSnapshotChange) return
+    onSnapshotChange({ search, filterValues, total })
+  }, [onSnapshotChange, search, filterValues, total])
 
   const currentParams = React.useMemo(() => Object.fromEntries(new URLSearchParams(queryParams)), [queryParams])
 
@@ -619,14 +669,24 @@ export default function ProductsDataTable() {
           isRefreshing: isLoading,
         }}
         actions={(
-          <Button asChild>
-            <Link href="/backend/catalog/products/create">
-              {t('catalog.products.actions.create', 'Create')}
-            </Link>
-          </Button>
+          <div className="flex items-center gap-2">
+            {extraActions}
+            <Button asChild>
+              <Link href="/backend/catalog/products/create">
+                {t('catalog.products.actions.create', 'Create')}
+              </Link>
+            </Button>
+          </div>
         )}
         columns={columns}
         data={rows}
+        emptyState={(
+          <ListEmptyState
+            entityName={t('catalog.products.page.title', 'Products & services')}
+            createHref="/backend/catalog/products/create"
+            createLabel={t('catalog.products.actions.create', 'Create')}
+          />
+        )}
         searchValue={search}
         onSearchChange={handleSearchChange}
         filters={filters}
@@ -640,8 +700,16 @@ export default function ProductsDataTable() {
         injectionContext={{
           search,
           filters: filterValues,
+          customFieldset: customFieldsetFilter,
           page,
+          sorting,
           scopeVersion,
+          // Step 5.15: surface `total` so the merchandising AI widget
+          // (rendered in `data-table:catalog.products:header`) can build
+          // a selection-aware pageContext per spec §10.1 without taking a
+          // dependency on the host page.
+          total,
+          totalMatching: total,
         }}
         pagination={{
           page,
@@ -649,10 +717,12 @@ export default function ProductsDataTable() {
           total,
           totalPages,
           onPageChange: setPage,
+          cacheStatus,
         }}
         exporter={exportConfig}
         isLoading={isLoading}
         perspective={{ tableId: 'catalog.products.list' }}
+        stickyActionsColumn
         rowActions={(row) => (
           <RowActions
             items={[

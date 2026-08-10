@@ -1,23 +1,29 @@
+import { createLogger } from '@open-mercato/shared/lib/logger'
 import { NextResponse, type NextRequest } from 'next/server'
+import type { OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
 import { generateObject } from '../../lib/ai-sdk'
-import {
-  createOpenAI,
-  createAnthropic,
-  createGoogleGenerativeAI,
-} from '../../lib/ai-sdk'
 import { z } from 'zod'
 import { getAuthFromRequest } from '@open-mercato/shared/lib/auth/server'
 import { createRequestContainer } from '@open-mercato/shared/lib/di/container'
-import {
-  resolveFirstConfiguredOpenCodeProvider,
-  resolveOpenCodeModel,
-  resolveOpenCodeProviderApiKey,
-} from '@open-mercato/shared/lib/ai/opencode-provider'
+import { llmProviderRegistry } from '@open-mercato/shared/lib/ai/llm-provider-registry'
+import { resolveOpenCodeModel } from '@open-mercato/shared/lib/ai/opencode-provider'
+import { joinProviderModel } from '@open-mercato/shared/lib/ai/model-id'
 import {
   resolveChatConfig,
   isProviderConfigured,
   type ChatProviderId,
 } from '../../lib/chat-config'
+import { createModelFactory, AiModelFactoryError } from '../../lib/model-factory'
+
+const logger = createLogger('ai_assistant')
+
+export const openApi: OpenApiRouteDoc = {
+  tag: 'AI Assistant',
+  summary: 'AI query routing',
+  methods: {
+    POST: { summary: 'Route user query to appropriate AI handler' },
+  },
+}
 
 export const metadata = {
   POST: { requireAuth: true, requireFeatures: ['ai_assistant.view'] },
@@ -31,39 +37,43 @@ const RouteResultSchema = z.object({
 })
 
 function createRoutingModel(providerId: ChatProviderId, configuredModel?: string) {
-  const { modelId, modelWithProvider } = resolveOpenCodeModel(providerId, {
-    overrideModel: configuredModel,
-  })
-  const apiKey = resolveOpenCodeProviderApiKey(providerId)
-  if (!apiKey) {
-    throw new Error(`${providerId.toUpperCase()} API key not configured`)
+  const provider = llmProviderRegistry.get(providerId)
+  if (!provider) {
+    throw new Error(`Unknown provider: ${providerId}`)
   }
 
-  switch (providerId) {
-    case 'openai': {
-      const openai = createOpenAI({ apiKey })
-      return {
-        model: openai(modelId) as unknown as Parameters<typeof generateObject>[0]['model'],
-        modelWithProvider,
-      }
-    }
-    case 'anthropic': {
-      const anthropic = createAnthropic({ apiKey })
-      return {
-        model: anthropic(modelId) as unknown as Parameters<typeof generateObject>[0]['model'],
-        modelWithProvider,
-      }
-    }
-    case 'google': {
-      const google = createGoogleGenerativeAI({ apiKey })
-      return {
-        model: google(modelId) as unknown as Parameters<typeof generateObject>[0]['model'],
-        modelWithProvider,
-      }
-    }
-    default:
-      throw new Error(`Unknown provider: ${providerId}`)
+  // resolveOpenCodeModel is still used for token parsing and provider-prefix
+  // validation (`openai/gpt-5-mini` vs `anthropic/claude-…`). It falls back
+  // to the provider's defaultModel via the opencode-provider facade, which
+  // is only populated for the three native providers — if the registry
+  // returns a preset-based provider whose id is unknown to opencode-provider,
+  // we short-circuit and use the provider's own defaultModel.
+  let modelId: string
+  let modelWithProvider: string
+  try {
+    const resolved = resolveOpenCodeModel(providerId as 'anthropic' | 'openai' | 'google', {
+      overrideModel: configuredModel,
+    })
+    modelId = resolved.modelId
+    modelWithProvider = resolved.modelWithProvider
+  } catch {
+    // Preset-based provider or unknown id — fall back to the provider's own
+    // model list. The explicit override (if any) wins.
+    const requested = (configuredModel ?? '').trim()
+    modelId = requested.length > 0 ? requested : provider.defaultModel
+    modelWithProvider = joinProviderModel(providerId, modelId)
   }
+
+  const apiKey = provider.resolveApiKey()
+  if (!apiKey) {
+    const envKey = provider.getConfiguredEnvKey()
+    throw new Error(`${envKey} not configured for provider "${providerId}"`)
+  }
+
+  const model = provider.createModel({ modelId, apiKey }) as unknown as Parameters<
+    typeof generateObject
+  >[0]['model']
+  return { model, modelWithProvider }
 }
 
 export async function POST(req: NextRequest) {
@@ -80,8 +90,8 @@ export async function POST(req: NextRequest) {
       availableTools: Array<{ name: string; description: string }>
     }
 
-    console.log('[AI Route] Routing query:', query)
-    console.log('[AI Route] Available tools count:', availableTools?.length)
+    logger.debug('Routing query received', { queryChars: query?.length ?? 0 })
+    logger.debug('Available tools count', { count: availableTools?.length })
 
     if (!query || typeof query !== 'string') {
       return NextResponse.json({ error: 'query is required' }, { status: 400 })
@@ -95,19 +105,58 @@ export async function POST(req: NextRequest) {
     const container = await createRequestContainer()
     let config = await resolveChatConfig(container)
 
-    // Fallback to first configured provider
+    // When no DB-stored config is present, delegate provider + model resolution
+    // to createModelFactory so OM_AI_PROVIDER / OM_AI_MODEL (Phase 0 of spec
+    // 2026-04-27-ai-agents-provider-model-baseurl-overrides) and all registered
+    // OpenAI-compatible presets are respected without duplicating the
+    // resolution chain here. Legacy OPENCODE_PROVIDER / OPENCODE_MODEL envs are
+    // still honored as BC fallbacks inside the factory.
     if (!config) {
-      const configuredProvider = resolveFirstConfiguredOpenCodeProvider()
-      if (!configuredProvider) {
-        return NextResponse.json(
-          { error: 'No AI provider configured. Please set an API key for OpenAI, Anthropic, or Google.' },
-          { status: 503 }
-        )
+      let factoryResolution
+      try {
+        factoryResolution = createModelFactory(container).resolveModel({
+          callerOverride: undefined,
+        })
+      } catch (error) {
+        if (error instanceof AiModelFactoryError && error.code === 'no_provider_configured') {
+          return NextResponse.json(
+            {
+              error:
+                'No AI provider configured. Please set an API key for one of the registered providers (Anthropic, OpenAI, Google, DeepInfra, Groq, …).',
+            },
+            { status: 503 },
+          )
+        }
+        throw error
       }
-      config = { providerId: configuredProvider, model: '', updatedAt: '' }
+
+      logger.debug('Using provider', { providerId: factoryResolution.providerId })
+
+      const modelWithProvider = joinProviderModel(factoryResolution.providerId, factoryResolution.modelId)
+      logger.debug('Calling generateObject', { model: modelWithProvider })
+
+      const result = await generateObject({
+        model: factoryResolution.model as Parameters<typeof generateObject>[0]['model'],
+        schema: RouteResultSchema,
+        prompt: `You are a routing assistant. Given a user query, determine if they want to use a specific tool or have a general conversation.
+
+Available tools:
+${availableTools.map((t) => `- ${t.name}: ${t.description}`).join('\n')}
+
+User query: "${query}"
+
+Respond with:
+- intent: "tool" if user wants to perform an action with a specific tool, "general_chat" otherwise
+- toolName: the exact tool name if intent is "tool"
+- confidence: 0-1 how confident you are
+- reasoning: brief explanation`,
+      })
+
+      logger.debug('Routing result', { resultKeys: Object.keys(result.object ?? {}).join(',') })
+      return NextResponse.json(result.object)
     }
 
-    console.log('[AI Route] Using provider:', config.providerId)
+    logger.debug('Using provider', { providerId: config.providerId })
 
     // Verify the configured provider is still available
     if (!isProviderConfigured(config.providerId)) {
@@ -124,7 +173,7 @@ export async function POST(req: NextRequest) {
       .map((t) => `- ${t.name}: ${t.description}`)
       .join('\n')
 
-    console.log('[AI Route] Calling generateObject with', modelWithProvider)
+    logger.debug('Calling generateObject', { model: modelWithProvider })
 
     const result = await generateObject({
       model,
@@ -143,10 +192,10 @@ Respond with:
 - reasoning: brief explanation`,
     })
 
-    console.log('[AI Route] Result:', result.object)
+    logger.debug('Routing result', { resultKeys: Object.keys(result.object ?? {}).join(',') })
     return NextResponse.json(result.object)
   } catch (error) {
-    console.error('[AI Route] Error routing query:', error)
+    logger.error('AI Route — Error routing query', { err: error })
     return NextResponse.json(
       { error: 'Routing request failed' },
       { status: 500 }

@@ -2,7 +2,9 @@ import * as React from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
 import { flash } from '../FlashMessages'
-import { apiCall } from '../utils/apiCall'
+import { apiCall, withScopedApiRequestHeaders } from '../utils/apiCall'
+import { buildOptimisticLockHeader } from '../utils/optimisticLock'
+import { surfaceRecordConflict } from '../conflicts'
 import type {
   AttachmentListResponse,
   MessageComposerProps,
@@ -16,6 +18,8 @@ import {
   useComposeSendOperation,
   useForwardSubmitOperation,
   useReplySubmitOperation,
+  useSendDraftOperation,
+  useUpdateDraftOperation,
 } from './useMessageComposeOperations'
 
 function toErrorMessage(payload: unknown): string | null {
@@ -125,12 +129,14 @@ export function useMessageCompose({
   requiredActionConfig = null,
   contextPreview = null,
   defaultValues,
+  expectedUpdatedAt = null,
   onSuccess,
   onCancel,
 }: UseMessageComposeParams): UseMessageComposeResult {
   const t = useT()
   const variant = variantProp
   const isOpen = inline ? true : Boolean(open)
+  const recipientSuggestionsCacheRef = React.useRef<TagsInputOption[] | null>(null)
 
   const [recipientIds, setRecipientIds] = React.useState<string[]>([])
   const [recipientMap, setRecipientMap] = React.useState<Record<string, TagsInputOption>>({})
@@ -153,6 +159,18 @@ export function useMessageCompose({
   const [submitting, setSubmitting] = React.useState(false)
   const [submitMode, setSubmitMode] = React.useState<'send' | 'draft'>('send')
   const [submitError, setSubmitError] = React.useState<string | null>(null)
+  // Tracks whether the composer is currently in the "open" lifecycle so the init
+  // effect below only runs on the closed → open transition, not on every parent
+  // re-render that produces a new `defaultValues` / `contextObject` reference
+  // while the user is typing. Without this guard, an inline literal
+  // `defaultValues={{...}}` in a re-rendering parent (e.g. message detail page
+  // with live notification badges or queue progress) would clear the body /
+  // subject mid-keystroke. CI shard 9 surfaced this as TC-MSG-009 timing out
+  // because `keyboard.type` characters appeared to "type nowhere" — they were
+  // typed correctly, then immediately wiped by the next effect run.
+  const isOpenRef = React.useRef(false)
+  const wasOpenRef = React.useRef(false)
+  const submitLockReleaseRef = React.useRef<(() => void) | null>(null)
 
   const messageTypesQuery = useQuery({
     queryKey: ['messages', 'types'],
@@ -218,7 +236,16 @@ export function useMessageCompose({
   }, [attachmentEntityId, attachmentRecordId, t])
 
   React.useEffect(() => {
-    if (!isOpen) return
+    if (!isOpen) {
+      isOpenRef.current = false
+      return
+    }
+    // Only initialize on the closed → open transition. Subsequent parent
+    // re-renders that change `defaultValues` / `contextObject` references
+    // (inline object literals are a new reference on every render) MUST NOT
+    // overwrite state the user has typed in.
+    if (isOpenRef.current) return
+    isOpenRef.current = true
 
     const nextRecipients = defaultValues?.recipients?.filter((value) => typeof value === 'string' && value.trim().length > 0) ?? []
     const dedupedRecipients = Array.from(new Set(nextRecipients))
@@ -268,6 +295,28 @@ export function useMessageCompose({
     normalizedRequiredActionMode,
     requiredActionConfig?.defaultActionType,
   ])
+
+  React.useEffect(() => {
+    if (!isOpen) {
+      submitLockReleaseRef.current?.()
+      submitLockReleaseRef.current = null
+      wasOpenRef.current = false
+      return
+    }
+
+    const justOpened = isOpen && !wasOpenRef.current
+    wasOpenRef.current = isOpen
+    if (!justOpened) return
+    submitLockReleaseRef.current?.()
+    submitLockReleaseRef.current = null
+    setSubmitting(false)
+    setSubmitMode('send')
+  }, [isOpen])
+
+  React.useEffect(() => () => {
+    submitLockReleaseRef.current?.()
+    submitLockReleaseRef.current = null
+  }, [])
 
   React.useEffect(() => {
     if (!isOpen) return
@@ -342,6 +391,11 @@ export function useMessageCompose({
     setRecipientIds([])
   }, [variant, visibility])
 
+  React.useEffect(() => {
+    if (isOpen) return
+    recipientSuggestionsCacheRef.current = null
+  }, [isOpen])
+
   const resolveRecipientLabel = React.useCallback((id: string) => {
     return recipientMap[id]?.label ?? id
   }, [recipientMap])
@@ -350,15 +404,32 @@ export function useMessageCompose({
     return recipientIds.map((id) => recipientMap[id] ?? { value: id, label: id })
   }, [recipientIds, recipientMap])
 
-  const loadRecipientSuggestions = React.useCallback(async (query?: string) => {
-    const params = new URLSearchParams()
-    params.set('page', '1')
-    params.set('pageSize', '20')
-    if (query && query.trim().length) {
-      params.set('search', query.trim())
+  const loadRecipientSuggestions = React.useCallback(async (_query?: string) => {
+    const cachedOptions = recipientSuggestionsCacheRef.current
+    if (cachedOptions) {
+      return cachedOptions
     }
 
-    const call = await apiCall<{ items?: UserListItem[] }>(`/api/auth/users?${params.toString()}`)
+    const params = new URLSearchParams()
+    params.set('page', '1')
+    params.set('pageSize', '100')
+    // Scope suggestions to the composer's active organization: a message is stamped with
+    // that org and its detail endpoint denies cross-org recipients, so a recipient from
+    // another org could never open what they were sent.
+    params.set('scopeToActiveOrganization', '1')
+    // Recipient lookup is filtered in TagsInput because incremental auth user search is unreliable.
+
+    const call = await apiCall<{ items?: UserListItem[] }>(
+      `/api/auth/users?${params.toString()}`,
+      {
+        headers: {
+          'x-om-forbidden-redirect': '0',
+        },
+      },
+    ).catch(() => null)
+    if (!call) {
+      return []
+    }
     if (!call.ok) {
       return []
     }
@@ -390,6 +461,7 @@ export function useMessageCompose({
       })
     }
 
+    recipientSuggestionsCacheRef.current = options
     return options
   }, [])
 
@@ -424,6 +496,7 @@ export function useMessageCompose({
 
   const composeDraftOperation = useComposeDraftOperation({
     t,
+    messageId,
     messageType,
     priority,
     visibility,
@@ -461,16 +534,59 @@ export function useMessageCompose({
     sendViaEmail,
   })
 
+  const sendDraftOperation = useSendDraftOperation({
+    t,
+    messageId: messageId ?? '',
+    messageType,
+    priority,
+    visibility,
+    externalEmail,
+    recipientIds,
+    subject,
+    body,
+    bodyFormat,
+    sendViaEmail,
+    contextObject,
+    defaultValues,
+    contextActionOptions,
+    normalizedRequiredActionMode,
+    shouldShowContextActions,
+    contextActionRequired,
+    contextActionType,
+  })
+
+  const updateDraftOperation = useUpdateDraftOperation({
+    t,
+    messageId: messageId ?? '',
+    messageType,
+    priority,
+    visibility,
+    externalEmail,
+    recipientIds,
+    subject,
+    body,
+    bodyFormat,
+    sendViaEmail,
+    contextObject,
+    defaultValues,
+    contextActionOptions,
+    normalizedRequiredActionMode,
+    shouldShowContextActions,
+    contextActionRequired,
+    contextActionType,
+  })
+
   const handleSubmit = React.useCallback(async ({ saveAsDraft = false }: { saveAsDraft?: boolean } = {}) => {
     if (submitting) return false
 
     setSubmitError(null)
 
+    const isEditingExistingDraft = variant === 'compose' && Boolean(messageId)
     const isComposeDraftSubmit = saveAsDraft && variant === 'compose'
     const operation = isComposeDraftSubmit
-      ? composeDraftOperation
+      ? (isEditingExistingDraft ? updateDraftOperation : composeDraftOperation)
       : variant === 'compose'
-        ? composeSendOperation
+        ? (isEditingExistingDraft ? sendDraftOperation : composeSendOperation)
         : variant === 'reply'
           ? replyOperation
           : forwardOperation
@@ -484,6 +600,8 @@ export function useMessageCompose({
 
     setSubmitMode(isComposeDraftSubmit ? 'draft' : 'send')
     setSubmitting(true)
+    let keepSubmitLock = false
+    let shouldReturnFalse = false
 
     try {
       let nextAttachmentIds = attachmentIds
@@ -496,56 +614,97 @@ export function useMessageCompose({
             : t('messages.errors.loadAttachmentOptionsFailed', 'Failed to load attachments.')
           setSubmitError(message)
           flash(message, 'error')
-          return false
+          shouldReturnFalse = true
         }
       }
 
-      const { endpoint, payload } = operation.buildRequest({ attachmentIds: nextAttachmentIds })
+      if (!shouldReturnFalse) {
+        const { endpoint, method, payload } = operation.buildRequest({ attachmentIds: nextAttachmentIds })
 
-      const call = await apiCall<{ id?: string }>(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      })
+        // Editing an existing draft is a PATCH on the message aggregate, so carry
+        // the OSS optimistic-lock header to reject a stale overwrite. New
+        // compose/reply/forward writes create fresh records and never lock.
+        const lockHeaders = isEditingExistingDraft
+          ? buildOptimisticLockHeader(expectedUpdatedAt)
+          : {}
 
-      if (!call.ok) {
-        const message = toErrorMessage(call.result) ?? t('messages.errors.sendFailed', 'Failed to send message.')
-        setSubmitError(message)
-        flash(message, 'error')
-        return false
+        const call = await withScopedApiRequestHeaders(lockHeaders, () =>
+          apiCall<{ id?: string }>(endpoint, {
+            method,
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          }),
+        )
+
+        if (!call.ok) {
+          if (surfaceRecordConflict({ status: call.status, body: call.result }, t)) {
+            setSubmitError(
+              t('ui.forms.flash.recordModified', 'This record was modified by someone else. Refresh and try again.'),
+            )
+            // The shared conflict banner renders at page level, so it is hidden
+            // behind the compose modal. Close the dialog to reveal it (with its
+            // Refresh action); the stale draft must be reloaded anyway (#3260 QA).
+            if (!inline) {
+              onOpenChange?.(false)
+            }
+          } else {
+            const message = toErrorMessage(call.result) ?? t('messages.errors.sendFailed', 'Failed to send message.')
+            setSubmitError(message)
+            flash(message, 'error')
+          }
+          shouldReturnFalse = true
+        } else {
+          flash(operation.successMessage, 'success')
+          keepSubmitLock = true
+
+          onSuccess?.({ id: call.result?.id })
+
+          if (!inline) {
+            onOpenChange?.(false)
+          }
+        }
       }
-
-      flash(operation.successMessage, 'success')
-
-      onSuccess?.({ id: call.result?.id })
-
-      if (!inline) {
-        onOpenChange?.(false)
-      }
-      return true
     } catch (error) {
       const message = error instanceof Error
         ? error.message
         : t('messages.errors.sendFailed', 'Failed to send message.')
       setSubmitError(message)
       flash(message, 'error')
-      return false
+      shouldReturnFalse = true
     } finally {
-      setSubmitting(false)
+      if (!keepSubmitLock) {
+        setSubmitting(false)
+      }
       setSubmitMode('send')
     }
+
+    if (shouldReturnFalse) {
+      return false
+    }
+
+    if (keepSubmitLock) {
+      return await new Promise<boolean>((resolve) => {
+        submitLockReleaseRef.current = () => resolve(true)
+      })
+    }
+
+    return true
   }, [
     attachmentIds,
     composeDraftOperation,
     composeSendOperation,
+    expectedUpdatedAt,
     forwardOperation,
     inline,
     loadAttachmentIds,
+    messageId,
     onOpenChange,
     onSuccess,
     replyOperation,
+    sendDraftOperation,
     submitting,
     t,
+    updateDraftOperation,
     variant,
   ])
 

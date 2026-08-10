@@ -6,8 +6,12 @@
  */
 
 import type { EntityManager } from '@mikro-orm/core'
+import type { EntityManager as PostgreSqlEntityManager } from '@mikro-orm/postgresql'
 import type { AwilixContainer } from 'awilix'
 import type { CacheService } from '@open-mercato/cache'
+import { matchEventPattern } from '@open-mercato/shared/lib/events/patterns'
+import { findWithDecryption } from '@open-mercato/shared/lib/encryption/find'
+import { testLinearRegex } from '@open-mercato/shared/lib/regex/linear'
 import {
   WorkflowEventTrigger,
   WorkflowDefinition,
@@ -18,6 +22,11 @@ import {
   type WorkflowDefinitionTrigger,
 } from '../data/entities'
 import { startWorkflow, executeWorkflow } from './workflow-executor'
+import { getAllCodeWorkflows } from './code-registry'
+import { codeWorkflowUuid } from './find-definition'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('workflows').child({ component: 'event-trigger' })
 
 // ============================================================================
 // Types
@@ -52,7 +61,7 @@ export interface UnifiedTrigger {
   workflowDefinitionId: string
   workflowId: string
   workflowVersion: number
-  source: 'legacy' | 'embedded'
+  source: 'legacy' | 'embedded' | 'code'
   tenantId: string
   organizationId: string
 }
@@ -65,41 +74,23 @@ interface CachedTriggers {
 // Cache TTL: 5 minutes
 const TRIGGER_CACHE_TTL = 5 * 60 * 1000
 
+function readEventActorUserId(payload: Record<string, unknown>): string | null {
+  const candidate = payload.userId ?? payload.actorUserId
+  if (typeof candidate !== 'string') return null
+  const trimmed = candidate.trim()
+  return trimmed.length > 0 && !trimmed.startsWith('trigger:') ? trimmed : null
+}
+
 // ============================================================================
 // Pattern Matching
 // ============================================================================
 
-/**
- * Match an event name against a pattern.
- *
- * Supports:
- * - Exact match: `customers.people.created`
- * - Wildcard `*` matches single segment: `customers.*` matches `customers.people` but not `customers.people.created`
- * - Global wildcard: `*` alone matches all events
- */
-export function matchEventPattern(eventName: string, pattern: string): boolean {
-  // Global wildcard matches all events
-  if (pattern === '*') return true
-
-  // Exact match
-  if (pattern === eventName) return true
-
-  // No wildcards in pattern means we need exact match, which already failed
-  if (!pattern.includes('*')) return false
-
-  // Convert pattern to regex:
-  // - Escape regex special chars (except *)
-  // - Replace * with [^.]+ (match one or more non-dot chars)
-  const regexPattern = pattern
-    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
-    .replace(/\*/g, '[^.]+')
-  const regex = new RegExp(`^${regexPattern}$`)
-  return regex.test(eventName)
-}
-
 // ============================================================================
 // Filter Evaluation
 // ============================================================================
+
+const MAX_WORKFLOW_REGEX_PATTERN_LENGTH = 200
+const MAX_WORKFLOW_REGEX_INPUT_LENGTH = 10_000
 
 /**
  * Get a nested value from an object using dot notation.
@@ -117,6 +108,114 @@ function getNestedValue(obj: unknown, path: string): unknown {
   }
 
   return current
+}
+
+function getQuantifierEnd(pattern: string, index: number): number | null {
+  const char = pattern[index]
+  if (char === '*' || char === '+' || char === '?') return index
+  if (char !== '{') return null
+
+  const closeIndex = pattern.indexOf('}', index + 1)
+  if (closeIndex === -1) return null
+
+  const body = pattern.slice(index + 1, closeIndex)
+  return /^[0-9]+(?:,[0-9]*)?$/.test(body) ? closeIndex : null
+}
+
+interface RegexGroupFrame {
+  hasAlternation: boolean
+  hasQuantifier: boolean
+}
+
+function isSafeWorkflowRegexPattern(pattern: string): boolean {
+  if (pattern.length > MAX_WORKFLOW_REGEX_PATTERN_LENGTH) return false
+
+  const groupStack: RegexGroupFrame[] = [{ hasAlternation: false, hasQuantifier: false }]
+  let inCharClass = false
+  let lastClosedGroup: RegexGroupFrame | null = null
+  let lastAtomWasQuantified = false
+
+  // Hand-written single-pass lexer: `index` is intentionally advanced inside the
+  // loop body (escape pairs, `(?:` prefixes, multi-char quantifiers, lazy `?`) on
+  // top of the `index += 1` update clause. Do not "simplify" these in-body writes.
+  for (let index = 0; index < pattern.length; index += 1) {
+    const char = pattern[index]
+
+    if (char === '\\') {
+      const next = pattern[index + 1]
+      if (!inCharClass && (/[1-9]/.test(next ?? '') || (next === 'k' && pattern[index + 2] === '<'))) {
+        return false
+      }
+      index += 1
+      lastClosedGroup = null
+      lastAtomWasQuantified = false
+      continue
+    }
+
+    if (inCharClass) {
+      if (char === ']') {
+        inCharClass = false
+        lastAtomWasQuantified = false
+      }
+      lastClosedGroup = null
+      continue
+    }
+
+    if (char === '[') {
+      inCharClass = true
+      lastClosedGroup = null
+      lastAtomWasQuantified = false
+      continue
+    }
+
+    if (char === '(') {
+      if (pattern[index + 1] === '?') {
+        if (pattern[index + 2] !== ':') return false
+        index += 2
+      }
+
+      groupStack.push({ hasAlternation: false, hasQuantifier: false })
+      lastClosedGroup = null
+      lastAtomWasQuantified = false
+      continue
+    }
+
+    if (char === ')') {
+      if (groupStack.length === 1) return false
+      lastClosedGroup = groupStack.pop()!
+      lastAtomWasQuantified = false
+      continue
+    }
+
+    if (char === '|') {
+      groupStack[groupStack.length - 1].hasAlternation = true
+      lastClosedGroup = null
+      lastAtomWasQuantified = false
+      continue
+    }
+
+    const quantifierEnd = getQuantifierEnd(pattern, index)
+    if (quantifierEnd !== null) {
+      if (lastAtomWasQuantified) return false
+      if (lastClosedGroup?.hasAlternation || lastClosedGroup?.hasQuantifier) return false
+
+      groupStack[groupStack.length - 1].hasQuantifier = true
+      lastClosedGroup = null
+      lastAtomWasQuantified = true
+      index = quantifierEnd
+
+      if (pattern[index + 1] === '?') {
+        index += 1
+      }
+
+      continue
+    }
+
+    lastClosedGroup = null
+    lastAtomWasQuantified = false
+  }
+
+  return groupStack.length === 1 && !inCharClass
 }
 
 /**
@@ -174,11 +273,14 @@ function evaluateCondition(condition: TriggerFilterCondition, payload: Record<st
 
     case 'regex':
       if (typeof value !== 'string' || typeof expected !== 'string') return false
-      try {
-        const regex = new RegExp(expected)
-        return regex.test(value)
-      } catch {
-        return false
+      if (value.length > MAX_WORKFLOW_REGEX_INPUT_LENGTH) return false
+      if (!isSafeWorkflowRegexPattern(expected)) return false
+      {
+        const result = testLinearRegex(expected, value, {
+          maxPatternLength: MAX_WORKFLOW_REGEX_PATTERN_LENGTH,
+          maxInputLength: MAX_WORKFLOW_REGEX_INPUT_LENGTH,
+        })
+        return result.ok ? result.matched : false
       }
 
     default:
@@ -226,8 +328,26 @@ export function mapEventToContext(
 // Trigger Loading with Caching
 // ============================================================================
 
-// In-memory cache for triggers (per tenant/org)
-const triggerCache = new Map<string, CachedTriggers>()
+// In-memory cache for triggers (per tenant/org).
+// Park the Map on globalThis so the same compiled module loaded under two
+// paths (a Next.js server chunk vs. a worker resolving the file through a
+// different import root) shares one cache. Without this,
+// `invalidateTriggerCache(...)` called from the PUT /api/workflows/definitions
+// route clears its own copy while the wildcard event-trigger subscriber keeps
+// reading a stale copy populated before the trigger was added — newly added
+// triggers stay invisible for up to TRIGGER_CACHE_TTL. Mirrors the same
+// workaround used by the modules registry and `getDiRegistrars()`.
+const GLOBAL_TRIGGER_CACHE_KEY = '__openMercatoWorkflowTriggerCache__'
+
+function getTriggerCache(): Map<string, CachedTriggers> {
+  const existing = (globalThis as any)[GLOBAL_TRIGGER_CACHE_KEY] as
+    | Map<string, CachedTriggers>
+    | undefined
+  if (existing) return existing
+  const created = new Map<string, CachedTriggers>()
+  ;(globalThis as any)[GLOBAL_TRIGGER_CACHE_KEY] = created
+  return created
+}
 
 function getCacheKey(tenantId: string, organizationId: string): string {
   return `${tenantId}:${organizationId}`
@@ -242,7 +362,9 @@ async function loadLegacyTriggers(
   tenantId: string,
   organizationId: string
 ): Promise<UnifiedTrigger[]> {
-  const legacyTriggers = await em.find(
+  const postgresEm = em as unknown as PostgreSqlEntityManager
+  const legacyTriggers = await findWithDecryption(
+    postgresEm,
     WorkflowEventTrigger,
     {
       tenantId,
@@ -252,16 +374,19 @@ async function loadLegacyTriggers(
     },
     {
       orderBy: { priority: 'DESC', createdAt: 'ASC' },
-    }
+    },
+    { tenantId, organizationId },
   )
 
   // Get definitions for these triggers to get workflowId
   const definitionIds = [...new Set(legacyTriggers.map(t => t.workflowDefinitionId))]
-  const definitions = definitionIds.length > 0 ? await em.find(WorkflowDefinition, {
+  const definitions = definitionIds.length > 0 ? await findWithDecryption(postgresEm, WorkflowDefinition, {
     id: { $in: definitionIds },
+    tenantId,
+    organizationId,
     enabled: true,
     deletedAt: null,
-  }) : []
+  }, {}, { tenantId, organizationId }) : []
   const definitionMap = new Map(definitions.map(d => [d.id, d]))
 
   return legacyTriggers
@@ -290,26 +415,39 @@ async function loadLegacyTriggers(
 /**
  * Load embedded triggers from workflow definitions.
  * New triggers are embedded directly in the definition JSONB.
+ *
+ * Also returns the set of every non-deleted DB definition's `workflowId` — even
+ * those with no triggers — so the caller can let a materialized (customized)
+ * definition suppress its code-registry counterpart regardless of whether the
+ * customization kept any triggers (#4425).
  */
 async function loadEmbeddedTriggers(
   em: EntityManager,
   tenantId: string,
   organizationId: string
-): Promise<UnifiedTrigger[]> {
-  // Load all enabled definitions that may have triggers
-  const definitions = await em.find(
+): Promise<{ triggers: UnifiedTrigger[]; workflowIds: Set<string> }> {
+  const postgresEm = em as unknown as PostgreSqlEntityManager
+  // Load all definitions so disabled customizations still shadow their code
+  // counterpart. Only enabled definitions contribute embedded triggers below.
+  const definitions = await findWithDecryption(
+    postgresEm,
     WorkflowDefinition,
     {
       tenantId,
       organizationId,
-      enabled: true,
       deletedAt: null,
-    }
+    },
+    {},
+    { tenantId, organizationId },
   )
 
   const triggers: UnifiedTrigger[] = []
+  const workflowIds = new Set<string>()
 
   for (const def of definitions) {
+    workflowIds.add(def.workflowId)
+    if (!def.enabled) continue
+
     const embeddedTriggers = def.definition?.triggers as WorkflowDefinitionTrigger[] | undefined
     if (!embeddedTriggers || embeddedTriggers.length === 0) continue
 
@@ -335,12 +473,70 @@ async function loadEmbeddedTriggers(
     }
   }
 
+  return { triggers, workflowIds }
+}
+
+/**
+ * Project triggers declared on code-defined workflows into UnifiedTriggers.
+ *
+ * Code workflows live only in the in-memory registry, so their `triggers`
+ * arrays never reached the DB-backed loaders — a code-declared trigger was inert
+ * until an operator ran `POST …/code:<id>/customize` to materialize the
+ * definition into a `workflow_definitions` row (#4425). This projects them
+ * directly. It is synchronous (no DB) and scoped to the caller's tenant/org via
+ * the deterministic virtual definition id, matching what `startWorkflow`
+ * persists as the instance's `definitionId` so the concurrency limit counts
+ * correctly.
+ *
+ * `dbBackedWorkflowIds` are workflowIds already contributed by the legacy or
+ * embedded (DB) sources; a code workflow whose id appears there is skipped so a
+ * customized DB override wins and its trigger is not double-registered.
+ */
+export function loadCodeTriggers(
+  tenantId: string,
+  organizationId: string,
+  dbBackedWorkflowIds: Set<string>,
+): UnifiedTrigger[] {
+  const triggers: UnifiedTrigger[] = []
+
+  for (const codeDef of getAllCodeWorkflows()) {
+    if (!codeDef.enabled) continue
+    if (dbBackedWorkflowIds.has(codeDef.workflowId)) continue
+
+    const embeddedTriggers = codeDef.definition?.triggers
+    if (!embeddedTriggers || embeddedTriggers.length === 0) continue
+
+    const definitionId = codeWorkflowUuid(codeDef.workflowId)
+    for (const trigger of embeddedTriggers) {
+      if (!trigger.enabled) continue
+
+      triggers.push({
+        id: `code:${codeDef.workflowId}:${trigger.triggerId}`,
+        triggerId: trigger.triggerId,
+        name: trigger.name,
+        description: trigger.description ?? null,
+        eventPattern: trigger.eventPattern,
+        config: (trigger.config ?? null) as WorkflowEventTriggerConfig | null,
+        enabled: trigger.enabled,
+        priority: trigger.priority,
+        workflowDefinitionId: definitionId,
+        workflowId: codeDef.workflowId,
+        workflowVersion: codeDef.version,
+        source: 'code' as const,
+        tenantId,
+        organizationId,
+      })
+    }
+  }
+
   return triggers
 }
 
 /**
  * Load all enabled triggers for a tenant/organization with caching.
- * Merges both legacy (entity) triggers and embedded (definition) triggers.
+ * Merges legacy (entity), embedded (definition), and code-registry triggers;
+ * a DB-backed source for a given workflowId takes precedence over its code
+ * trigger so `customize` semantics are preserved.
  */
 export async function loadTriggersForTenant(
   em: EntityManager,
@@ -349,25 +545,36 @@ export async function loadTriggersForTenant(
   cacheService?: CacheService
 ): Promise<UnifiedTrigger[]> {
   const cacheKey = getCacheKey(tenantId, organizationId)
+  const cache = getTriggerCache()
 
   // Check in-memory cache
-  const cached = triggerCache.get(cacheKey)
+  const cached = cache.get(cacheKey)
   if (cached && Date.now() - cached.cachedAt < TRIGGER_CACHE_TTL) {
     return cached.triggers
   }
 
-  // Load from both sources
-  const [legacyTriggers, embeddedTriggers] = await Promise.all([
+  // Load from both DB sources
+  const [legacyTriggers, embedded] = await Promise.all([
     loadLegacyTriggers(em, tenantId, organizationId),
     loadEmbeddedTriggers(em, tenantId, organizationId),
   ])
+  const embeddedTriggers = embedded.triggers
+
+  // Project code-registry triggers, letting any DB-backed definition for the
+  // same workflowId win (preserves `customize` override semantics — including
+  // a customization that removed its triggers).
+  const dbBackedWorkflowIds = new Set<string>([
+    ...embedded.workflowIds,
+    ...legacyTriggers.map((t) => t.workflowId),
+  ])
+  const codeTriggers = loadCodeTriggers(tenantId, organizationId, dbBackedWorkflowIds)
 
   // Merge and sort by priority (higher first)
-  const allTriggers = [...legacyTriggers, ...embeddedTriggers]
+  const allTriggers = [...legacyTriggers, ...embeddedTriggers, ...codeTriggers]
     .sort((a, b) => b.priority - a.priority)
 
   // Update cache
-  triggerCache.set(cacheKey, {
+  cache.set(cacheKey, {
     triggers: allTriggers,
     cachedAt: Date.now(),
   })
@@ -382,15 +589,16 @@ export async function loadTriggersForTenant(
  * - Workflow definitions with embedded triggers are created/updated/deleted
  */
 export function invalidateTriggerCache(tenantId: string, organizationId?: string): void {
+  const cache = getTriggerCache()
   if (organizationId) {
     // Invalidate specific org
     const cacheKey = getCacheKey(tenantId, organizationId)
-    triggerCache.delete(cacheKey)
+    cache.delete(cacheKey)
   } else {
     // Invalidate all orgs for tenant
-    for (const key of triggerCache.keys()) {
+    for (const key of cache.keys()) {
       if (key.startsWith(`${tenantId}:`)) {
-        triggerCache.delete(key)
+        cache.delete(key)
       }
     }
   }
@@ -483,7 +691,7 @@ export async function processEventTriggers(
       // Check concurrency limit
       const canStart = await checkConcurrencyLimit(em, trigger)
       if (!canStart) {
-        console.log(`[workflow-trigger] Skipping trigger "${trigger.name}": max concurrent instances reached`)
+        logger.debug('Skipping trigger: max concurrent instances reached', { triggerId: trigger.id, triggerName: trigger.name })
         result.skipped++
         continue
       }
@@ -494,6 +702,7 @@ export async function processEventTriggers(
       // Extract entity info from payload for metadata
       const payloadId = context.payload?.id as string | undefined
       const payloadEntityType = context.payload?.entityType as string | undefined
+      const actorUserId = readEventActorUserId(context.payload)
 
       // Include event metadata and payload in context
       const initialContext = {
@@ -517,7 +726,7 @@ export async function processEventTriggers(
         version: trigger.workflowVersion,
         initialContext,
         metadata: {
-          initiatedBy: `trigger:${trigger.id}`,
+          initiatedBy: actorUserId ?? `trigger:${trigger.id}`,
           // Include entityId and entityType for widget discovery
           entityId: payloadId,
           entityType: payloadEntityType || trigger.config?.entityType,
@@ -539,13 +748,18 @@ export async function processEventTriggers(
       })
 
       // Execute workflow asynchronously (don't wait)
-      executeWorkflow(em.fork(), container, instance.id).catch(err => {
-        console.error(`[workflow-trigger] Error executing workflow ${instance.id}:`, err)
+      executeWorkflow(
+        em.fork(),
+        container,
+        instance.id,
+        actorUserId ? { userId: actorUserId } : undefined
+      ).catch(err => {
+        logger.error('Error executing workflow', { instanceId: instance.id, err })
       })
 
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error)
-      console.error(`[workflow-trigger] Error processing trigger "${trigger.name}":`, error)
+      logger.error('Error processing trigger', { triggerId: trigger.id, triggerName: trigger.name, err: error })
       result.errors.push({
         triggerId: trigger.id,
         error: errorMessage,

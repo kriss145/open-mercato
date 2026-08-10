@@ -12,6 +12,7 @@ import {
 } from '@open-mercato/shared/lib/commands'
 import { extractUndoPayload } from '@open-mercato/shared/lib/commands/undo'
 import { buildChanges, requireId } from '@open-mercato/shared/lib/commands/helpers'
+import { ensureOrganizationScope, ensureTenantScope } from '@open-mercato/shared/lib/commands/scope'
 import { CrudHttpError } from '@open-mercato/shared/lib/crud/errors'
 import { resolveTranslations } from '@open-mercato/shared/lib/i18n/server'
 import type { z } from 'zod'
@@ -20,6 +21,11 @@ import { findOneWithDecryption } from '@open-mercato/shared/lib/encryption/find'
 type DictionaryScope = {
   tenantId: string
   organizationId: string
+}
+
+export function ensureDictionaryEntryScope(ctx: CommandRuntimeContext, scope: DictionaryScope): void {
+  ensureTenantScope(ctx, scope.tenantId)
+  ensureOrganizationScope(ctx, scope.organizationId)
 }
 
 export type DictionaryEntrySnapshot = {
@@ -34,6 +40,8 @@ export type DictionaryEntrySnapshot = {
   icon: string | null
   createdAt: string
   updatedAt: string
+  position?: number
+  isDefault?: boolean
 }
 
 export type DictionaryEntryUndoPayload = {
@@ -41,7 +49,7 @@ export type DictionaryEntryUndoPayload = {
   after?: DictionaryEntrySnapshot | null
 }
 
-const ENTRY_CHANGE_KEYS = ['value', 'label', 'color', 'icon'] as const
+const ENTRY_CHANGE_KEYS = ['value', 'label', 'color', 'icon', 'position', 'isDefault'] as const
 
 type ResolveDictionaryForCreate<TCreate> = (options: {
   em: EntityManager
@@ -85,8 +93,8 @@ export type DictionaryEntryCommandConfig<TCreate, TUpdate> = {
   labels?: DictionaryEntryCommandLabels
 }
 
-function toScopeEnsurer(fn: EnsureScopeFn | undefined): EnsureScopeFn {
-  return typeof fn === 'function' ? fn : () => {}
+export function toScopeEnsurer(fn: EnsureScopeFn | undefined): EnsureScopeFn {
+  return typeof fn === 'function' ? fn : ensureDictionaryEntryScope
 }
 
 async function loadSnapshot(em: EntityManager, id: string): Promise<DictionaryEntrySnapshot | null> {
@@ -102,6 +110,8 @@ async function loadSnapshot(em: EntityManager, id: string): Promise<DictionaryEn
     label: entry.label,
     color: entry.color ?? null,
     icon: entry.icon ?? null,
+    position: entry.position ?? 0,
+    isDefault: entry.isDefault ?? false,
     createdAt:
       entry.createdAt instanceof Date
         ? entry.createdAt.toISOString()
@@ -119,6 +129,8 @@ function applySnapshot(entry: DictionaryEntry, snapshot: DictionaryEntrySnapshot
   entry.label = snapshot.label
   entry.color = snapshot.color ?? null
   entry.icon = snapshot.icon ?? null
+  if (snapshot.position !== undefined) entry.position = snapshot.position
+  if (snapshot.isDefault !== undefined) entry.isDefault = snapshot.isDefault
   entry.organizationId = snapshot.organizationId
   entry.tenantId = snapshot.tenantId
   entry.createdAt = new Date(snapshot.createdAt)
@@ -145,6 +157,7 @@ function sanitizeCreatePayload(input: any): {
   label: string
   color: string | null
   icon: string | null
+  position: number | undefined
 } {
   const rawValue = typeof input?.value === 'string' ? input.value.trim() : ''
   if (!rawValue) {
@@ -155,7 +168,8 @@ function sanitizeCreatePayload(input: any): {
   const label = rawLabel || rawValue
   const color = sanitizeDictionaryColor(input?.color ?? null)
   const icon = sanitizeDictionaryIcon(input?.icon ?? null)
-  return { value: rawValue, normalized, label, color, icon }
+  const position = typeof input?.position === 'number' ? input.position : undefined
+  return { value: rawValue, normalized, label, color, icon, position }
 }
 
 function sanitizeUpdatePayload(input: any): {
@@ -164,6 +178,8 @@ function sanitizeUpdatePayload(input: any): {
   label?: string
   color?: string | null
   icon?: string | null
+  position?: number
+  isDefault?: boolean
 } {
   const payload: {
     value?: string
@@ -171,6 +187,8 @@ function sanitizeUpdatePayload(input: any): {
     label?: string
     color?: string | null
     icon?: string | null
+    position?: number
+    isDefault?: boolean
   } = {}
   if (Object.prototype.hasOwnProperty.call(input, 'value')) {
     const rawValue = typeof input?.value === 'string' ? input.value.trim() : ''
@@ -189,6 +207,15 @@ function sanitizeUpdatePayload(input: any): {
   }
   if (Object.prototype.hasOwnProperty.call(input, 'icon')) {
     payload.icon = sanitizeDictionaryIcon(input?.icon ?? null)
+  }
+  if (Object.prototype.hasOwnProperty.call(input, 'position')) {
+    const rawPosition = typeof input?.position === 'number' ? input.position : undefined
+    if (rawPosition !== undefined) {
+      payload.position = rawPosition
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(input, 'isDefault')) {
+    payload.isDefault = typeof input?.isDefault === 'boolean' ? input.isDefault : undefined
   }
   return payload
 }
@@ -216,7 +243,7 @@ export function registerDictionaryEntryCommands<TCreate, TUpdate>(
       const { dictionary, scope } = await config.resolveDictionaryForCreate({ em, ctx, parsed })
       scopeEnsurer(ctx, scope)
 
-      const { value, normalized, label, color, icon } = sanitizeCreatePayload(parsed)
+      const { value, normalized, label, color, icon, position } = sanitizeCreatePayload(parsed)
       const duplicate = await em.findOne(DictionaryEntry, {
         dictionary,
         tenantId: scope.tenantId,
@@ -236,6 +263,7 @@ export function registerDictionaryEntryCommands<TCreate, TUpdate>(
         label,
         color,
         icon,
+        ...(position !== undefined ? { position } : {}),
         createdAt: new Date(),
         updatedAt: new Date(),
       })
@@ -274,7 +302,7 @@ export function registerDictionaryEntryCommands<TCreate, TUpdate>(
       scopeEnsurer(ctx, { tenantId: after.tenantId, organizationId: after.organizationId })
       const entry = await em.findOne(DictionaryEntry, after.id)
       if (entry) {
-      await em.removeAndFlush(entry)
+      await em.remove(entry).flush()
       return
     }
     await em.nativeDelete(DictionaryEntry, { id: after.id })
@@ -330,6 +358,12 @@ export function registerDictionaryEntryCommands<TCreate, TUpdate>(
       }
       if (Object.prototype.hasOwnProperty.call(updates, 'icon')) {
         entry.icon = updates.icon ?? null
+      }
+      if (updates.position !== undefined) {
+        entry.position = updates.position
+      }
+      if (updates.isDefault !== undefined) {
+        entry.isDefault = updates.isDefault
       }
       await em.flush()
       return { entryId: entry.id }

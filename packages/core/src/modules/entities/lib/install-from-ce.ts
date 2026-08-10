@@ -7,6 +7,7 @@ import { getModules } from '@open-mercato/shared/lib/i18n/server'
 import { getEntityIds } from '@open-mercato/shared/lib/encryption/entityIds'
 import { ensureCustomFieldDefinitions } from './field-definitions'
 import { upsertCustomEntity, type UpsertCustomEntityResult } from './register'
+import { invalidateDefinitionsCache } from '../api/definitions.cache'
 
 type InstallScope = {
   tenantId: string | null
@@ -14,8 +15,10 @@ type InstallScope = {
 
 export type InstallEntitiesOptions = {
   tenantIds?: string[]
+  entityIds?: string[]
   includeGlobal?: boolean
   dryRun?: boolean
+  createOnly?: boolean
   force?: boolean
   logger?: (message: string) => void
 }
@@ -46,6 +49,7 @@ const FIELD_DETAIL_KEYS: Array<keyof CustomFieldDefinition> = [
   'formEditable',
   'listVisible',
   'indexed',
+  'priority',
   'editor',
   'input',
   'relatedEntityId',
@@ -58,7 +62,7 @@ function normalizeValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map((item) => normalizeValue(item))
   if (value && typeof value === 'object') {
     return Object.keys(value as Record<string, unknown>)
-      .sort()
+      .sort((a, b) => a.localeCompare(b))
       .reduce<Record<string, unknown>>((acc, key) => {
         acc[key] = normalizeValue((value as Record<string, unknown>)[key])
         return acc
@@ -105,14 +109,28 @@ function buildAggregatedConfigs(): AggregatedEntityConfig[] {
   return Array.from(map.values())
 }
 
-function resolveFields(fieldSets: CustomFieldSet[]): CustomFieldDefinition[] {
+export function resolveFields(fieldSets: CustomFieldSet[]): CustomFieldDefinition[] {
   const byKey = new Map<string, CustomFieldDefinition>()
+  const declarationOrder = new Map<string, number>()
   for (const set of fieldSets) {
     for (const field of set.fields ?? []) {
+      if (!declarationOrder.has(field.key)) declarationOrder.set(field.key, declarationOrder.size)
       byKey.set(field.key, { ...field })
     }
   }
-  return Array.from(byKey.values()).sort((a, b) => a.key.localeCompare(b.key))
+  // Declaration order is the author's intent, so it drives `priority` (and the
+  // resulting render order) unless a field states its own. Sorting alphabetically
+  // by key here would silently discard that intent (#4378).
+  const resolved = Array.from(byKey.values()).map((field) => (
+    typeof field.priority === 'number'
+      ? field
+      : { ...field, priority: declarationOrder.get(field.key) ?? 0 }
+  ))
+  return resolved.sort((a, b) => {
+    const byPriority = (a.priority ?? 0) - (b.priority ?? 0)
+    if (byPriority !== 0) return byPriority
+    return (declarationOrder.get(a.key) ?? 0) - (declarationOrder.get(b.key) ?? 0)
+  })
 }
 
 function normalizeField(field: CustomFieldDefinition) {
@@ -145,6 +163,7 @@ function buildChecksumPayload(params: {
     labelField: spec?.labelField ?? null,
     defaultEditor: spec?.defaultEditor ?? null,
     showInSidebar: spec?.showInSidebar ?? false,
+    accessRestricted: spec?.accessRestricted ?? false,
     fields: fields.map((f) => normalizeField(f)),
   }
 }
@@ -154,10 +173,17 @@ export async function installCustomEntitiesFromModules(
   cache: CacheStrategy | null | undefined,
   options: InstallEntitiesOptions = {}
 ): Promise<InstallEntitiesResult> {
-  const aggregated = buildAggregatedConfigs()
+  const requestedEntityIds = options.entityIds
+    ? new Set(options.entityIds.filter((id): id is string => typeof id === 'string' && id.length > 0))
+    : null
+  const aggregated = buildAggregatedConfigs().filter((entry) => {
+    if (!requestedEntityIds) return true
+    return requestedEntityIds.has(entry.entityId)
+  })
   const systemIds = systemEntityIds()
   const includeGlobal = options.includeGlobal !== false
   const dryRun = options.dryRun === true
+  const createOnly = options.createOnly === true
   const force = options.force === true
   const logger = options.logger
 
@@ -234,10 +260,12 @@ export async function installCustomEntitiesFromModules(
           organizationId: null,
           tenantId: scope.tenantId,
           showInSidebar: spec?.showInSidebar ?? false,
+          accessRestricted: spec?.accessRestricted ?? false,
           labelField: spec?.labelField ?? null,
           defaultEditor: spec?.defaultEditor ?? null,
           isActive: true,
           dryRun,
+          createOnly,
         })
       }
 
@@ -246,11 +274,20 @@ export async function installCustomEntitiesFromModules(
         fieldResult = await ensureCustomFieldDefinitions(
           em,
           [{ entity: entityId, fields }],
-          { organizationId: null, tenantId: scope.tenantId, dryRun }
+          { organizationId: null, tenantId: scope.tenantId, dryRun, createOnly }
         )
       }
 
       const changed = (entityResult !== 'unchanged') || fieldResult.created > 0 || fieldResult.updated > 0
+      const shouldInvalidateDefinitions = !dryRun && (changed || force)
+      if (shouldInvalidateDefinitions) {
+        await invalidateDefinitionsCache(cache ?? undefined, {
+          tenantId: scope.tenantId,
+          organizationId: null,
+          entityIds: [entityId],
+        })
+      }
+
       if (changed) {
         synchronized++
         fieldChanges += fieldResult.created + fieldResult.updated

@@ -1,7 +1,8 @@
 "use client"
 
 import type { ProductMediaItem } from './ProductMediaManager'
-import { createLocalId } from './productForm'
+import { createLocalId, type PriceKindSummary } from './productForm'
+import { isCatalogPriceAmountInputValid } from '../../lib/priceValidation'
 
 export type OptionDefinition = {
   id: string
@@ -16,12 +17,17 @@ export type VariantPriceDraft = {
   amount: string
   currencyCode?: string | null
   displayMode: 'including-tax' | 'excluding-tax'
+  /** The price row's version, for the per-price optimistic-lock header (#2055). */
+  updatedAt?: string | null
 }
 
 export type VariantFormValues = {
+  id?: string
   name: string
   sku: string
   barcode: string
+  gtinType: string | null
+  hsCode: string
   isDefault: boolean
   isActive: boolean
   optionValues: Record<string, string>
@@ -33,12 +39,15 @@ export type VariantFormValues = {
   prices: Record<string, VariantPriceDraft>
   taxRateId: string | null
   customFieldsetCode?: string | null
+  updatedAt?: string | null
 }
 
 export const VARIANT_BASE_VALUES: VariantFormValues = {
   name: '',
   sku: '',
   barcode: '',
+  gtinType: null,
+  hsCode: '',
   isDefault: false,
   isActive: true,
   optionValues: {},
@@ -95,4 +104,62 @@ function extractString(value: unknown): string {
 export function buildVariantMetadata(values: VariantFormValues): Record<string, unknown> {
   const metadata = typeof values.metadata === 'object' && values.metadata ? { ...values.metadata } : {}
   return metadata
+}
+
+export function findInvalidVariantPriceKinds(
+  priceKinds: PriceKindSummary[],
+  priceDrafts: Record<string, VariantPriceDraft> | undefined,
+): string[] {
+  const invalid: string[] = []
+  for (const kind of priceKinds) {
+    const draft = priceDrafts?.[kind.id]
+    const amount = typeof draft?.amount === 'string' ? draft.amount.trim() : ''
+    if (!amount) continue
+    if (!isCatalogPriceAmountInputValid(amount)) invalid.push(kind.id)
+  }
+  return invalid
+}
+
+export function mapPriceItemToDraft(
+  item: Record<string, unknown>,
+  kindDisplayModes: Map<string, 'including-tax' | 'excluding-tax'>,
+): VariantPriceDraft | null {
+  const kindId =
+    typeof item.price_kind_id === 'string'
+      ? item.price_kind_id
+      : typeof item.priceKindId === 'string'
+        ? item.priceKindId
+        : null
+  if (!kindId) return null
+  const unitNet =
+    typeof item.unit_price_net === 'string'
+      ? item.unit_price_net
+      : typeof item.unitPriceNet === 'string'
+        ? item.unitPriceNet
+        : null
+  const unitGross =
+    typeof item.unit_price_gross === 'string'
+      ? item.unit_price_gross
+      : typeof item.unitPriceGross === 'string'
+        ? item.unitPriceGross
+        : null
+  const kindMode = kindDisplayModes.get(kindId) ?? (unitGross ? 'including-tax' : 'excluding-tax')
+  return {
+    priceKindId: kindId,
+    priceId: typeof item.id === 'string' ? item.id : undefined,
+    amount: kindMode === 'including-tax' ? (unitGross ?? unitNet ?? '') : (unitNet ?? unitGross ?? ''),
+    currencyCode:
+      typeof item.currency_code === 'string'
+        ? item.currency_code
+        : typeof item.currencyCode === 'string'
+          ? item.currencyCode
+          : null,
+    displayMode: kindMode,
+    updatedAt:
+      typeof item.updatedAt === 'string'
+        ? item.updatedAt
+        : typeof item.updated_at === 'string'
+          ? item.updated_at
+          : null,
+  }
 }

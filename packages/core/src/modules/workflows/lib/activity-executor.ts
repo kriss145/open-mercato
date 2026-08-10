@@ -11,12 +11,80 @@
  */
 
 import { EntityManager } from '@mikro-orm/core'
+import type { EntityManager as PostgreSqlEntityManager } from '@mikro-orm/postgresql'
 import type { AwilixContainer } from 'awilix'
 import { WorkflowInstance } from '../data/entities'
-import { createQueue, Queue } from '@open-mercato/queue'
+import { createModuleQueue, Queue } from '@open-mercato/queue'
 import { getRedisUrl } from '@open-mercato/shared/lib/redis/connection'
+import {
+  safeOutboundFetch,
+  UnsafeOutboundUrlError,
+  type HostLookup,
+} from '@open-mercato/shared/lib/url-safety'
+import { parseBooleanWithDefault } from '@open-mercato/shared/lib/boolean'
+import { hasAllFeatures } from '@open-mercato/shared/security/features'
+import { callWebhookConfigSchema } from '../data/validators'
 import { WorkflowActivityJob, WORKFLOW_ACTIVITIES_QUEUE_NAME } from './activity-queue-types'
 import { logWorkflowEvent } from './event-logger'
+import { parseDuration } from './duration'
+import { getWorkflowSafeCommand } from './workflow-safe-commands'
+
+export { isPrivateUrl } from '@open-mercato/shared/lib/network'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('workflows')
+
+function isAllowPrivateWorkflowWebhookUrlsEnabled(): boolean {
+  if (parseBooleanWithDefault(process.env.OM_WORKFLOWS_ALLOW_PRIVATE_URLS, false)) {
+    if (process.env.NODE_ENV === 'production') {
+      logger.warn('OM_WORKFLOWS_ALLOW_PRIVATE_URLS is set but ignored in production. SSRF protection remains enabled.', { component: 'CALL_WEBHOOK' })
+      return false
+    }
+
+    logger.warn('OM_WORKFLOWS_ALLOW_PRIVATE_URLS is enabled. SSRF protection is bypassed for workflow webhooks; use only in development.', { component: 'CALL_WEBHOOK' })
+    return true
+  }
+
+  if (parseBooleanWithDefault(process.env.WORKFLOW_WEBHOOK_ALLOW_PRIVATE_URLS, false)) {
+    if (process.env.NODE_ENV === 'production') {
+      logger.warn('WORKFLOW_WEBHOOK_ALLOW_PRIVATE_URLS is deprecated and ignored in production. Use OM_WORKFLOWS_ALLOW_PRIVATE_URLS for development only. SSRF protection remains enabled.', { component: 'CALL_WEBHOOK' })
+      return false
+    }
+
+    logger.warn('WORKFLOW_WEBHOOK_ALLOW_PRIVATE_URLS is deprecated. Use OM_WORKFLOWS_ALLOW_PRIVATE_URLS instead. SSRF protection is bypassed.', { component: 'CALL_WEBHOOK' })
+    return true
+  }
+
+  return false
+}
+
+const DEFAULT_WORKFLOW_ENV_INTERPOLATION_ALLOWLIST = new Set(['APP_URL'])
+const WORKFLOW_ENV_INTERPOLATION_ALLOWLIST_KEY = 'OM_WORKFLOWS_ENV_INTERPOLATION_ALLOWLIST'
+
+function getWorkflowEnvInterpolationAllowlist(): Set<string> {
+  const allowlist = new Set(DEFAULT_WORKFLOW_ENV_INTERPOLATION_ALLOWLIST)
+  const configuredKeys = process.env[WORKFLOW_ENV_INTERPOLATION_ALLOWLIST_KEY]
+  if (!configuredKeys) {
+    return allowlist
+  }
+
+  for (const key of configuredKeys.split(',')) {
+    const trimmedKey = key.trim()
+    if (trimmedKey) {
+      allowlist.add(trimmedKey)
+    }
+  }
+
+  return allowlist
+}
+
+function resolveWorkflowEnvInterpolation(envKey: string): string {
+  if (!getWorkflowEnvInterpolationAllowlist().has(envKey)) {
+    return ''
+  }
+
+  return process.env[envKey] ?? ''
+}
 
 // ============================================================================
 // Types and Interfaces
@@ -29,6 +97,7 @@ export type ActivityType =
   | 'UPDATE_ENTITY'
   | 'CALL_WEBHOOK'
   | 'EXECUTE_FUNCTION'
+  | 'WAIT'
 
 export interface ActivityDefinition {
   activityId: string // Unique identifier for activity
@@ -53,8 +122,35 @@ export interface ActivityContext {
   workflowContext: Record<string, any>
   stepContext?: Record<string, any>
   stepInstanceId?: string
+  // Set when the activity runs inside a parallel branch; carried on the queue
+  // payload so async resume targets the branch rather than the instance.
+  branchInstanceId?: string | null
   transitionId?: string
   userId?: string
+}
+
+type RbacFeatureResolver = {
+  getGrantedFeatures: (
+    userId: string,
+    opts: { tenantId: string | null; organizationId: string | null }
+  ) => Promise<string[]>
+}
+
+async function resolveWorkflowUserFeatures(
+  container: AwilixContainer,
+  userId: string,
+  tenantId: string | null,
+  organizationId: string | null
+): Promise<string[]> {
+  try {
+    const rbac = container.resolve('rbacService') as RbacFeatureResolver | undefined
+    if (rbac?.getGrantedFeatures) {
+      return await rbac.getGrantedFeatures(userId, { tenantId, organizationId })
+    }
+  } catch {
+    // Fail closed below when the workflow executor cannot prove the actor's grants.
+  }
+  return []
 }
 
 export interface ActivityExecutionResult {
@@ -93,23 +189,10 @@ let activityQueue: Queue<WorkflowActivityJob> | null = null
  */
 function getActivityQueue(): Queue<WorkflowActivityJob> {
   if (!activityQueue) {
-    if (process.env.QUEUE_STRATEGY === 'async') {
-      activityQueue = createQueue<WorkflowActivityJob>(
-        WORKFLOW_ACTIVITIES_QUEUE_NAME,
-        'async',
-        {
-          connection: {
-            url: getRedisUrl('QUEUE'),
-          },
-          concurrency: parseInt(process.env.WORKFLOW_WORKER_CONCURRENCY || '5'),
-        }
-      )
-    } else {
-      activityQueue = createQueue<WorkflowActivityJob>(
-        WORKFLOW_ACTIVITIES_QUEUE_NAME,
-        'local'
-      )
-    }
+    activityQueue = createModuleQueue<WorkflowActivityJob>(
+      WORKFLOW_ACTIVITIES_QUEUE_NAME,
+      { concurrency: parseInt(process.env.WORKFLOW_WORKER_CONCURRENCY || '5') },
+    )
   }
 
   return activityQueue
@@ -128,7 +211,7 @@ export async function enqueueActivity(
   activity: ActivityDefinition,
   context: ActivityContext
 ): Promise<string> {
-  const { workflowInstance, workflowContext, stepContext, transitionId, stepInstanceId } =
+  const { workflowInstance, workflowContext, stepContext, transitionId, stepInstanceId, branchInstanceId } =
     context
 
   // Interpolate config variables NOW (before queuing)
@@ -138,6 +221,7 @@ export async function enqueueActivity(
   const job: WorkflowActivityJob = {
     workflowInstanceId: workflowInstance.id,
     stepInstanceId,
+    branchInstanceId: branchInstanceId ?? undefined,
     transitionId,
     activityId: activity.activityId,
     activityName: activity.activityName || activity.activityType,
@@ -152,9 +236,12 @@ export async function enqueueActivity(
     userId: context.userId,
   }
 
-  // Enqueue to queue
+  // Enqueue to queue (WAIT activities use delayMs for the actual delay)
   const queue = getActivityQueue()
-  const jobId = await queue.enqueue(job)
+  const enqueueOptions = activity.activityType === 'WAIT' && (interpolatedConfig.duration || interpolatedConfig.until)
+    ? { delayMs: calculateWaitDelayMs(interpolatedConfig) }
+    : undefined
+  const jobId = await queue.enqueue(job, enqueueOptions)
 
   // Log event
   await logWorkflowEvent(em, {
@@ -171,6 +258,43 @@ export async function enqueueActivity(
     tenantId: workflowInstance.tenantId,
     organizationId: workflowInstance.organizationId,
   })
+
+  return jobId
+}
+
+/**
+ * Enqueue a delayed timer job for a WAIT_FOR_TIMER step.
+ *
+ * The activity worker handles `kind: 'timer'` jobs by calling
+ * `timerHandler.fireTimer`, which resumes the paused workflow instance.
+ */
+export async function enqueueTimerJob(params: {
+  workflowInstanceId: string
+  stepInstanceId: string
+  branchInstanceId?: string | null
+  tenantId: string
+  organizationId: string
+  userId?: string
+  fireAt: string
+  delayMs: number
+}): Promise<string> {
+  const { workflowInstanceId, stepInstanceId, branchInstanceId, tenantId, organizationId, userId, fireAt, delayMs } =
+    params
+
+  const queue = getActivityQueue()
+  const jobId = await queue.enqueue(
+    {
+      kind: 'timer',
+      workflowInstanceId,
+      stepInstanceId,
+      branchInstanceId: branchInstanceId ?? undefined,
+      tenantId,
+      organizationId,
+      userId,
+      fireAt,
+    },
+    { delayMs: delayMs > 0 ? delayMs : undefined }
+  )
 
   return jobId
 }
@@ -232,6 +356,18 @@ export async function executeActivity(
       lastError = error
       retryCount = attempt + 1
 
+      // Log activity retry attempt with context
+      if (attempt < retryPolicy.maxAttempts - 1) {
+        logger.error('Activity failed; will retry', {
+          activityId: activity.activityId,
+          activityType: activity.activityType,
+          attempt: attempt + 1,
+          maxAttempts: retryPolicy.maxAttempts,
+          instanceId: context.workflowInstance.id,
+          err: error,
+        })
+      }
+
       // If not the last attempt, apply backoff and retry
       if (attempt < retryPolicy.maxAttempts - 1) {
         const backoff = calculateBackoff(
@@ -248,6 +384,13 @@ export async function executeActivity(
 
   // All retries exhausted
   const errorMessage = lastError instanceof Error ? lastError.message : String(lastError)
+  logger.error('Activity failed after all attempts', {
+    activityId: activity.activityId,
+    activityType: activity.activityType,
+    attempts: retryCount,
+    instanceId: context.workflowInstance.id,
+    err: lastError,
+  })
 
   return {
     activityId: activity.activityId,
@@ -356,6 +499,9 @@ async function executeActivityByType(
     case 'EXECUTE_FUNCTION':
       return await executeFunction(interpolatedConfig, context, container)
 
+    case 'WAIT':
+      return await executeWait(interpolatedConfig)
+
     default:
       throw new ActivityExecutionError(
         `Unknown activity type: ${activity.activityType}`,
@@ -382,11 +528,11 @@ export async function executeSendEmail(
   }
 
   // For MVP: Log the email (actual email service integration can be added later)
-  console.log(`[Workflow Activity] Send email to ${to}: ${subject}`)
+  logger.info('Send email activity invoked', { component: 'SEND_EMAIL', subject })
 
   // Check if email service is available in container
   try {
-    const emailService = container.resolve('emailService')
+    const emailService = container.resolve<{ send: (input: unknown) => Promise<unknown> | unknown }>('emailService')
     if (emailService && typeof emailService.send === 'function') {
       await emailService.send({
         to,
@@ -421,7 +567,7 @@ export async function executeEmitEvent(
   }
 
   // Get event bus from container
-  const eventBus = container.resolve('eventBus')
+  const eventBus = container.resolve<{ emitEvent: (event: string, payload: unknown, options?: unknown) => Promise<unknown> | unknown }>('eventBus')
 
   if (!eventBus || typeof eventBus.emitEvent !== 'function') {
     throw new Error('Event bus not available in container')
@@ -438,7 +584,10 @@ export async function executeEmitEvent(
     },
   }
 
-  await eventBus.emitEvent(eventName, enrichedPayload)
+  await eventBus.emitEvent(eventName, enrichedPayload, {
+    tenantId: context.workflowInstance.tenantId,
+    organizationId: context.workflowInstance.organizationId,
+  })
 
   return { emitted: true, eventName, payload: enrichedPayload }
 }
@@ -483,8 +632,28 @@ export async function executeUpdateEntity(
     throw new Error('UPDATE_ENTITY requires "commandId" field (e.g., "sales.documents.update")')
   }
 
+  const workflowSafeCommand = getWorkflowSafeCommand(commandId)
+  if (!workflowSafeCommand) {
+    throw new Error('UPDATE_ENTITY command is not allowed')
+  }
+
   if (!input || typeof input !== 'object') {
     throw new Error('UPDATE_ENTITY requires "input" object with entity data')
+  }
+
+  const actorUserId = typeof context.userId === 'string' ? context.userId.trim() : ''
+  if (!actorUserId) {
+    throw new Error('UPDATE_ENTITY requires an authenticated workflow user')
+  }
+
+  const userFeatures = await resolveWorkflowUserFeatures(
+    container,
+    actorUserId,
+    context.workflowInstance.tenantId,
+    context.workflowInstance.organizationId
+  )
+  if (!hasAllFeatures(userFeatures, workflowSafeCommand.requiredFeatures)) {
+    throw new Error('UPDATE_ENTITY command is not authorized')
   }
 
   // Resolve CommandBus from container
@@ -513,12 +682,10 @@ export async function executeUpdateEntity(
   }
 
   // Build synthetic CommandRuntimeContext for workflow execution
-  // Use nil UUID for system actions when no user context is available
-  const SYSTEM_USER_ID = '00000000-0000-0000-0000-000000000000'
   const ctx = {
     container,
     auth: {
-      sub: context.userId || SYSTEM_USER_ID,
+      sub: actorUserId,
       tenantId: context.workflowInstance.tenantId,
       orgId: context.workflowInstance.organizationId,
       isSuperAdmin: false,
@@ -567,7 +734,7 @@ async function resolveDictionaryEntryId(
     })
 
     if (!dictionary) {
-      console.warn(`[UPDATE_ENTITY] Dictionary not found: ${dictionaryKey}`)
+      logger.warn('Dictionary not found', { component: 'UPDATE_ENTITY', dictionaryKey })
       return null
     }
 
@@ -581,13 +748,13 @@ async function resolveDictionaryEntryId(
     })
 
     if (!entry) {
-      console.warn(`[UPDATE_ENTITY] Dictionary entry not found: ${dictionaryKey}/${value}`)
+      logger.warn('Dictionary entry not found', { component: 'UPDATE_ENTITY', dictionaryKey, value })
       return null
     }
 
     return entry.id
   } catch (error) {
-    console.error(`[UPDATE_ENTITY] Error resolving dictionary entry:`, error)
+    logger.error('Error resolving dictionary entry', { component: 'UPDATE_ENTITY', err: error })
     return null
   }
 }
@@ -595,27 +762,72 @@ async function resolveDictionaryEntryId(
 /**
  * CALL_WEBHOOK activity handler
  *
- * Makes HTTP request to external URL
+ * Makes HTTP request to an external URL. Applies shared SSRF guard
+ * (protocol / credentials / blocked host / private IP literal / DNS rebinding)
+ * before issuing the request and rejects any 3xx redirect rather than following.
  */
-export async function executeCallWebhook(
-  config: any,
-  context: ActivityContext
-): Promise<any> {
-  const { url, method = 'POST', headers = {}, body } = config
+export type CallWebhookDeps = {
+  lookupHost?: HostLookup
+  allowPrivate?: boolean
+  fetchImpl?: typeof fetch
+  signal?: AbortSignal
+}
 
-  if (!url) {
-    throw new Error('CALL_WEBHOOK requires "url" field')
+export async function executeCallWebhook(
+  config: unknown,
+  context: ActivityContext,
+  deps: CallWebhookDeps = {}
+): Promise<any> {
+  const parsed = callWebhookConfigSchema.safeParse(config)
+  if (!parsed.success) {
+    const issues = parsed.error.issues
+      .map((issue) => `${issue.path.join('.') || 'config'}: ${issue.message}`)
+      .join('; ')
+    throw new Error(`CALL_WEBHOOK config invalid: ${issues}`)
+  }
+  const { url, method, headers: rawHeaders, body } = parsed.data
+  const headers = rawHeaders ?? {}
+
+  const allowPrivate = deps.allowPrivate ?? isAllowPrivateWorkflowWebhookUrlsEnabled()
+
+  let response: Response
+  try {
+    response = await safeOutboundFetch(
+      url,
+      {
+        method,
+        headers: {
+          'Content-Type': 'application/json',
+          ...headers,
+        },
+        body: body !== undefined && body !== null ? JSON.stringify(body) : undefined,
+        redirect: 'manual',
+        signal: deps.signal,
+      },
+      {
+        subject: 'Workflow webhook URL',
+        allowPrivate,
+        lookupHost: deps.lookupHost,
+        fetchImpl: deps.fetchImpl,
+      },
+    )
+  } catch (error) {
+    if (error instanceof UnsafeOutboundUrlError) {
+      throw new Error(
+        `CALL_WEBHOOK rejected unsafe URL (reason=${error.reason}): ${error.message}`
+      )
+    }
+    throw error
   }
 
-  // Make HTTP request
-  const response = await fetch(url, {
-    method,
-    headers: {
-      'Content-Type': 'application/json',
-      ...headers,
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  })
+  if (response.status >= 300 && response.status < 400) {
+    const location = response.headers.get('location')
+    throw new Error(
+      `CALL_WEBHOOK refused to follow redirect ${response.status} to ${
+        location ?? '(no Location header)'
+      }`
+    )
+  }
 
   // Parse response
   let result: any
@@ -682,6 +894,47 @@ export async function executeFunction(
 }
 
 /**
+ * Calculate delay in milliseconds from a WAIT activity config.
+ * Supports either `duration` (relative, e.g. "PT5M") or `until` (absolute ISO 8601 datetime).
+ */
+function calculateWaitDelayMs(config: { duration?: string; until?: string }): number {
+  if (config.until) {
+    const targetDate = new Date(config.until)
+    if (isNaN(targetDate.getTime())) {
+      throw new Error(`WAIT activity: invalid "until" datetime: ${config.until}`)
+    }
+    const delayMs = targetDate.getTime() - Date.now()
+    return Math.max(0, delayMs)
+  }
+
+  if (config.duration) {
+    return parseDuration(config.duration)
+  }
+
+  throw new Error('WAIT activity requires "duration" (e.g., "PT5M", "1h") or "until" (ISO 8601 datetime)')
+}
+
+/**
+ * WAIT activity handler
+ *
+ * Delays workflow execution for a configured duration or until a specific datetime.
+ * - `duration`: relative delay (e.g. "PT5M", "1h", "30s")
+ * - `until`: absolute datetime (e.g. "2026-04-15T10:00:00Z")
+ * - Sync mode: blocks via sleep (suitable for short delays)
+ * - Async mode: delay is handled by the queue's delayMs option;
+ *   this handler returns immediately when called from the worker
+ */
+async function executeWait(config: any): Promise<any> {
+  const durationMs = calculateWaitDelayMs(config)
+
+  // In sync mode, actually sleep for the duration
+  // In async mode (called from worker), the delay already happened via queue scheduling
+  await sleep(durationMs)
+
+  return { waited: true, durationMs }
+}
+
+/**
  * CALL_API activity handler
  *
  * Makes authenticated HTTP request to internal Open Mercato APIs
@@ -695,9 +948,10 @@ export async function executeCallApi(
   em: EntityManager,
   config: any,
   context: ActivityContext,
-  container: AwilixContainer
+  container: AwilixContainer,
+  signal?: AbortSignal
 ): Promise<any> {
-  // 1. Interpolate variables in config (including {{workflow.*}}, {{context.*}}, {{env.*}}, {{now}})
+  // 1. Interpolate variables in config (including {{workflow.*}}, {{context.*}}, allowlisted {{env.*}}, {{now}})
   const interpolatedConfig = interpolateVariables(config, context.workflowContext, context.workflowInstance)
 
   const {
@@ -719,26 +973,60 @@ export async function executeCallApi(
   // 3. Import the one-time API key helper
   const { withOnetimeApiKey } = await import('../../api_keys/services/apiKeyService')
 
-  // 4. Get EntityManager from container (for correct type)
-  const apiKeyEm = container.resolve('em')
+  // 4. Create the one-time API key on an EntityManager that is fully detached
+  //    from the surrounding request/transaction context.
+  //
+  //    CALL_API runs inside `workflowExecutor.executeWorkflow()`, which wraps
+  //    the whole execution in `em.transactional(...)`. The request EM is forked
+  //    with `useContext: true`, so while that transaction is open, EVERY
+  //    operation on the container's `em` — including this API key's
+  //    persist/flush — is transparently redirected to the uncommitted
+  //    transaction fork (MikroORM `getContext()` → `TransactionContext`). The
+  //    key would therefore stay invisible until the transaction commits, but
+  //    the commit cannot happen until this activity returns. The outbound
+  //    self-authenticated `fetch` below opens a SEPARATE DB connection that
+  //    cannot see the uncommitted row, so the internal API responds `401` and
+  //    the activity fails (issue #4202).
+  //
+  //    Forking with `useContext: false` (matching the query_index/webhooks
+  //    isolated-EM convention) gives the key its own pooled connection with
+  //    autocommit, so it is committed and visible to the internal request
+  //    immediately.
+  const apiKeyEm = container
+    .resolve<PostgreSqlEntityManager>('em')
+    .fork({ clear: true, freshEventManager: true, useContext: false }) as PostgreSqlEntityManager
 
-  // 5. Look up an admin role for the tenant to assign to the one-time key
-  // CRITICAL: rolesJson must contain role IDs (UUIDs), not role names!
-  const { Role } = await import('../../auth/data/entities')
-  const adminRole = await apiKeyEm.findOne(Role, {
-    tenantId: context.workflowInstance.tenantId,
-    name: { $in: ['superadmin', 'admin', 'administrator'] }  // Try common admin role names
-  })
+  // 5. Resolve the roles that the one-time API key will inherit.
+  //
+  // SECURITY: The key must never exceed the permissions of the human who
+  //   triggered (or authored) this workflow. Previously this code looked up
+  //   a role named "admin"/"superadmin" for the tenant and assigned it to
+  //   the key — which allowed any non-admin workflow author with
+  //   `workflows.definitions.edit` + `workflows.instances.create` to issue
+  //   arbitrary administrative API calls via a CALL_API activity. See the
+  //   SECURITY.md changelog entry for this fix.
+  //
+  //   The resolution strategy is:
+  //     1. Use the workflow instance's `metadata.initiatedBy` user (whoever
+  //        manually started the instance), when available. Only this user's
+  //        current active roles are used — we never fall back to the author
+  //        when the initiator is known, because that would escalate the
+  //        initiator's privileges.
+  //     2. Fall back to the workflow definition's `createdBy` (author) only
+  //        when the instance was started by an event trigger with no user.
+  //     3. If no traceable principal exists, the activity refuses to run —
+  //        there is no "system" fallback that bypasses RBAC.
+  const resolvedRoleIds = await resolveCallApiRoleIds(apiKeyEm, context.workflowInstance)
 
-  if (!adminRole) {
+  if (resolvedRoleIds.length === 0) {
     throw new Error(
-      `[CALL_API] No admin role found for tenant ${context.workflowInstance.tenantId}. ` +
-      `Cannot create one-time API key without role assignment. ` +
-      `Ensure 'mercato init' has been run to create default roles.`
+      `[CALL_API] Refusing to execute CALL_API for workflow instance ${context.workflowInstance.id}: ` +
+      `no traceable user roles could be resolved from the workflow instance or definition. ` +
+      `CALL_API activities must run under the identity of the user who triggered them.`
     )
   }
 
-  // 6. Execute request with one-time API key (using role ID, not name)
+  // 6. Execute request with one-time API key scoped to the resolved user's roles
   return await withOnetimeApiKey(
     apiKeyEm,
     {
@@ -746,7 +1034,7 @@ export async function executeCallApi(
       description: `One-time key for workflow ${context.workflowInstance.workflowId} instance ${context.workflowInstance.id}`,
       tenantId: context.workflowInstance.tenantId,
       organizationId: context.workflowInstance.organizationId,
-      roles: [adminRole.id], // ✅ FIX: Use role ID (UUID), not role name
+      roles: resolvedRoleIds,
       expiresAt: null,
     },
     async (apiKeySecret) => {
@@ -765,6 +1053,7 @@ export async function executeCallApi(
         method,
         headers: requestHeaders,
         body: body ? JSON.stringify(body) : undefined,
+        signal,
       })
 
       // Parse response body (JSON-safe)
@@ -812,6 +1101,85 @@ export async function executeCallApi(
 // ============================================================================
 // CALL_API Helper Functions
 // ============================================================================
+
+export type CallApiInstanceLike = {
+  id: string
+  tenantId: string
+  organizationId: string
+  definitionId: string
+  metadata?: { initiatedBy?: string | null } | null
+}
+
+async function resolveActiveRoleIdsForUser(
+  em: any,
+  userId: string,
+  scope: { tenantId: string; organizationId: string },
+): Promise<string[]> {
+  const { findOneWithDecryption, findWithDecryption } = await import('@open-mercato/shared/lib/encryption/find')
+  const { User, UserRole, Role } = await import('../../auth/data/entities')
+
+  const user = await findOneWithDecryption(em, User, {
+    id: userId,
+    tenantId: scope.tenantId,
+    deletedAt: null,
+  }, {}, scope)
+  if (!user) return []
+
+  const userRoles = await findWithDecryption(
+    em,
+    UserRole,
+    { user: user.id, deletedAt: null },
+    { populate: ['role'] },
+    scope,
+  )
+  const roleIds = userRoles
+    .map((ur: any) => (typeof ur.role === 'string' ? ur.role : ur.role?.id))
+    .filter((id: unknown): id is string => typeof id === 'string' && id.length > 0)
+
+  if (roleIds.length === 0) return []
+
+  const scopedRoles = await findWithDecryption(em, Role, {
+    id: { $in: roleIds },
+    tenantId: scope.tenantId,
+    deletedAt: null,
+  }, {}, scope)
+  return scopedRoles.map((r: any) => r.id as string)
+}
+
+export async function resolveCallApiRoleIds(
+  em: any,
+  instance: CallApiInstanceLike
+): Promise<string[]> {
+  if (!instance.definitionId) return []
+
+  const { findOneWithDecryption } = await import('@open-mercato/shared/lib/encryption/find')
+  const { WorkflowDefinition } = await import('../data/entities')
+
+  const scope = { tenantId: instance.tenantId, organizationId: instance.organizationId }
+
+  // 1. Prefer the triggering user (whoever manually started this instance).
+  //    WorkflowInstance.metadata.initiatedBy is the canonical record of that
+  //    principal for user-started instances; use their current role set so
+  //    CALL_API never exceeds the initiator's permissions. Refuse if the
+  //    initiator has no active scoped roles — do not fall back to the
+  //    definition author, which would escalate the initiator's privileges.
+  const initiatorUserId = instance.metadata?.initiatedBy ?? null
+  if (initiatorUserId) {
+    return resolveActiveRoleIdsForUser(em, initiatorUserId, scope)
+  }
+
+  // 2. Event-triggered instance with no human initiator: fall back to the
+  //    definition author. Soft-deleted definitions must not mint keys.
+  const definition = await findOneWithDecryption(em, WorkflowDefinition, {
+    id: instance.definitionId,
+    tenantId: instance.tenantId,
+    deletedAt: null,
+  }, {}, scope)
+  const authorUserId = definition?.createdBy
+  if (!authorUserId) return []
+
+  return resolveActiveRoleIdsForUser(em, authorUserId, scope)
+}
 
 /**
  * Build full API URL from endpoint
@@ -891,7 +1259,7 @@ function classifyAndThrowError(status: number, body: any, url: string): never {
  * - {{workflow.tenantId}} - tenant ID
  * - {{workflow.organizationId}} - organization ID
  * - {{workflow.currentStepId}} - current step ID
- * - {{env.VAR_NAME}} - environment variables
+ * - {{env.VAR_NAME}} - server-allowlisted environment variables
  * - {{now}} - current ISO timestamp
  */
 function interpolateVariables(
@@ -931,7 +1299,7 @@ function interpolateVariables(
       // Handle {{env.*}} variables
       if (trimmedPath.startsWith('env.')) {
         const envKey = trimmedPath.substring('env.'.length)
-        return process.env[envKey] ?? config
+        return resolveWorkflowEnvInterpolation(envKey)
       }
 
       // Handle {{now}} - current timestamp
@@ -976,8 +1344,7 @@ function interpolateVariables(
       // Handle {{env.*}} variables
       if (trimmedPath.startsWith('env.')) {
         const envKey = trimmedPath.substring('env.'.length)
-        const envValue = process.env[envKey]
-        return envValue !== undefined ? envValue : match
+        return resolveWorkflowEnvInterpolation(envKey)
       }
 
       // Handle {{now}} - current timestamp

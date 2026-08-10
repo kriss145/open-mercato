@@ -60,6 +60,7 @@ const CATEGORY_METADATA: Record<
 }
 
 const SYSTEM_STATUS_DOC_BASE = 'https://docs.openmercato.com/docs/framework/operations/system-status'
+const DEFAULT_SQLITE_CACHE_PATH = './.mercato/cache/cache.db'
 
 function maskConnectionCredentials(raw: string | undefined): string | undefined {
   if (typeof raw !== 'string') return raw
@@ -246,7 +247,7 @@ export const SYSTEM_STATUS_VARIABLES: SystemStatusVariableDefinition[] = [
     labelKey: 'configs.systemStatus.variables.cacheSqlitePath.label',
     descriptionKey: 'configs.systemStatus.variables.cacheSqlitePath.description',
     docUrl: `${SYSTEM_STATUS_DOC_BASE}#cache_sqlite_path`,
-    defaultValue: './data/cache.db',
+    defaultValue: DEFAULT_SQLITE_CACHE_PATH,
   },
   {
     key: 'SCHEDULE_AUTO_REINDEX',
@@ -273,7 +274,43 @@ export const SYSTEM_STATUS_VARIABLES: SystemStatusVariableDefinition[] = [
     labelKey: 'configs.systemStatus.variables.forceQueryIndexOnPartialIndexes.label',
     descriptionKey: 'configs.systemStatus.variables.forceQueryIndexOnPartialIndexes.description',
     docUrl: `${SYSTEM_STATUS_DOC_BASE}#force_query_index_on_partial_indexes`,
+    defaultValue: 'false',
+  },
+  {
+    key: 'QUERY_INDEX_WARMUP_ENABLED',
+    category: 'query_index',
+    kind: 'boolean',
+    labelKey: 'configs.systemStatus.variables.queryIndexWarmupEnabled.label',
+    descriptionKey: 'configs.systemStatus.variables.queryIndexWarmupEnabled.description',
+    docUrl: `${SYSTEM_STATUS_DOC_BASE}#query_index_warmup_enabled`,
     defaultValue: 'true',
+  },
+  {
+    key: 'QUERY_INDEX_WARMUP_THROTTLE_MS',
+    category: 'query_index',
+    kind: 'string',
+    labelKey: 'configs.systemStatus.variables.queryIndexWarmupThrottleMs.label',
+    descriptionKey: 'configs.systemStatus.variables.queryIndexWarmupThrottleMs.description',
+    docUrl: `${SYSTEM_STATUS_DOC_BASE}#query_index_warmup_throttle_ms`,
+    defaultValue: String(5 * 60 * 1000),
+  },
+  {
+    key: 'QUERY_INDEX_WARMUP_CONCURRENCY',
+    category: 'query_index',
+    kind: 'string',
+    labelKey: 'configs.systemStatus.variables.queryIndexWarmupConcurrency.label',
+    descriptionKey: 'configs.systemStatus.variables.queryIndexWarmupConcurrency.description',
+    docUrl: `${SYSTEM_STATUS_DOC_BASE}#query_index_warmup_concurrency`,
+    defaultValue: '10',
+  },
+  {
+    key: 'QUERY_INDEX_WARMUP_STAGGER_MS',
+    category: 'query_index',
+    kind: 'string',
+    labelKey: 'configs.systemStatus.variables.queryIndexWarmupStaggerMs.label',
+    descriptionKey: 'configs.systemStatus.variables.queryIndexWarmupStaggerMs.description',
+    docUrl: `${SYSTEM_STATUS_DOC_BASE}#query_index_warmup_stagger_ms`,
+    defaultValue: '0',
   },
   {
     key: 'ENTITIES_BACKCOMPAT_EAV_FOR_CUSTOM',

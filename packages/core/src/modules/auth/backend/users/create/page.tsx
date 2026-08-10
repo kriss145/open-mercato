@@ -10,11 +10,18 @@ import { OrganizationSelect } from '@open-mercato/core/modules/directory/compone
 import { TenantSelect } from '@open-mercato/core/modules/directory/components/TenantSelect'
 import { fetchRoleOptions } from '@open-mercato/core/modules/auth/backend/users/roleOptions'
 import { Spinner } from '@open-mercato/ui/primitives/spinner'
+import { RadioGroup } from '@open-mercato/ui/primitives/radio'
+import { RadioField } from '@open-mercato/ui/primitives/radio-field'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
 import { formatPasswordRequirements, getPasswordPolicy } from '@open-mercato/shared/lib/auth/passwordPolicy'
+import { normalizeDisplayNameInput } from '@open-mercato/core/modules/auth/lib/displayName'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('auth').child({ component: 'users-create-page' })
 
 type CreateUserFormValues = {
   email: string
+  name: string
   password: string
   tenantId: string | null
   organizationId: string | null
@@ -85,6 +92,8 @@ export default function CreateUserPage() {
   const [selectedWidgets, setSelectedWidgets] = React.useState<string[]>([])
   const [selectedTenantId, setSelectedTenantId] = React.useState<string | null>(null)
   const [actorIsSuperAdmin, setActorIsSuperAdmin] = React.useState(false)
+  const [actorResolved, setActorResolved] = React.useState(false)
+  const [sendInviteEmail, setSendInviteEmail] = React.useState(false)
   const passwordPolicy = React.useMemo(() => getPasswordPolicy(), [])
   const passwordRequirements = React.useMemo(
     () => formatPasswordRequirements(passwordPolicy, t),
@@ -103,7 +112,12 @@ export default function CreateUserPage() {
       setWidgetError(null)
       try {
         const { ok, result } = await apiCall<WidgetCatalogResponse>('/api/dashboards/widgets/catalog')
-        if (!ok) throw new Error('request_failed')
+        if (!ok) {
+          throw new Error(t(
+            'auth.users.widgets.errors.load',
+            'Unable to load dashboard widgets. You can configure them later from the user page.',
+          ))
+        }
         if (!cancelled) {
           const rawItems: unknown[] = Array.isArray(result?.items) ? result?.items ?? [] : []
           const normalized = rawItems
@@ -123,7 +137,7 @@ export default function CreateUserPage() {
           setWidgetCatalog(normalized)
         }
       } catch (err) {
-        console.error('Failed to load dashboard widget catalog', err)
+        logger.error('Failed to load dashboard widget catalog', { err })
         if (!cancelled) {
           setWidgetError(t(
             'auth.users.widgets.errors.load',
@@ -145,7 +159,9 @@ export default function CreateUserPage() {
         const { ok, result } = await apiCall<UserListResponse>('/api/auth/users?page=1&pageSize=1')
         if (!cancelled && ok) setActorIsSuperAdmin(Boolean(result?.isSuperAdmin))
       } catch (err) {
-        console.error('Failed to resolve actor super admin flag', err)
+        logger.error('Failed to resolve actor super admin flag', { err })
+      } finally {
+        if (!cancelled) setActorResolved(true)
       }
     }
     loadActor()
@@ -156,24 +172,45 @@ export default function CreateUserPage() {
     setSelectedWidgets((prev) => (prev.includes(id) ? prev.filter((value) => value !== id) : [...prev, id]))
   }, [])
 
+  // Block role loading until we know whether the actor is a super admin. Without this guard the
+  // initial (non-super-admin) branch fires before the flag resolves and the server returns roles
+  // from other tenants because the real caller is a super admin without tenantId scoping.
   const loadRoleOptions = React.useCallback(async (query?: string): Promise<CrudFieldOption[]> => {
+    if (!actorResolved) return []
     if (actorIsSuperAdmin) {
       if (!selectedTenantId) return []
-      return fetchRoleOptions(query, { tenantId: selectedTenantId })
+      return fetchRoleOptions(query, { tenantId: selectedTenantId, includeSuperAdmin: true })
     }
     return fetchRoleOptions(query)
-  }, [actorIsSuperAdmin, selectedTenantId])
+  }, [actorIsSuperAdmin, actorResolved, selectedTenantId])
 
   const fields: CrudField[] = React.useMemo(() => {
     const items: CrudField[] = [
       { id: 'email', label: t('auth.users.form.field.email', 'Email'), type: 'text', required: true },
+      { id: 'name', label: t('auth.users.form.field.name', 'Display name'), type: 'text' },
       {
+        id: 'sendInviteEmail',
+        label: t('auth.users.form.field.sendInviteEmail', 'Send password setup link via email'),
+        type: 'custom',
+        component: () => (
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              className="size-4"
+              checked={sendInviteEmail}
+              onChange={(e) => setSendInviteEmail(e.target.checked)}
+            />
+            {t('auth.users.form.field.sendInviteEmailHint', 'Invite user to set their own password via a secure email link')}
+          </label>
+        ),
+      },
+      ...(!sendInviteEmail ? [{
         id: 'password',
         label: t('auth.users.form.field.password', 'Password'),
-        type: 'text',
+        type: 'password' as const,
         required: true,
         description: passwordDescription,
-      },
+      }] : []),
     ]
     if (actorIsSuperAdmin) {
       items.push({
@@ -206,6 +243,7 @@ export default function CreateUserPage() {
       id: 'organizationId',
       label: t('auth.users.form.field.organization', 'Organization'),
       type: 'custom',
+      required: true,
       component: ({ id, value, setValue }) => {
         const normalizedValue = typeof value === 'string' ? value : null
         return (
@@ -220,13 +258,18 @@ export default function CreateUserPage() {
     })
     items.push({ id: 'roles', label: t('auth.users.form.field.roles', 'Roles'), type: 'tags', loadOptions: loadRoleOptions })
     return items
-  }, [actorIsSuperAdmin, loadRoleOptions, passwordDescription, selectedTenantId, t])
+  }, [actorIsSuperAdmin, loadRoleOptions, passwordDescription, selectedTenantId, sendInviteEmail, t])
 
   const detailFieldIds = React.useMemo(() => {
-    const base: string[] = ['email', 'password', 'organizationId', 'roles']
-    if (actorIsSuperAdmin) base.splice(2, 0, 'tenantId')
+    const base: string[] = sendInviteEmail
+      ? ['email', 'name', 'sendInviteEmail', 'organizationId', 'roles']
+      : ['email', 'name', 'sendInviteEmail', 'password', 'organizationId', 'roles']
+    if (actorIsSuperAdmin) {
+      const orgIdx = base.indexOf('organizationId')
+      base.splice(orgIdx, 0, 'tenantId')
+    }
     return base
-  }, [actorIsSuperAdmin])
+  }, [actorIsSuperAdmin, sendInviteEmail])
 
   const groups: CrudFormGroup[] = React.useMemo(() => [
     { id: 'details', title: t('auth.users.form.group.details', 'Details'), column: 1, fields: detailFieldIds },
@@ -262,6 +305,7 @@ export default function CreateUserPage() {
   const initialValues = React.useMemo<Partial<CreateUserFormValues>>(
     () => ({
       email: '',
+      name: '',
       password: '',
       tenantId: null,
       organizationId: null,
@@ -282,22 +326,36 @@ export default function CreateUserPage() {
           initialValues={initialValues}
           submitLabel={t('auth.users.form.action.create', 'Create')}
           cancelHref="/backend/users"
-          successRedirect={`/backend/users?flash=${encodeURIComponent(t('auth.users.flash.created', 'User created'))}&type=success`}
+          successRedirect={`/backend/users?flash=${encodeURIComponent(
+            sendInviteEmail
+              ? t('auth.users.flash.createdWithInvite', 'User created and invitation sent')
+              : t('auth.users.flash.created', 'User created')
+          )}&type=success`}
           onSubmit={async (values) => {
             const customFields = collectCustomFieldValues(values)
             const payload: Record<string, unknown> = {
               email: values.email,
-              password: values.password,
+              name: normalizeDisplayNameInput(values.name),
               organizationId: values.organizationId ? values.organizationId : null,
               roles: Array.isArray(values.roles) ? values.roles : [],
               ...(Object.keys(customFields).length ? { customFields } : {}),
+            }
+            if (sendInviteEmail) {
+              payload.sendInviteEmail = true
+            } else {
+              payload.password = values.password
             }
             if (actorIsSuperAdmin) {
               const rawTenant = typeof values.tenantId === 'string' ? values.tenantId.trim() : null
               payload.tenantId = rawTenant && rawTenant.length ? rawTenant : null
             }
-            const { result: created } = await createCrud<{ id?: string }>('auth/users', payload)
+            const { result: created } = await createCrud<{ id?: string; _warning?: string }>('auth/users', payload)
             const newUserId = typeof created?.id === 'string' ? created.id : null
+            if (created?._warning === 'invite_email_failed') {
+              const msg = t('auth.users.flash.createdEmailFailed', 'User created but invitation email could not be sent. You can resend it from the user page.')
+              window.location.href = `/backend/users?flash=${encodeURIComponent(msg)}&type=warning`
+              return
+            }
 
             if (widgetMode === 'override' && newUserId) {
               await updateCrud('dashboards/users/widgets', {
@@ -352,26 +410,20 @@ function DashboardWidgetSelector({
       )}
       {!error && (
         <>
-          <div className="flex items-center gap-3 rounded-md border bg-muted/30 px-3 py-2">
-            <label className="flex items-center gap-2 text-sm">
-              <input
-                type="radio"
-                value="inherit"
-                checked={mode === 'inherit'}
-                onChange={() => onModeChange('inherit')}
-              />
-              {t('auth.users.widgets.mode.inherit', 'Inherit from roles')}
-            </label>
-            <label className="flex items-center gap-2 text-sm">
-              <input
-                type="radio"
-                value="override"
-                checked={mode === 'override'}
-                onChange={() => onModeChange('override')}
-              />
-              {t('auth.users.widgets.mode.override', 'Override for this user')}
-            </label>
-          </div>
+          <RadioGroup
+            className="flex flex-row items-center gap-3 rounded-md border bg-muted/30 px-3 py-2"
+            value={mode}
+            onValueChange={(next) => onModeChange(next as 'inherit' | 'override')}
+          >
+            <RadioField
+              value="inherit"
+              label={t('auth.users.widgets.mode.inherit', 'Inherit from roles')}
+            />
+            <RadioField
+              value="override"
+              label={t('auth.users.widgets.mode.override', 'Override for this user')}
+            />
+          </RadioGroup>
           {mode === 'override' && (
             <div className="space-y-2">
               {catalog.map((widget) => (
@@ -391,7 +443,7 @@ function DashboardWidgetSelector({
             </div>
           )}
           {mode === 'inherit' && (
-            <div className="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+            <div className="rounded-md border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
               {t('auth.users.widgets.mode.hint', 'New users inherit widgets from their assigned roles. Override to pick a custom set.')}
             </div>
           )}

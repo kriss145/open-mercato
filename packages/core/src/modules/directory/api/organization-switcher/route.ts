@@ -16,6 +16,9 @@ import { Tenant } from '@open-mercato/core/modules/directory/data/entities'
 import type { EntityManager } from '@mikro-orm/postgresql'
 import type { RbacService } from '@open-mercato/core/modules/auth/services/rbacService'
 import type { FilterQuery } from '@mikro-orm/core'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('directory').child({ component: 'organization-switcher' })
 
 type OrganizationMenuNode = {
   id: string
@@ -171,7 +174,7 @@ export async function GET(req: NextRequest) {
         tenantId,
         orgId: scopedOrgId,
       },
-      selectedId: requestedAll ? null : rawSelected,
+      selectedId: rawSelected,
       tenantId,
     })
     const accessible = scope.allowedIds
@@ -195,10 +198,12 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ items: [], selectedId: null, canManage: false })
     }
 
+    const canViewAllOrganizations = accessible === null
     const response = {
       items: menuData.nodes,
       selectedId,
       canManage: !!hasManageFeature,
+      canViewAllOrganizations,
       tenantId,
       tenants: tenantRecords,
       isSuperAdmin: effectiveIsSuperAdmin,
@@ -218,7 +223,7 @@ export async function GET(req: NextRequest) {
 
     return NextResponse.json(response)
   } catch (err) {
-    console.error('Failed to build organization switcher payload', err)
+    logger.error('Failed to build organization switcher payload', { err })
     return NextResponse.json({ items: [], selectedId: null, canManage: false, tenantId: null, tenants: [], isSuperAdmin: false }, { status: 500 })
   }
 }

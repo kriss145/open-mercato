@@ -88,6 +88,9 @@ describe('catalog.products.update', () => {
       flush: jest.fn().mockImplementation(async () => {
         events.push('flush')
       }),
+      begin: jest.fn().mockResolvedValue(undefined),
+      commit: jest.fn().mockResolvedValue(undefined),
+      rollback: jest.fn().mockResolvedValue(undefined),
       fork: jest.fn(),
     }
     em.fork.mockReturnValue(em)
@@ -195,6 +198,9 @@ describe('catalog.products.update', () => {
       remove: jest.fn(),
       persist: jest.fn(),
       flush: jest.fn(),
+      begin: jest.fn().mockResolvedValue(undefined),
+      commit: jest.fn().mockResolvedValue(undefined),
+      rollback: jest.fn().mockResolvedValue(undefined),
       fork: jest.fn(),
     }
     em.fork.mockReturnValue(em)
@@ -239,5 +245,118 @@ describe('catalog.products.update', () => {
       status: 400,
       body: { error: 'uom.default_unit_missing' },
     })
+  })
+
+  it('preserves categories and tags when a partial update omits them', async () => {
+    let updateCommand: unknown
+    jest.isolateModules(() => {
+      require('../products')
+      updateCommand = registerCommand.mock.calls.find(([cmd]) => cmd.id === 'catalog.products.update')?.[0]
+    })
+    expect(updateCommand).toBeDefined()
+
+    const categoryAssignment = {
+      id: 'cat-assignment-1',
+      category: { id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' },
+    }
+    const tagAssignment = {
+      id: 'tag-assignment-1',
+      tag: { id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' },
+    }
+    const record = {
+      id: '11111111-1111-4111-8111-111111111113',
+      organizationId: '22222222-2222-4222-8222-222222222222',
+      tenantId: '33333333-3333-4333-8333-333333333333',
+      title: 'Old title',
+      subtitle: null,
+      description: null,
+      sku: null,
+      handle: null,
+      taxRateId: null,
+      taxRate: null,
+      productType: 'simple',
+      statusEntryId: null,
+      primaryCurrencyCode: null,
+      defaultUnit: null,
+      defaultSalesUnit: null,
+      defaultSalesUnitQuantity: null,
+      uomRoundingScale: null,
+      uomRoundingMode: null,
+      unitPriceEnabled: false,
+      unitPriceReferenceUnit: null,
+      unitPriceBaseQuantity: null,
+      defaultMediaId: null,
+      defaultMediaUrl: null,
+      weightValue: null,
+      weightUnit: null,
+      dimensions: null,
+      metadata: null,
+      customFieldsetCode: null,
+      optionSchemaTemplate: null,
+      isConfigurable: false,
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    }
+
+    const em = {
+      findOne: jest.fn().mockResolvedValue(record),
+      find: jest.fn().mockImplementation(async (entity: unknown) => {
+        const name = typeof entity === 'function' ? (entity as { name: string }).name : String(entity)
+        if (name === CatalogProductCategoryAssignment.name) return [categoryAssignment]
+        return []
+      }),
+      count: jest.fn().mockResolvedValue(0),
+      create: jest.fn().mockImplementation((_entity: unknown, payload: unknown) => payload),
+      remove: jest.fn(),
+      persist: jest.fn(),
+      flush: jest.fn(),
+      begin: jest.fn().mockResolvedValue(undefined),
+      commit: jest.fn().mockResolvedValue(undefined),
+      rollback: jest.fn().mockResolvedValue(undefined),
+      fork: jest.fn(),
+    }
+    em.fork.mockReturnValue(em)
+
+    const dataEngine = {
+      markOrmEntityChange: jest.fn(),
+    }
+
+    const container = {
+      resolve: jest.fn((token: string) => {
+        if (token === 'em') return em
+        if (token === 'dataEngine') return dataEngine
+        return undefined
+      }),
+    }
+
+    const ctx = {
+      container,
+      auth: {
+        sub: 'user-1',
+        tenantId: '33333333-3333-4333-8333-333333333333',
+        orgId: '22222222-2222-4222-8222-222222222222',
+      },
+      organizationScope: null,
+      selectedOrganizationId: null,
+      organizationIds: null,
+    }
+
+    findOneWithDecryption.mockResolvedValue(record)
+    findWithDecryption.mockResolvedValue([tagAssignment])
+
+    await (updateCommand as { execute: (payload: Record<string, unknown>, ctx: unknown) => Promise<void> }).execute(
+      {
+        id: '11111111-1111-4111-8111-111111111113',
+        organizationId: '22222222-2222-4222-8222-222222222222',
+        tenantId: '33333333-3333-4333-8333-333333333333',
+        title: 'New title',
+        defaultMediaId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+      },
+      ctx,
+    )
+
+    expect(em.remove).not.toHaveBeenCalledWith(categoryAssignment)
+    expect(em.remove).not.toHaveBeenCalledWith(tagAssignment)
   })
 })

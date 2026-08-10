@@ -2,16 +2,14 @@
 
 import * as React from 'react'
 import Link from 'next/link'
-import { Loader2, Linkedin, Pencil, Twitter, X } from 'lucide-react'
-import ReactMarkdown from 'react-markdown'
+import { AtSign, Briefcase, Loader2, Pencil, X } from 'lucide-react'
 import { Button } from '@open-mercato/ui/primitives/button'
-import type { PluggableList } from 'unified'
+import { MarkdownContent } from '@open-mercato/ui/backend/markdown'
 import { flash } from '@open-mercato/ui/backend/FlashMessages'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
 import { cn } from '@open-mercato/shared/lib/utils'
 import { useQueryClient } from '@tanstack/react-query'
 import { useOrganizationScopeVersion } from '@open-mercato/shared/lib/frontend/useOrganizationScope'
-import remarkGfm from 'remark-gfm'
 import { useEmailDuplicateCheck } from '../../backend/hooks/useEmailDuplicateCheck'
 import { lookupPhoneDuplicate } from '../../utils/phoneDuplicates'
 import {
@@ -132,7 +130,7 @@ export function InlineTextEditor(props: InlineFieldProps) {
                 {t('customers.people.detail.inline.emailDuplicate', undefined, { name: emailDuplicate.displayName })}{' '}
                 <Link
                   className="font-medium text-primary underline underline-offset-2"
-                  href={`/backend/customers/people/${emailDuplicate.id}`}
+                  href={`/backend/customers/people-v2/${emailDuplicate.id}`}
                 >
                   {t('customers.people.detail.inline.emailDuplicateLink')}
                 </Link>
@@ -172,9 +170,7 @@ export function InlineTextEditor(props: InlineFieldProps) {
 export const InlineMultilineEditor = UiInlineMultilineEditor
 export const InlineSelectEditor = UiInlineSelectEditor
 
-const MARKDOWN_PREVIEW_PLUGINS: PluggableList = [remarkGfm]
-
-function createSocialRenderDisplay(IconComponent: typeof Linkedin): NonNullable<InlineFieldProps['renderDisplay']> {
+function createSocialRenderDisplay(IconComponent: typeof Briefcase): NonNullable<InlineFieldProps['renderDisplay']> {
   // eslint-disable-next-line react/display-name
   return ({ value, emptyLabel }) => {
     const raw = typeof value === 'string' ? value.trim() : ''
@@ -196,8 +192,8 @@ function createSocialRenderDisplay(IconComponent: typeof Linkedin): NonNullable<
   }
 }
 
-export const renderLinkedInDisplay = createSocialRenderDisplay(Linkedin)
-export const renderTwitterDisplay = createSocialRenderDisplay(Twitter)
+export const renderLinkedInDisplay = createSocialRenderDisplay(Briefcase)
+export const renderTwitterDisplay = createSocialRenderDisplay(AtSign)
 
 export const renderMultilineMarkdownDisplay: InlineMultilineDisplayRenderer = ({ value, emptyLabel }) => {
   const raw = typeof value === 'string' ? value : ''
@@ -206,12 +202,11 @@ export const renderMultilineMarkdownDisplay: InlineMultilineDisplayRenderer = ({
     return <span className="text-muted-foreground">{emptyLabel}</span>
   }
   return (
-    <ReactMarkdown
-      remarkPlugins={MARKDOWN_PREVIEW_PLUGINS}
+    <MarkdownContent
+      format="markdown"
+      body={raw}
       className="text-sm text-foreground [&>*]:mb-2 [&>*:last-child]:mb-0 [&_ul]:ml-4 [&_ul]:list-disc [&_ol]:ml-4 [&_ol]:list-decimal [&_code]:rounded [&_code]:bg-muted [&_code]:px-1 [&_code]:py-0.5 [&_pre]:rounded-md [&_pre]:bg-muted [&_pre]:p-3 [&_pre]:text-xs"
-    >
-      {raw}
-    </ReactMarkdown>
+    />
   )
 }
 
@@ -293,7 +288,7 @@ export function InlineDictionaryEditor({
             selectClassName={selectClassName}
           />
           {dictionaryQuery.isError ? (
-            <p className="text-xs text-red-600">
+            <p className="text-xs text-status-error-text">
               {dictionaryQuery.error instanceof Error
                 ? dictionaryQuery.error.message
                 : translate('customers.people.form.dictionary.errorLoad', 'Failed to load options')}
@@ -564,8 +559,8 @@ export function InlineNextInteractionEditor({
               <input
                 type="datetime-local"
                 className={cn(
-                  'w-full rounded-md border px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring',
-                  dateError ? 'border-destructive focus:border-destructive focus:ring-destructive/40' : null,
+                  'w-full rounded-md border px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                  dateError ? 'border-destructive aria-invalid:border-destructive aria-invalid:ring-destructive' : null,
                 )}
                 value={draftDate}
                 aria-invalid={dateError ? 'true' : undefined}
@@ -585,8 +580,8 @@ export function InlineNextInteractionEditor({
               <input
                 placeholder={t('customers.people.detail.inline.nextInteractionName')}
                 className={cn(
-                  'w-full rounded-md border px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring',
-                  nameError ? 'border-destructive focus:border-destructive focus:ring-destructive/40' : null,
+                  'w-full rounded-md border px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                  nameError ? 'border-destructive aria-invalid:border-destructive aria-invalid:ring-destructive' : null,
                 )}
                 value={draftName}
                 aria-invalid={nameError ? 'true' : undefined}
@@ -605,7 +600,7 @@ export function InlineNextInteractionEditor({
               ) : null}
               <input
                 placeholder={t('customers.people.detail.inline.nextInteractionRef')}
-                className="w-full rounded-md border px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                className="w-full rounded-md border px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 value={draftRefId}
                 onChange={(event) => {
                   if (submitError) setSubmitError(null)

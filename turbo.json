@@ -1,10 +1,29 @@
 {
   "$schema": "https://turbo.build/schema.json",
-  "globalPassThroughEnv": ["*"],
+  "concurrency": "32",
+  "globalEnv": ["NODE_ENV"],
+  "globalDependencies": ["scripts/build-package.mjs", "scripts/watch.mjs", "scripts/lib/add-js-extension.mjs"],
   "tasks": {
     "build": {
-      "cache": false,
+      "cache": true,
+      "inputs": ["$TURBO_DEFAULT$", "generated/**"],
       "outputs": ["dist/**", ".next/**", "!.next/cache/**"]
+    },
+    "@open-mercato/cli#build": {
+      "dependsOn": ["^build"],
+      "cache": true,
+      "inputs": ["$TURBO_DEFAULT$", "generated/**"],
+      "outputs": ["dist/**"]
+    },
+    "create-mercato-app#build": {
+      "dependsOn": ["^build"],
+      "cache": true,
+      "inputs": ["$TURBO_DEFAULT$", "generated/**"],
+      "outputs": ["dist/**"]
+    },
+    "start": {
+      "cache": false,
+      "persistent": true
     },
     "dev": {
       "cache": false,
@@ -23,7 +42,7 @@
       "persistent": true
     },
     "typecheck": {
-      "cache": false,
+      "cache": true,
       "outputs": []
     },
     "test": {
@@ -54,6 +73,10 @@
       "outputs": []
     },
     "initialize": {
+      "cache": false,
+      "outputs": []
+    },
+    "seed:defaults": {
       "cache": false,
       "outputs": []
     }

@@ -2,23 +2,31 @@
 
 import * as React from 'react'
 import Link from 'next/link'
-import { useRouter } from 'next/navigation'
+import { usePathname, useRouter, useSearchParams } from 'next/navigation'
 import { Page, PageBody } from '@open-mercato/ui/backend/Page'
-import { DataTable, type DataTableExportFormat } from '@open-mercato/ui/backend/DataTable'
-import type { ColumnDef } from '@tanstack/react-table'
+import { DataTable, type DataTableExportFormat, withDataTableNamespaces } from '@open-mercato/ui/backend/DataTable'
+import type { ColumnDef, SortingState } from '@tanstack/react-table'
 import { Button } from '@open-mercato/ui/primitives/button'
 import { RowActions } from '@open-mercato/ui/backend/RowActions'
-import { apiCall, apiCallOrThrow, readApiResultOrThrow } from '@open-mercato/ui/backend/utils/apiCall'
+import { apiCall, apiCallOrThrow } from '@open-mercato/ui/backend/utils/apiCall'
 import { buildCrudExportUrl } from '@open-mercato/ui/backend/utils/crud'
+import { groupBulkDeleteFailures, runBulkDelete } from '@open-mercato/ui/backend/utils/bulkDelete'
+import { coalesceLastOperations } from '@open-mercato/ui/backend/operations/store'
+import { useGuardedMutation } from '@open-mercato/ui/backend/injection/useGuardedMutation'
 import { flash } from '@open-mercato/ui/backend/FlashMessages'
 import { E } from '#generated/entities.ids.generated'
 import { useOrganizationScopeVersion } from '@open-mercato/shared/lib/frontend/useOrganizationScope'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
 import { useConfirmDialog } from '@open-mercato/ui/backend/confirm-dialog'
-import type { FilterDef, FilterValues } from '@open-mercato/ui/backend/FilterBar'
 import type { FilterOption } from '@open-mercato/ui/backend/FilterOverlay'
+import type { FilterFieldDef, FilterOption as AdvancedFilterOption } from '@open-mercato/shared/lib/query/advanced-filter'
+import type { AdvancedFilterTree } from '@open-mercato/shared/lib/query/advanced-filter-tree'
+import { createEmptyTree, makeRuleTree } from '@open-mercato/shared/lib/query/advanced-filter-tree'
+import { deserializeAdvancedFilter, deserializeTree, flatToTree, mapDictionaryColorToTone, serializeTree } from '@open-mercato/shared/lib/query/advanced-filter'
+import { useCurrentUserId } from '@open-mercato/ui/backend/utils/useCurrentUserId'
 import {
   DictionaryValue,
+  createEmptyCustomerDictionaryMaps,
   renderDictionaryColor,
   renderDictionaryIcon,
   type CustomerDictionaryKind,
@@ -26,10 +34,62 @@ import {
 } from '../../../lib/dictionaries'
 import {
   useCustomFieldDefs,
-  filterCustomFieldDefs,
 } from '@open-mercato/ui/backend/utils/customFieldDefs'
+import {
+  mapCustomFieldKindToFilterType,
+  normalizeCustomFieldFilterOptions,
+  supportsCustomFieldColumn,
+} from '@open-mercato/ui/backend/utils/customFieldColumns'
+import { useAutoDiscoveredFields } from '@open-mercato/ui/backend/utils/useAutoDiscoveredFields'
+import { useAdvancedFilterTree } from '@open-mercato/ui/backend/hooks/useAdvancedFilter'
+import { AdvancedFilterPanel } from '@open-mercato/ui/backend/filters/AdvancedFilterPanel'
+import { ActiveFilterChips } from '@open-mercato/ui/backend/filters/ActiveFilterChips'
+import { ListEmptyState } from '@open-mercato/ui/backend/filters/ListEmptyState'
+import type { FilterPreset } from '@open-mercato/ui/backend/filters/QuickFilters'
 import { useQueryClient } from '@tanstack/react-query'
 import { ensureCustomerDictionary } from '../../../components/detail/hooks/useCustomerDictionary'
+import {
+  ensureCurrentUserFilterOption,
+  fetchAssignableStaffMembers,
+  mapAssignableStaffToFilterOptions,
+} from '../../../components/detail/assignableStaff'
+import { CollectionPreviewCell, normalizeCollectionLabels } from '../../../components/list/CollectionPreviewCell'
+import { appendCustomerListSortParams } from '../listSorting'
+
+type DictionaryOptionWithTone = AdvancedFilterOption & FilterOption
+
+function makePeoplePresets(): FilterPreset[] {
+  return [
+    {
+      id: 'recently-active',
+      labelKey: 'customers.people.presets.recentlyActive',
+      iconName: 'clock',
+      build: ({ now }) => {
+        const cutoff = new Date(now.getTime() - 7 * 24 * 3600 * 1000).toISOString().slice(0, 10)
+        return makeRuleTree({ field: 'next_interaction_at', operator: 'is_after', value: cutoff })
+      },
+    },
+    {
+      id: 'my-contacts',
+      labelKey: 'customers.people.presets.myContacts',
+      requiresUser: true,
+      build: ({ userId }) => makeRuleTree({ field: 'owner_user_id', operator: 'is', value: userId }),
+    },
+    {
+      id: 'hot-leads',
+      labelKey: 'customers.people.presets.hotLeads',
+      build: () => makeRuleTree({ field: 'lifecycle_stage', operator: 'is', value: 'lead' }),
+    },
+    {
+      id: 'stale-30',
+      labelKey: 'customers.people.presets.stale30',
+      build: ({ now }) => {
+        const cutoff = new Date(now.getTime() - 30 * 24 * 3600 * 1000).toISOString().slice(0, 10)
+        return makeRuleTree({ field: 'next_interaction_at', operator: 'is_before', value: cutoff })
+      },
+    },
+  ]
+}
 
 type PersonRow = {
   id: string
@@ -37,6 +97,16 @@ type PersonRow = {
   description?: string | null
   email?: string | null
   phone?: string | null
+  firstName?: string | null
+  lastName?: string | null
+  preferredName?: string | null
+  jobTitle?: string | null
+  department?: string | null
+  seniority?: string | null
+  timezone?: string | null
+  linkedInUrl?: string | null
+  twitterUrl?: string | null
+  companyEntityId?: string | null
   status?: string | null
   lifecycleStage?: string | null
   nextInteractionAt?: string | null
@@ -45,6 +115,7 @@ type PersonRow = {
   nextInteractionColor?: string | null
   organizationId?: string | null
   source?: string | null
+  ownerUserId?: string | null
 } & Record<string, unknown>
 
 type PeopleResponse = {
@@ -58,20 +129,6 @@ type DictionaryKindKey = CustomerDictionaryKind
 type DictionaryMap = CustomerDictionaryMap
 
 const NO_MATCH_TAG_SENTINEL = '__no_match__'
-
-function createEmptyDictionaryMaps(): Record<DictionaryKindKey, DictionaryMap> {
-  return {
-    statuses: {},
-    sources: {},
-    'lifecycle-stages': {},
-    'address-types': {},
-    'activity-types': {},
-    'deal-statuses': {},
-    'pipeline-stages': {},
-    'job-titles': {},
-    industries: {},
-  }
-}
 
 function formatDate(value: string | null | undefined, fallback: string): string {
   if (!value) return fallback
@@ -87,6 +144,16 @@ function mapApiItem(item: Record<string, unknown>): PersonRow | null {
   const description = typeof item.description === 'string' ? item.description : null
   const email = typeof item.primary_email === 'string' ? item.primary_email : null
   const phone = typeof item.primary_phone === 'string' ? item.primary_phone : null
+  const firstName = typeof item.first_name === 'string' ? item.first_name : null
+  const lastName = typeof item.last_name === 'string' ? item.last_name : null
+  const preferredName = typeof item.preferred_name === 'string' ? item.preferred_name : null
+  const jobTitle = typeof item.job_title === 'string' ? item.job_title : null
+  const department = typeof item.department === 'string' ? item.department : null
+  const seniority = typeof item.seniority === 'string' ? item.seniority : null
+  const timezone = typeof item.timezone === 'string' ? item.timezone : null
+  const linkedInUrl = typeof item.linked_in_url === 'string' ? item.linked_in_url : null
+  const twitterUrl = typeof item.twitter_url === 'string' ? item.twitter_url : null
+  const companyEntityId = typeof item.company_entity_id === 'string' ? item.company_entity_id : null
   const status = typeof item.status === 'string' ? item.status : null
   const lifecycleStage = typeof item.lifecycle_stage === 'string' ? item.lifecycle_stage : null
   const nextInteractionAt = typeof item.next_interaction_at === 'string' ? item.next_interaction_at : null
@@ -101,12 +168,22 @@ function mapApiItem(item: Record<string, unknown>): PersonRow | null {
       customFields[key] = value
     }
   }
-  return {
+  return withDataTableNamespaces({
     id,
     name,
     description,
     email,
     phone,
+    firstName,
+    lastName,
+    preferredName,
+    jobTitle,
+    department,
+    seniority,
+    timezone,
+    linkedInUrl,
+    twitterUrl,
+    companyEntityId,
     status,
     lifecycleStage,
     nextInteractionAt,
@@ -116,27 +193,96 @@ function mapApiItem(item: Record<string, unknown>): PersonRow | null {
     organizationId,
     source,
     ...customFields,
-  }
+  }, item)
 }
 
 export default function CustomersPeoplePage() {
   const { confirm, ConfirmDialogElement } = useConfirmDialog()
   const [rows, setRows] = React.useState<PersonRow[]>([])
   const [page, setPage] = React.useState(1)
-  const [pageSize] = React.useState(20)
+  const [pageSize, setPageSize] = React.useState(20)
+  const [sorting, setSorting] = React.useState<SortingState>([])
   const [total, setTotal] = React.useState(0)
   const [totalPages, setTotalPages] = React.useState(1)
   const [search, setSearch] = React.useState('')
-  const [filterValues, setFilterValues] = React.useState<FilterValues>({})
+  const pathname = usePathname()
+  const searchParams = useSearchParams()
+  // One-shot URL hydration used as the hook's initial value. The hook is the
+  // single source of truth from this point on — the page MUST NOT keep a
+  // parallel `useState<AdvancedFilterTree>` (see spec "Migration & Backward
+  // Compatibility" → state ownership).
+  const initialFilterTree = React.useMemo<AdvancedFilterTree>(() => {
+    if (!searchParams) return createEmptyTree()
+    const record: Record<string, string> = {}
+    searchParams.forEach((value, key) => {
+      if (key.startsWith('filter[')) record[key] = value
+    })
+    const v2 = deserializeTree(record)
+    if (v2) return v2
+    const flat = deserializeAdvancedFilter(record)
+    if (flat) return flatToTree(flat)
+    return createEmptyTree()
+    // searchParams is intentionally evaluated once on mount — subsequent URL
+    // changes flow through the hook, not back through hydration.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+  // `filterPanel` lives at the top of the component so derived state below
+  // (URL params, data fetch, export config) can read `filterPanel.appliedTree`
+  // directly. Real `FilterFieldDef[]` arrives later from `useAutoDiscoveredFields`
+  // (it depends on columns) and is synced into the hook via a small effect at
+  // the bottom of the component. The hook reads fields through a ref at
+  // validation time only — first validation cannot fire before user input, by
+  // which point fields have settled, so the empty initial value is safe.
+  const [panelFields, setPanelFields] = React.useState<FilterFieldDef[]>([])
+  const [filtersOpen, setFiltersOpen] = React.useState(false)
+  const filtersTriggerRef = React.useRef<HTMLButtonElement | null>(null)
+  const filterPanel = useAdvancedFilterTree({
+    initial: initialFilterTree,
+    fields: panelFields,
+    onApply: () => setPage(1),
+  })
+  const advancedFilterState = filterPanel.appliedTree
+  const handleAdvancedFilterClear = React.useCallback(() => {
+    filterPanel.clear()
+    setPage(1)
+  }, [filterPanel])
   const [isLoading, setIsLoading] = React.useState(true)
   const [reloadToken, setReloadToken] = React.useState(0)
   const [cacheStatus, setCacheStatus] = React.useState<'hit' | 'miss' | null>(null)
-  const [dictionaryMaps, setDictionaryMaps] = React.useState<Record<DictionaryKindKey, DictionaryMap>>(createEmptyDictionaryMaps())
-  const [tagIdToLabel, setTagIdToLabel] = React.useState<Record<string, string>>({})
+  const [dictionaryMaps, setDictionaryMaps] = React.useState<Record<DictionaryKindKey, DictionaryMap>>(createEmptyCustomerDictionaryMaps())
   const scopeVersion = useOrganizationScopeVersion()
   const queryClient = useQueryClient()
   const t = useT()
   const router = useRouter()
+  const handlePageSizeChange = React.useCallback((newSize: number) => {
+    setPageSize(newSize)
+    setPage(1)
+  }, [])
+  const handleSortingChange = React.useCallback((nextSorting: SortingState) => {
+    setSorting(nextSorting)
+    setPage(1)
+  }, [])
+
+  const bulkMutationContextId = 'customers-people-list:bulk-delete'
+  const { runMutation: runBulkMutation, retryLastMutation: retryBulkMutation } = useGuardedMutation<{
+    formId: string
+    resourceKind: string
+    retryLastMutation: () => Promise<boolean>
+  }>({
+    contextId: bulkMutationContextId,
+    blockedMessage: t('ui.forms.flash.saveBlocked', 'Save blocked by validation'),
+  })
+  const singleMutationContextId = 'customers-people-list:single-delete'
+  const { runMutation: runSingleMutation, retryLastMutation: retrySingleMutation } = useGuardedMutation<{
+    formId: string
+    resourceKind: string
+    resourceId: string
+    retryLastMutation: () => Promise<boolean>
+  }>({
+    contextId: singleMutationContextId,
+    blockedMessage: t('ui.forms.flash.saveBlocked', 'Save blocked by validation'),
+  })
+
   const fetchDictionaryEntries = React.useCallback(async (kind: DictionaryKindKey) => {
     try {
       const data = await ensureCustomerDictionary(queryClient, kind, scopeVersion)
@@ -149,15 +295,15 @@ export default function CustomersPeoplePage() {
       return []
     }
   }, [queryClient, scopeVersion])
-  const loadDictionaryOptions = React.useCallback(async (kind: 'statuses' | 'sources' | 'lifecycle-stages') => {
-    const entries = await fetchDictionaryEntries(kind)
-    return entries.map((entry) => ({ value: entry.value, label: entry.label }))
-  }, [fetchDictionaryEntries])
-
   const dictionaryOptions = React.useMemo(() => {
-    const toOptions = (map?: DictionaryMap | null): FilterOption[] =>
+    const toOptions = (map?: DictionaryMap | null): DictionaryOptionWithTone[] =>
       Object.values(map ?? {})
-        .map((entry) => ({ value: entry.value, label: entry.label }))
+        .map((entry) => {
+          const tone = mapDictionaryColorToTone(entry.color)
+          const option: DictionaryOptionWithTone = { value: entry.value, label: entry.label }
+          if (tone) option.tone = tone
+          return option
+        })
         .sort((a, b) => a.label.localeCompare(b.label, undefined, { sensitivity: 'base' }))
     return {
       statuses: toOptions(dictionaryMaps.statuses),
@@ -166,68 +312,11 @@ export default function CustomersPeoplePage() {
     }
   }, [dictionaryMaps])
 
-  const loadTagOptions = React.useCallback(async (query?: string): Promise<FilterOption[]> => {
-    try {
-      const params = new URLSearchParams({ pageSize: '100' })
-      const trimmedQuery = typeof query === 'string' ? query.trim() : ''
-      if (trimmedQuery) params.set('search', trimmedQuery)
-      const payload = await readApiResultOrThrow<{ items?: unknown[] }>(
-        `/api/customers/tags?${params.toString()}`,
-        undefined,
-        { errorMessage: t('customers.people.detail.tags.loadError', 'Failed to load tags.') },
-      )
-      const items = Array.isArray(payload?.items) ? payload.items : []
-      const options: FilterOption[] = []
-      for (const item of items) {
-        if (!item || typeof item !== 'object') continue
-        const raw = item as { id?: unknown; tagId?: unknown; label?: unknown; slug?: unknown }
-        const rawId = typeof raw.id === 'string'
-          ? raw.id
-          : typeof raw.tagId === 'string'
-            ? raw.tagId
-            : null
-        if (!rawId) continue
-        const label = typeof raw.label === 'string' && raw.label.trim().length
-          ? raw.label.trim()
-          : typeof raw.slug === 'string' && raw.slug.trim().length
-            ? raw.slug.trim()
-            : rawId
-        options.push({ value: rawId, label })
-      }
-      if (options.length) {
-        setTagIdToLabel((prev) => {
-          let changed = false
-          const next = { ...prev }
-          for (const option of options) {
-            if (next[option.value] !== option.label) {
-              next[option.value] = option.label
-              changed = true
-            }
-          }
-          return changed ? next : prev
-        })
-      }
-      return options
-    } catch (err) {
-      console.error('customers.people.list.loadTagOptions', err)
-      return []
-    }
-  }, [setTagIdToLabel, t])
-
-  const tagLabelToId = React.useMemo(() => {
-    const map: Record<string, string> = {}
-    for (const [id, label] of Object.entries(tagIdToLabel)) {
-      if (!label) continue
-      map[label] = id
-    }
-    return map
-  }, [tagIdToLabel])
-
   React.useEffect(() => {
     let cancelled = false
     async function loadAll() {
       if (cancelled) return
-      setDictionaryMaps(createEmptyDictionaryMaps())
+      setDictionaryMaps(createEmptyCustomerDictionaryMaps())
       await Promise.all([
         fetchDictionaryEntries('statuses'),
         fetchDictionaryEntries('sources'),
@@ -244,130 +333,73 @@ export default function CustomersPeoplePage() {
     [E.customers.customer_entity, E.customers.customer_person_profile],
     { keyExtras: [scopeVersion, reloadToken] },
   )
-
-  const filters = React.useMemo<FilterDef[]>(() => [
-    {
-      id: 'status',
-      label: t('customers.people.list.filters.status'),
-      type: 'select',
-      options: dictionaryOptions.statuses,
-      loadOptions: () => loadDictionaryOptions('statuses'),
-    },
-    {
-      id: 'source',
-      label: t('customers.people.list.filters.source'),
-      type: 'select',
-      options: dictionaryOptions.sources,
-      loadOptions: () => loadDictionaryOptions('sources'),
-    },
-    {
-      id: 'lifecycleStage',
-      label: t('customers.people.list.filters.lifecycleStage'),
-      type: 'select',
-      options: dictionaryOptions.lifecycleStages,
-      loadOptions: () => loadDictionaryOptions('lifecycle-stages'),
-    },
-    {
-      id: 'tagIds',
-      label: t('customers.people.list.filters.tags'),
-      type: 'tags',
-      loadOptions: loadTagOptions,
-    },
-    {
-      id: 'createdAt',
-      label: t('customers.people.list.filters.createdAt'),
-      type: 'dateRange',
-    },
-    {
-      id: 'emailContains',
-      label: t('customers.people.list.filters.emailContains'),
-      type: 'text',
-      placeholder: t('customers.people.list.filters.emailContainsPlaceholder'),
-    },
-    {
-      id: 'hasEmail',
-      label: t('customers.people.list.filters.hasEmail'),
-      type: 'checkbox',
-    },
-    {
-      id: 'hasPhone',
-      label: t('customers.people.list.filters.hasPhone'),
-      type: 'checkbox',
-    },
-    {
-      id: 'hasNextInteraction',
-      label: t('customers.people.list.filters.hasNextInteraction'),
-      type: 'checkbox',
-    },
-  ], [dictionaryOptions.lifecycleStages, dictionaryOptions.sources, dictionaryOptions.statuses, loadDictionaryOptions, loadTagOptions, t])
+  const currentUserId = useCurrentUserId()
+  const [ownerFilterOptions, setOwnerFilterOptions] = React.useState<AdvancedFilterOption[]>([])
+  React.useEffect(() => {
+    const controller = new AbortController()
+    let cancelled = false
+    void fetchAssignableStaffMembers('', { pageSize: 100, signal: controller.signal })
+      .then((items) => {
+        if (!cancelled) setOwnerFilterOptions(mapAssignableStaffToFilterOptions(items))
+      })
+      .catch(() => {
+        if (!cancelled) setOwnerFilterOptions([])
+      })
+    return () => {
+      cancelled = true
+      controller.abort()
+    }
+  }, [scopeVersion])
+  const resolvedOwnerFilterOptions = React.useMemo(
+    () => ensureCurrentUserFilterOption(
+      ownerFilterOptions,
+      currentUserId,
+      t('customers.filters.currentUser', 'Current user'),
+    ),
+    [currentUserId, ownerFilterOptions, t],
+  )
+  const loadOwnerFilterOptions = React.useCallback(async (query?: string): Promise<AdvancedFilterOption[]> => {
+    const items = await fetchAssignableStaffMembers(query ?? '', { pageSize: 100 })
+    return mapAssignableStaffToFilterOptions(items)
+  }, [])
 
   const queryParams = React.useMemo(() => {
     const params = new URLSearchParams()
     params.set('page', String(page))
     params.set('pageSize', String(pageSize))
+    appendCustomerListSortParams(params, sorting)
     if (search.trim()) params.set('search', search.trim())
-    const status = filterValues.status
-    if (typeof status === 'string' && status.trim()) params.set('status', status)
-    const source = filterValues.source
-    if (typeof source === 'string' && source.trim()) params.set('source', source)
-    const lifecycleStage = filterValues.lifecycleStage
-    if (typeof lifecycleStage === 'string' && lifecycleStage.trim()) params.set('lifecycleStage', lifecycleStage)
-    const createdAt = filterValues.createdAt
-    if (createdAt && typeof createdAt === 'object') {
-      if (createdAt.from) params.set('createdFrom', createdAt.from)
-      if (createdAt.to) params.set('createdTo', createdAt.to)
+    const advancedParams = serializeTree(advancedFilterState)
+    for (const [key, val] of Object.entries(advancedParams)) {
+      params.set(key, val)
     }
-    const emailContains = filterValues.emailContains
-    if (typeof emailContains === 'string' && emailContains.trim()) {
-      params.set('emailContains', emailContains.trim())
-    }
-    const booleanFilters: Array<['hasEmail' | 'hasPhone' | 'hasNextInteraction', string]> = [
-      ['hasEmail', 'hasEmail'],
-      ['hasPhone', 'hasPhone'],
-      ['hasNextInteraction', 'hasNextInteraction'],
-    ]
-    for (const [key, queryKey] of booleanFilters) {
-      const value = filterValues[key]
-      if (value === true) params.set(queryKey, 'true')
-      if (value === false) params.set(queryKey, 'false')
-    }
-    const tagLabels = Array.isArray(filterValues.tagIds)
-      ? filterValues.tagIds
-          .map((value) => (typeof value === 'string' ? value.trim() : String(value || '').trim()))
-          .filter((value) => value.length > 0)
-      : []
-    if (tagLabels.length > 0) {
-      const normalizedTagIds = tagLabels
-        .map((label) => tagLabelToId[label])
-        .filter((id): id is string => typeof id === 'string' && id.length > 0)
-      if (normalizedTagIds.length === tagLabels.length && normalizedTagIds.length > 0) {
-        params.set('tagIds', normalizedTagIds.join(','))
-      } else {
-        params.set('tagIdsEmpty', 'true')
-      }
-    }
-    Object.entries(filterValues).forEach(([key, value]) => {
-      if (!key.startsWith('cf_') || value == null) return
-      if (Array.isArray(value)) {
-        const normalized = value
-          .map((item) => {
-            if (item == null) return ''
-            if (typeof item === 'string') return item.trim()
-            return String(item).trim()
-          })
-          .filter((item) => item.length > 0)
-        if (normalized.length) params.set(key, normalized.join(','))
-      } else if (typeof value === 'object') {
-        return
-      } else if (value !== '') {
-        const stringValue = typeof value === 'string' ? value.trim() : String(value)
-        if (stringValue) params.set(key, stringValue)
-      }
-    })
     return params.toString()
-  }, [filterValues, page, pageSize, search, tagLabelToId])
+  }, [advancedFilterState, page, pageSize, search, sorting])
 
   const currentParams = React.useMemo(() => Object.fromEntries(new URLSearchParams(queryParams)), [queryParams])
+
+  // Mirror page state into the URL so a refresh restores the same filter tree,
+  // including nested subgroups. Without this effect the People page would
+  // discard everything the user typed into the filter panel on refresh
+  // (the previous behavior — top-level rules only "appeared" to survive
+  // because a stale localStorage perspective snapshot was being re-applied).
+  const queryRef = React.useRef(searchParams?.toString() ?? '')
+  React.useEffect(() => {
+    if (!pathname) return
+    const params = new URLSearchParams()
+    if (search.trim().length) params.set('search', search.trim())
+    if (page > 1) params.set('page', String(page))
+    appendCustomerListSortParams(params, sorting)
+    const advancedParams = serializeTree(advancedFilterState)
+    for (const [key, val] of Object.entries(advancedParams)) {
+      params.set(key, val)
+    }
+    const next = params.toString()
+    if (queryRef.current === next) return
+    queryRef.current = next
+    router.replace(next ? `${pathname}?${next}` : pathname, { scroll: false })
+  }, [pathname, router, page, search, sorting, advancedFilterState])
+
   const exportConfig = React.useMemo(() => ({
     view: {
       getUrl: (format: DataTableExportFormat) =>
@@ -428,14 +460,25 @@ export default function CustomersPeoplePage() {
     })
     if (!confirmed) return
     try {
-      await apiCallOrThrow(
-        `/api/customers/people?id=${encodeURIComponent(person.id)}`,
-        {
-          method: 'DELETE',
-          headers: { 'content-type': 'application/json' },
+      await runSingleMutation({
+        operation: async () => {
+          // optimistic-lock-exempt: delete-only mutation — no field-level lost-update
+          await apiCallOrThrow(
+            `/api/customers/people?id=${encodeURIComponent(person.id)}`,
+            {
+              method: 'DELETE',
+              headers: { 'content-type': 'application/json' },
+            },
+            { errorMessage: t('customers.people.list.deleteError') },
+          )
         },
-        { errorMessage: t('customers.people.list.deleteError') },
-      )
+        context: {
+          formId: singleMutationContextId,
+          resourceKind: 'customers.person',
+          resourceId: person.id,
+          retryLastMutation: retrySingleMutation,
+        },
+      })
       setRows((prev) => prev.filter((row) => row.id !== person.id))
       setTotal((prev) => Math.max(prev - 1, 0))
       handleRefresh()
@@ -444,29 +487,91 @@ export default function CustomersPeoplePage() {
       const message = err instanceof Error ? err.message : t('customers.people.list.deleteError')
       flash(message, 'error')
     }
-  }, [confirm, handleRefresh, t])
+  }, [confirm, handleRefresh, retrySingleMutation, runSingleMutation, singleMutationContextId, t])
 
-  const handleFiltersApply = React.useCallback((values: FilterValues) => {
-    const next: FilterValues = {}
-    Object.entries(values).forEach(([key, value]) => {
-      if (value !== undefined) {
-        next[key] = value
-      }
+  const handleBulkDelete = React.useCallback(async (selectedRows: PersonRow[]) => {
+    const confirmed = await confirm({
+      title: t('customers.people.list.bulkDelete.title', 'Delete {count} people?', { count: selectedRows.length }),
+      description: t('customers.people.list.bulkDelete.description', 'This action cannot be undone.'),
+      variant: 'destructive',
     })
-    const rawTags = Array.isArray(values.tagIds) ? (values.tagIds as string[]) : []
-    const sanitizedTags = rawTags
-      .map((tag) => (typeof tag === 'string' ? tag.trim() : ''))
-      .filter((tag) => tag.length > 0)
-    if (sanitizedTags.length) next.tagIds = sanitizedTags
-    else delete next.tagIds
-    setFilterValues(next)
-    setPage(1)
-  }, [setFilterValues, setPage])
+    if (!confirmed) return false
 
-  const handleFiltersClear = React.useCallback(() => {
-    setFilterValues({})
-    setPage(1)
-  }, [setFilterValues, setPage])
+    const { succeeded, failures } = await runBulkMutation({
+      operation: async () =>
+        runBulkDelete(
+          selectedRows,
+          async (row) => {
+            // optimistic-lock-exempt: bulk delete-only mutation — no field-level lost-update
+            await apiCallOrThrow(`/api/customers/people?id=${encodeURIComponent(row.id)}`, {
+              method: 'DELETE',
+              headers: { 'content-type': 'application/json' },
+            })
+          },
+          {
+            fallbackErrorMessage: t('customers.people.list.deleteError', 'Failed to delete person.'),
+            logTag: 'customers.people.list',
+            progress: {
+              jobType: 'customers.people.bulk_delete',
+              name: t('customers.people.list.bulkDelete.progressName', 'Delete selected people'),
+              description: t(
+                'customers.people.list.bulkDelete.progressDescription',
+                '{count} people selected for deletion',
+                { count: selectedRows.length },
+              ),
+              meta: { source: 'customers.people.list' },
+            },
+          },
+        ),
+      context: {
+        formId: bulkMutationContextId,
+        resourceKind: 'customers.person',
+        retryLastMutation: retryBulkMutation,
+      },
+    })
+
+    if (succeeded.length > 0) {
+      const succeededIds = new Set(succeeded.map((r) => r.id))
+      setRows((prev) => prev.filter((r) => !succeededIds.has(r.id)))
+      setTotal((prev) => Math.max(0, prev - succeeded.length))
+      setReloadToken((prev) => prev + 1)
+      if (succeeded.length > 1) {
+        coalesceLastOperations(succeeded.length, {
+          commandId: 'customers.people.delete',
+          actionLabel: t('customers.people.list.bulkDelete.operationLabel', 'Delete {count} people', { count: succeeded.length }),
+          resourceKind: 'customers.person',
+        })
+      }
+      if (failures.length === 0) {
+        flash(
+          t('customers.people.list.bulkDelete.success', '{count} people deleted', { count: succeeded.length }),
+          'success',
+        )
+      } else {
+        flash(
+          t('customers.people.list.bulkDelete.partial', '{deleted} of {total} people deleted; {failed} failed', {
+            deleted: succeeded.length,
+            total: selectedRows.length,
+            failed: failures.length,
+          }),
+          'warning',
+        )
+      }
+    }
+
+    for (const group of groupBulkDeleteFailures(failures)) {
+      const message = group.count === 1
+        ? group.sampleMessage
+        : t(
+            'customers.people.list.bulkDelete.failedGroup',
+            '{count} people could not be deleted: {message}',
+            { count: group.count, message: group.sampleMessage },
+          )
+      flash(message, 'error')
+    }
+
+    return succeeded.length > 0
+  }, [bulkMutationContextId, confirm, retryBulkMutation, runBulkMutation, t])
 
   const columns = React.useMemo<ColumnDef<PersonRow>[]>(() => {
     const noValue = <span className="text-muted-foreground text-sm">{t('customers.people.list.noValue')}</span>
@@ -486,15 +591,15 @@ export default function CustomersPeoplePage() {
       if (value == null) return noValue
       if (Array.isArray(value)) {
         if (!value.length) return noValue
-        const normalized = value
-          .map((item) => {
+        const normalized = normalizeCollectionLabels(
+          value.map((item) => {
             if (item == null) return ''
-            if (typeof item === 'string') return item.trim()
-            return String(item).trim()
-          })
-          .filter((item) => item.length > 0)
+            if (typeof item === 'string') return item
+            return String(item)
+          }),
+        )
         if (!normalized.length) return noValue
-        return <span className="text-sm">{normalized.join(', ')}</span>
+        return <CollectionPreviewCell labels={normalized} maxVisible={2} />
       }
       if (typeof value === 'boolean') {
         return (
@@ -514,8 +619,15 @@ export default function CustomersPeoplePage() {
       {
         accessorKey: 'name',
         header: t('customers.people.list.columns.name'),
+        meta: {
+          alwaysVisible: true,
+          columnChooserGroup: 'Basic Info',
+          filterKey: 'display_name',
+          filterGroup: 'CRM',
+          maxWidth: '240px',
+        },
         cell: ({ row }) => (
-          <Link href={`/backend/customers/people/${row.original.id}`} className="font-medium hover:underline">
+          <Link href={`/backend/customers/people-v2/${row.original.id}`} className="font-medium hover:underline">
             {row.original.name}
           </Link>
         ),
@@ -523,22 +635,46 @@ export default function CustomersPeoplePage() {
       {
         accessorKey: 'email',
         header: t('customers.people.list.columns.email'),
+        meta: {
+          columnChooserGroup: 'Contact',
+          filterKey: 'primary_email',
+          filterGroup: 'Contact',
+          filterIconName: 'mail',
+          maxWidth: '220px',
+        },
         cell: ({ row }) => row.original.email || <span className="text-muted-foreground text-sm">{t('customers.people.list.noValue')}</span>,
       },
       {
         accessorKey: 'status',
         header: t('customers.people.list.columns.status'),
+        meta: {
+          filterType: 'select' as const,
+          filterOptions: dictionaryOptions.statuses,
+          columnChooserGroup: 'Basic Info',
+          filterGroup: 'CRM',
+        },
         cell: ({ row }) => renderDictionaryCell('statuses', row.original.status),
       },
       {
         accessorKey: 'lifecycleStage',
         header: t('customers.people.list.columns.lifecycleStage'),
+        meta: {
+          filterType: 'select' as const,
+          filterOptions: dictionaryOptions.lifecycleStages,
+          columnChooserGroup: 'Basic Info',
+          filterKey: 'lifecycle_stage',
+          filterGroup: 'CRM',
+        },
         cell: ({ row }) => renderDictionaryCell('lifecycle-stages', row.original.lifecycleStage),
       },
       {
         accessorKey: 'nextInteractionAt',
         header: t('customers.people.list.columns.nextInteraction'),
         meta: {
+          columnChooserGroup: 'Dates',
+          filterKey: 'next_interaction_at',
+          filterGroup: 'Activity',
+          filterIconName: 'calendar',
           tooltipContent: (row: PersonRow) => {
             if (!row.nextInteractionAt) return undefined
             const date = formatDate(row.nextInteractionAt, '')
@@ -573,23 +709,191 @@ export default function CustomersPeoplePage() {
       {
         accessorKey: 'source',
         header: t('customers.people.list.columns.source'),
+        meta: {
+          filterType: 'select' as const,
+          filterOptions: dictionaryOptions.sources,
+          columnChooserGroup: 'Basic Info',
+          filterGroup: 'CRM',
+        },
         cell: ({ row }) => renderDictionaryCell('sources', row.original.source),
+      },
+      {
+        accessorKey: 'ownerUserId',
+        header: t('customers.people.list.columns.owner', 'Owner'),
+        meta: {
+          columnChooserGroup: 'CRM',
+          filterType: 'select',
+          filterOptions: resolvedOwnerFilterOptions,
+          filterLoadOptions: loadOwnerFilterOptions,
+          filterGroup: 'CRM',
+          filterIconName: 'user-round',
+          filterKey: 'owner_user_id',
+          hidden: true,
+        },
+        cell: ({ row }) => row.original.ownerUserId ?? null,
+      },
+      {
+        accessorKey: 'firstName',
+        header: t('customers.people.form.firstName', 'First name'),
+        meta: {
+          columnChooserGroup: 'Profile',
+          hidden: true,
+          filterKey: 'person_profile.first_name',
+          filterGroup: 'Profile',
+        },
+        cell: ({ row }) => row.original.firstName || noValue,
+      },
+      {
+        accessorKey: 'lastName',
+        header: t('customers.people.form.lastName', 'Last name'),
+        meta: {
+          columnChooserGroup: 'Profile',
+          hidden: true,
+          filterKey: 'person_profile.last_name',
+          filterGroup: 'Profile',
+        },
+        cell: ({ row }) => row.original.lastName || noValue,
+      },
+      {
+        accessorKey: 'preferredName',
+        header: t('customers.people.form.preferredName', 'Preferred name'),
+        meta: {
+          columnChooserGroup: 'Profile',
+          hidden: true,
+          filterKey: 'person_profile.preferred_name',
+          filterGroup: 'Profile',
+        },
+        cell: ({ row }) => row.original.preferredName || noValue,
+      },
+      {
+        accessorKey: 'jobTitle',
+        header: t('customers.people.form.jobTitle', 'Job title'),
+        meta: {
+          columnChooserGroup: 'Profile',
+          hidden: true,
+          filterKey: 'person_profile.job_title',
+          filterGroup: 'Profile',
+        },
+        cell: ({ row }) => row.original.jobTitle || noValue,
+      },
+      {
+        accessorKey: 'department',
+        header: t('customers.people.detail.fields.department', 'Department'),
+        meta: {
+          columnChooserGroup: 'Profile',
+          hidden: true,
+          filterKey: 'person_profile.department',
+          filterGroup: 'Profile',
+        },
+        cell: ({ row }) => row.original.department || noValue,
+      },
+      {
+        accessorKey: 'seniority',
+        header: t('customers.people.detail.fields.seniority', 'Seniority'),
+        meta: {
+          columnChooserGroup: 'Profile',
+          hidden: true,
+          filterKey: 'person_profile.seniority',
+          filterGroup: 'Profile',
+        },
+        cell: ({ row }) => row.original.seniority || noValue,
+      },
+      {
+        accessorKey: 'timezone',
+        header: t('customers.people.detail.fields.timezone', 'Timezone'),
+        meta: {
+          columnChooserGroup: 'Profile',
+          hidden: true,
+          filterKey: 'person_profile.timezone',
+          filterGroup: 'Profile',
+        },
+        cell: ({ row }) => row.original.timezone || noValue,
+      },
+      {
+        accessorKey: 'linkedInUrl',
+        header: t('customers.people.detail.fields.linkedIn', 'LinkedIn'),
+        meta: {
+          columnChooserGroup: 'Socials',
+          hidden: true,
+          filterKey: 'person_profile.linked_in_url',
+          filterGroup: 'Socials',
+        },
+        cell: ({ row }) => row.original.linkedInUrl || noValue,
+      },
+      {
+        accessorKey: 'twitterUrl',
+        header: t('customers.people.detail.fields.twitter', 'Twitter'),
+        meta: {
+          columnChooserGroup: 'Socials',
+          hidden: true,
+          filterKey: 'person_profile.twitter_url',
+          filterGroup: 'Socials',
+        },
+        cell: ({ row }) => row.original.twitterUrl || noValue,
+      },
+      {
+        accessorKey: 'description',
+        header: t('customers.people.form.description', 'Description'),
+        meta: {
+          columnChooserGroup: 'Notes',
+          hidden: true,
+          filterKey: 'description',
+          filterGroup: 'Notes',
+        },
+        cell: ({ row }) => row.original.description || noValue,
       },
     ]
 
-    const customColumns = filterCustomFieldDefs(customFieldDefs, 'list').map<ColumnDef<PersonRow>>((def) => ({
-      accessorKey: `cf_${def.key}`,
-      header: def.label || def.key,
-      cell: ({ getValue }) => renderCustomFieldCell(getValue()),
-    }))
+    const customColumns = customFieldDefs
+      .filter((def) => supportsCustomFieldColumn(def))
+      .map<ColumnDef<PersonRow>>((def) => ({
+        accessorKey: `cf_${def.key}`,
+        header: def.label || def.key,
+        enableSorting: true,
+        meta: {
+          columnChooserGroup: def.group?.title ?? 'Custom Fields',
+          filterGroup: def.group?.title ?? 'Custom Fields',
+          filterType: mapCustomFieldKindToFilterType(def.kind),
+          filterOptions: normalizeCustomFieldFilterOptions(def.options),
+          hidden: def.listVisible === false,
+          maxWidth: '220px',
+        },
+        cell: ({ getValue }) => renderCustomFieldCell(getValue()),
+      }))
 
     return [...baseColumns, ...customColumns]
-  }, [customFieldDefs, dictionaryMaps, t])
+  }, [customFieldDefs, dictionaryMaps, dictionaryOptions, loadOwnerFilterOptions, resolvedOwnerFilterOptions, t])
+
+  const { advancedFilterFields } = useAutoDiscoveredFields({ columns, customFieldDefs })
+
+  // Sync auto-discovered fields into the `filterPanel` declared at the top of
+  // the component. See the comment on the `panelFields` state for why this
+  // late-binding is safe. Bail out by content (field-key list) — every render
+  // of `useAutoDiscoveredFields` produces fresh `FilterFieldDef` object refs
+  // even when the set of fields hasn't actually changed, so a naive reference
+  // setState would loop ("Maximum update depth exceeded").
+  React.useEffect(() => {
+    setPanelFields((prev) => {
+      if (prev === advancedFilterFields) return prev
+      if (prev.length === advancedFilterFields.length) {
+        let same = true
+        for (let i = 0; i < prev.length; i++) {
+          if (prev[i].key !== advancedFilterFields[i].key) { same = false; break }
+        }
+        if (same) return prev
+      }
+      return advancedFilterFields
+    })
+  }, [advancedFilterFields])
+
+  const peoplePresets = React.useMemo<FilterPreset[]>(() => makePeoplePresets(), [])
 
   return (
     <Page>
       <PageBody>
         <DataTable<PersonRow>
+          stickyFirstColumn
+          stickyActionsColumn
           title={t('customers.people.list.title')}
           refreshButton={{
             label: t('customers.people.list.actions.refresh'),
@@ -603,30 +907,39 @@ export default function CustomersPeoplePage() {
             </Button>
           )}
           columns={columns}
+          columnChooser={{ auto: true }}
           data={rows}
           exporter={exportConfig}
           searchValue={search}
           onSearchChange={(value) => { setSearch(value); setPage(1) }}
           searchPlaceholder={t('customers.people.list.searchPlaceholder')}
-          filters={filters}
-          filterValues={filterValues}
-          onFiltersApply={handleFiltersApply}
-          onFiltersClear={handleFiltersClear}
           entityIds={[E.customers.customer_entity, E.customers.customer_person_profile]}
           perspective={{ tableId: 'customers.people.list' }}
-          onRowClick={(row) => router.push(`/backend/customers/people/${row.id}`)}
+          onRowClick={(row) => router.push(`/backend/customers/people-v2/${row.id}`)}
+          sortable
+          manualSorting
+          sorting={sorting}
+          onSortingChange={handleSortingChange}
+          bulkActions={[
+            {
+              id: 'delete',
+              label: t('customers.people.list.bulkDelete.action', 'Delete selected'),
+              destructive: true,
+              onExecute: handleBulkDelete,
+            },
+          ]}
           rowActions={(row) => (
             <RowActions
               items={[
                 {
                   id: 'view',
                   label: t('customers.people.list.actions.view'),
-                  onSelect: () => { router.push(`/backend/customers/people/${row.id}`) },
+                  onSelect: () => { router.push(`/backend/customers/people-v2/${row.id}`) },
                 },
                 {
                   id: 'open-new-tab',
                   label: t('customers.people.list.actions.openInNewTab'),
-                  onSelect: () => window.open(`/backend/customers/people/${row.id}`, '_blank', 'noopener'),
+                  onSelect: () => window.open(`/backend/customers/people-v2/${row.id}`, '_blank', 'noopener'),
                 },
                 {
                   id: 'delete',
@@ -637,8 +950,61 @@ export default function CustomersPeoplePage() {
               ]}
             />
           )}
-          pagination={{ page, pageSize, total, totalPages, onPageChange: setPage, cacheStatus }}
+          advancedFilter={{
+            auto: true,
+            value: filterPanel.tree,
+            onChange: filterPanel.setTree,
+            onApply: () => filterPanel.flush(),
+            onClear: handleAdvancedFilterClear,
+            triggerRef: filtersTriggerRef,
+            externalPopover: true,
+            onTriggerClick: () => setFiltersOpen((prev) => !prev),
+            onApplyTree: (tree) => {
+              filterPanel.replaceTree(tree)
+              setPage(1)
+            },
+          }}
+          activeFilterChips={(
+            <ActiveFilterChips
+              tree={filterPanel.appliedTree}
+              fields={advancedFilterFields}
+              popoverOpen={filtersOpen}
+              onRemoveNode={(id) => filterPanel.dispatch({ type: 'removeNode', nodeId: id })}
+              onOpen={() => setFiltersOpen(true)}
+            />
+          )}
+          filterAwareEmptyState={{
+            active: advancedFilterState.root.children.length > 0,
+            entityNamePlural: t('customers.people.entityPlural', 'people'),
+            canRemoveLast: filterPanel.tree.root.children.length > 0,
+            onClearAll: handleAdvancedFilterClear,
+            onRemoveLast: () => filterPanel.dispatch({ type: 'removeLast' }),
+          }}
+          emptyState={(
+            <ListEmptyState
+              entityName={t('customers.people.entityPlural', 'people')}
+              createHref="/backend/customers/people/create"
+              createLabel={t('customers.people.list.actions.new')}
+            />
+          )}
+          virtualized
+          pagination={{ page, pageSize, total, totalPages, onPageChange: setPage, cacheStatus, pageSizeOptions: [10, 25, 50, 100], onPageSizeChange: handlePageSizeChange }}
           isLoading={isLoading}
+        />
+        <AdvancedFilterPanel
+          fields={advancedFilterFields}
+          value={filterPanel.tree}
+          onChange={filterPanel.setTree}
+          onApply={filterPanel.flush}
+          onClear={handleAdvancedFilterClear}
+          onFlush={filterPanel.flush}
+          pendingErrors={filterPanel.pendingErrors}
+          userId={currentUserId}
+          presets={peoplePresets}
+          open={filtersOpen}
+          onOpenChange={setFiltersOpen}
+          triggerRef={filtersTriggerRef}
+          savedFilterStorageKey="customers.people.list"
         />
       </PageBody>
       {ConfirmDialogElement}

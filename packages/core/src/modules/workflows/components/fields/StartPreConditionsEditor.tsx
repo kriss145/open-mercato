@@ -11,8 +11,11 @@ import { BusinessRulesSelector, type BusinessRule } from '../BusinessRulesSelect
 import { apiFetch } from '@open-mercato/ui/backend/utils/api'
 import { EmptyState } from '@open-mercato/ui/backend/EmptyState'
 import { Spinner } from '@open-mercato/ui/primitives/spinner'
-import { Switch } from '@open-mercato/ui/primitives/switch'
+import { SwitchField } from '@open-mercato/ui/primitives/switch-field'
 import { ConfirmDialog } from '@open-mercato/ui/backend/confirm-dialog'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('workflows')
 
 /**
  * StartPreCondition interface matching the schema in validators.ts
@@ -180,7 +183,7 @@ export function StartPreConditionsEditor({
         })
       }
     } catch (err) {
-      console.error(`Failed to fetch rule details for ${ruleId}:`, err)
+      logger.error('Failed to fetch rule details', { ruleId, err })
       setConditionsWithDetails((prev) => {
         const updated = [...prev]
         if (updated[index]) {
@@ -341,17 +344,14 @@ export function StartPreConditionsEditor({
               </div>
 
               {/* Required toggle */}
-              <div className="flex items-center gap-2">
-                <Switch
-                  id={`precondition-${index}-required`}
-                  checked={conditions[index]?.required ?? true}
-                  onCheckedChange={(checked) => updateCondition(index, { required: checked })}
-                  disabled={disabled}
-                />
-                <Label htmlFor={`precondition-${index}-required`} className="text-xs font-medium cursor-pointer">
-                  {t('workflows.fieldEditors.preConditions.requiredLabel')}
-                </Label>
-              </div>
+              <SwitchField
+                id={`precondition-${index}-required`}
+                label={t('workflows.fieldEditors.preConditions.requiredLabel')}
+                flip
+                checked={conditions[index]?.required ?? true}
+                onCheckedChange={(checked) => updateCondition(index, { required: checked })}
+                disabled={disabled}
+              />
 
               {/* Validation Messages */}
               <div>

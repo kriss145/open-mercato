@@ -12,10 +12,20 @@ async function writeTestFile(projectRoot: string, relativePath: string, content 
 describe('integration discovery', () => {
   let tempRoot = ''
   const previousEnterpriseFlag = process.env.OM_ENABLE_ENTERPRISE_MODULES
+  const testEnvKeys = [
+    'OM_TEST_DISCOVERY_AI_KEY',
+    'OM_TEST_DISCOVERY_FALLBACK_AI_KEY',
+    'OM_TEST_DISCOVERY_REQUIRED_KEY',
+  ] as const
+  const previousTestEnvValues = new Map<string, string | undefined>()
 
   beforeEach(async () => {
     tempRoot = await mkdtemp(path.join(os.tmpdir(), 'om-integration-discovery-'))
     delete process.env.OM_ENABLE_ENTERPRISE_MODULES
+    for (const key of testEnvKeys) {
+      previousTestEnvValues.set(key, process.env[key])
+      delete process.env[key]
+    }
   })
 
   afterEach(async () => {
@@ -27,6 +37,15 @@ describe('integration discovery', () => {
     } else {
       process.env.OM_ENABLE_ENTERPRISE_MODULES = previousEnterpriseFlag
     }
+    for (const key of testEnvKeys) {
+      const previousValue = previousTestEnvValues.get(key)
+      if (previousValue === undefined) {
+        delete process.env[key]
+      } else {
+        process.env[key] = previousValue
+      }
+    }
+    previousTestEnvValues.clear()
   })
 
   it('applies folder and per-test metadata dependencies', async () => {
@@ -107,6 +126,85 @@ describe('integration discovery', () => {
     const discovered = discoverIntegrationSpecFiles(tempRoot, path.join(tempRoot, '.ai', 'qa', 'tests'))
     expect(discovered.map((entry) => entry.path)).toEqual([
       'packages/create-app/template/src/modules/auth/__integration__/TC-AUTH-001.spec.ts',
+    ])
+  })
+
+  it('discovers standalone app integration tests from src/modules', async () => {
+    await writeTestFile(tempRoot, 'src/modules/auth/.gitkeep')
+    await writeTestFile(tempRoot, 'src/modules/sales/.gitkeep')
+    await writeTestFile(
+      tempRoot,
+      'src/modules/sales/__integration__/TC-SALES-020.spec.ts',
+      'export {}\n',
+    )
+
+    const discovered = discoverIntegrationSpecFiles(tempRoot, path.join(tempRoot, '.ai', 'qa', 'tests'))
+    expect(discovered.map((entry) => entry.path)).toEqual([
+      'src/modules/sales/__integration__/TC-SALES-020.spec.ts',
+    ])
+  })
+
+  it('discovers standalone package integration tests from node_modules/@open-mercato', async () => {
+    await writeTestFile(tempRoot, 'src/modules/customers/.gitkeep')
+    await writeTestFile(tempRoot, 'node_modules/@open-mercato/core/src/modules/customers/.gitkeep')
+    await writeTestFile(
+      tempRoot,
+      'node_modules/@open-mercato/core/src/modules/customers/__integration__/TC-CRM-020.spec.ts',
+      'export {}\n',
+    )
+
+    const discovered = discoverIntegrationSpecFiles(tempRoot, path.join(tempRoot, '.ai', 'qa', 'tests'))
+    expect(discovered.map((entry) => entry.path)).toEqual([
+      'node_modules/@open-mercato/core/src/modules/customers/__integration__/TC-CRM-020.spec.ts',
+    ])
+  })
+
+  it('applies folder and per-test metadata environment requirements', async () => {
+    await writeTestFile(tempRoot, 'packages/ai-assistant/src/modules/ai_assistant/.gitkeep')
+    await writeTestFile(
+      tempRoot,
+      'packages/ai-assistant/src/modules/ai_assistant/__integration__/TC-AI-001.spec.ts',
+      'export {}\n',
+    )
+    await writeTestFile(
+      tempRoot,
+      'packages/ai-assistant/src/modules/ai_assistant/__integration__/TC-AI-002.spec.ts',
+      'export {}\n',
+    )
+    await writeTestFile(
+      tempRoot,
+      'packages/ai-assistant/src/modules/ai_assistant/__integration__/TC-AI-002.meta.ts',
+      "export const integrationMeta = { requiredAnyEnvVars: ['OM_TEST_DISCOVERY_AI_KEY', 'OM_TEST_DISCOVERY_FALLBACK_AI_KEY'] }\n",
+    )
+    await writeTestFile(
+      tempRoot,
+      'packages/ai-assistant/src/modules/ai_assistant/__integration__/live/meta.ts',
+      "export const integrationMeta = { requiredEnvVars: ['OM_TEST_DISCOVERY_REQUIRED_KEY'] }\n",
+    )
+    await writeTestFile(
+      tempRoot,
+      'packages/ai-assistant/src/modules/ai_assistant/__integration__/live/TC-AI-003.spec.ts',
+      'export {}\n',
+    )
+
+    let discovered = discoverIntegrationSpecFiles(tempRoot, path.join(tempRoot, '.ai', 'qa', 'tests'))
+    expect(discovered.map((entry) => entry.path)).toEqual([
+      'packages/ai-assistant/src/modules/ai_assistant/__integration__/TC-AI-001.spec.ts',
+    ])
+
+    process.env.OM_TEST_DISCOVERY_FALLBACK_AI_KEY = 'test-key'
+    discovered = discoverIntegrationSpecFiles(tempRoot, path.join(tempRoot, '.ai', 'qa', 'tests'))
+    expect(discovered.map((entry) => entry.path)).toEqual([
+      'packages/ai-assistant/src/modules/ai_assistant/__integration__/TC-AI-001.spec.ts',
+      'packages/ai-assistant/src/modules/ai_assistant/__integration__/TC-AI-002.spec.ts',
+    ])
+
+    process.env.OM_TEST_DISCOVERY_REQUIRED_KEY = 'required-key'
+    discovered = discoverIntegrationSpecFiles(tempRoot, path.join(tempRoot, '.ai', 'qa', 'tests'))
+    expect(discovered.map((entry) => entry.path)).toEqual([
+      'packages/ai-assistant/src/modules/ai_assistant/__integration__/live/TC-AI-003.spec.ts',
+      'packages/ai-assistant/src/modules/ai_assistant/__integration__/TC-AI-001.spec.ts',
+      'packages/ai-assistant/src/modules/ai_assistant/__integration__/TC-AI-002.spec.ts',
     ])
   })
 })

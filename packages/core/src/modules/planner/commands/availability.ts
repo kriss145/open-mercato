@@ -10,9 +10,19 @@ import {
   type PlannerAvailabilityRuleCreateInput,
   type PlannerAvailabilityRuleUpdateInput,
 } from '../data/validators'
-import { ensureOrganizationScope, ensureTenantScope } from './shared'
+import {
+  applyScopeToWhere,
+  commandActorScope,
+  ensureOrganizationScope,
+  ensureTenantScope,
+  explicitPlannerCommandScope,
+  extractUndoPayload,
+  type PlannerCommandScope,
+} from './shared'
 import type { PlannerAvailabilityKind, PlannerAvailabilitySubjectType } from '../data/entities'
-import { extractUndoPayload } from './shared'
+import { resolveRedoSnapshot } from '@open-mercato/shared/lib/commands/redo'
+
+const AVAILABILITY_RULE_RESOURCE_KIND = 'planner.availability.rule'
 
 type AvailabilityRuleSnapshot = {
   id: string
@@ -35,8 +45,15 @@ type AvailabilityRuleUndoPayload = {
   after?: AvailabilityRuleSnapshot | null
 }
 
-async function loadAvailabilityRuleSnapshot(em: EntityManager, id: string): Promise<AvailabilityRuleSnapshot | null> {
-  const record = await em.findOne(PlannerAvailabilityRule, { id })
+async function loadAvailabilityRuleSnapshot(
+  em: EntityManager,
+  id: string,
+  scope: PlannerCommandScope,
+): Promise<AvailabilityRuleSnapshot | null> {
+  const record = await em.findOne(
+    PlannerAvailabilityRule,
+    applyScopeToWhere<PlannerAvailabilityRule>({ id }, scope),
+  )
   if (!record) return null
   return {
     id: record.id,
@@ -122,16 +139,20 @@ const createAvailabilityRuleCommand: CommandHandler<PlannerAvailabilityRuleCreat
     await em.flush()
     return { ruleId: record.id }
   },
-  captureAfter: async (_input, result, ctx) => {
+  captureAfter: async (input, result, ctx) => {
     const em = (ctx.container.resolve('em') as EntityManager).fork()
-    return loadAvailabilityRuleSnapshot(em, result.ruleId)
+    return loadAvailabilityRuleSnapshot(
+      em,
+      result.ruleId,
+      explicitPlannerCommandScope(input.tenantId, input.organizationId),
+    )
   },
   buildLog: async ({ input, result, ctx, snapshots }) => {
     const snapshot = snapshots.after as AvailabilityRuleSnapshot | undefined
     const { translate } = await resolveTranslations()
     return {
       actionLabel: translate('planner.audit.availability.create', 'Create availability rule'),
-      resourceKind: 'planner.availability',
+      resourceKind: AVAILABILITY_RULE_RESOURCE_KIND,
       resourceId: result?.ruleId ?? null,
       tenantId: input?.tenantId ?? ctx.auth?.tenantId ?? null,
       organizationId: input?.organizationId ?? ctx.selectedOrganizationId ?? ctx.auth?.orgId ?? null,
@@ -153,6 +174,14 @@ const createAvailabilityRuleCommand: CommandHandler<PlannerAvailabilityRuleCreat
       await em.flush()
     }
   },
+  redo: async ({ logEntry, ctx }) => {
+    const after = resolveRedoSnapshot<AvailabilityRuleSnapshot>(logEntry)
+    if (!after) throw new CrudHttpError(400, { error: '[internal] redo snapshot unavailable for availability rule create' })
+    const em = (ctx.container.resolve('em') as EntityManager).fork()
+    await restoreAvailabilityRuleFromSnapshot(em, { ...after, deletedAt: null })
+    await em.flush()
+    return { ruleId: after.id }
+  },
 }
 
 const updateAvailabilityRuleCommand: CommandHandler<PlannerAvailabilityRuleUpdateInput, { ruleId: string }> = {
@@ -160,13 +189,19 @@ const updateAvailabilityRuleCommand: CommandHandler<PlannerAvailabilityRuleUpdat
   async prepare(input, ctx) {
     const parsed = plannerAvailabilityRuleUpdateSchema.parse(input)
     const em = (ctx.container.resolve('em') as EntityManager)
-    const snapshot = await loadAvailabilityRuleSnapshot(em, parsed.id)
+    const snapshot = await loadAvailabilityRuleSnapshot(em, parsed.id, commandActorScope(ctx))
     return snapshot ? { before: snapshot } : {}
   },
   async execute(input, ctx) {
     const parsed = plannerAvailabilityRuleUpdateSchema.parse(input)
     const em = (ctx.container.resolve('em') as EntityManager).fork()
-    const record = await em.findOne(PlannerAvailabilityRule, { id: parsed.id, deletedAt: null })
+    const record = await em.findOne(
+      PlannerAvailabilityRule,
+      applyScopeToWhere<PlannerAvailabilityRule>(
+        { id: parsed.id, deletedAt: null },
+        commandActorScope(ctx),
+      ),
+    )
     if (!record) throw new CrudHttpError(404, { error: 'Planner availability rule not found.' })
     ensureTenantScope(ctx, record.tenantId)
     ensureOrganizationScope(ctx, record.organizationId)
@@ -197,11 +232,17 @@ const updateAvailabilityRuleCommand: CommandHandler<PlannerAvailabilityRuleUpdat
   buildLog: async ({ snapshots, input, result, ctx }) => {
     const before = snapshots.before as AvailabilityRuleSnapshot | undefined
     const em = (ctx.container.resolve('em') as EntityManager).fork()
-    const afterSnapshot = before ? await loadAvailabilityRuleSnapshot(em, before.id) : null
+    const afterSnapshot = before
+      ? await loadAvailabilityRuleSnapshot(
+          em,
+          before.id,
+          explicitPlannerCommandScope(before.tenantId, before.organizationId),
+        )
+      : null
     const { translate } = await resolveTranslations()
     return {
       actionLabel: translate('planner.audit.availability.update', 'Update availability rule'),
-      resourceKind: 'planner.availability',
+      resourceKind: AVAILABILITY_RULE_RESOURCE_KIND,
       resourceId: result?.ruleId ?? input?.id ?? null,
       tenantId: ctx.auth?.tenantId ?? null,
       organizationId: ctx.selectedOrganizationId ?? ctx.auth?.orgId ?? null,
@@ -231,14 +272,17 @@ const deleteAvailabilityRuleCommand: CommandHandler<{ id?: string }, { ruleId: s
     const id = input?.id
     if (!id) return {}
     const em = (ctx.container.resolve('em') as EntityManager)
-    const snapshot = await loadAvailabilityRuleSnapshot(em, id)
+    const snapshot = await loadAvailabilityRuleSnapshot(em, id, commandActorScope(ctx))
     return snapshot ? { before: snapshot } : {}
   },
   async execute(input, ctx) {
     const id = input?.id
     if (!id) throw new CrudHttpError(400, { error: 'Availability rule id is required.' })
     const em = (ctx.container.resolve('em') as EntityManager).fork()
-    const record = await em.findOne(PlannerAvailabilityRule, { id, deletedAt: null })
+    const record = await em.findOne(
+      PlannerAvailabilityRule,
+      applyScopeToWhere<PlannerAvailabilityRule>({ id, deletedAt: null }, commandActorScope(ctx)),
+    )
     if (!record) return { ruleId: id }
     ensureTenantScope(ctx, record.tenantId)
     ensureOrganizationScope(ctx, record.organizationId)
@@ -251,7 +295,7 @@ const deleteAvailabilityRuleCommand: CommandHandler<{ id?: string }, { ruleId: s
     const { translate } = await resolveTranslations()
     return {
       actionLabel: translate('planner.audit.availability.delete', 'Delete availability rule'),
-      resourceKind: 'planner.availability',
+      resourceKind: AVAILABILITY_RULE_RESOURCE_KIND,
       resourceId: result?.ruleId ?? input?.id ?? null,
       tenantId: ctx.auth?.tenantId ?? null,
       organizationId: ctx.selectedOrganizationId ?? ctx.auth?.orgId ?? null,

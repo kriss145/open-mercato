@@ -1,24 +1,31 @@
 import type { EntityManager } from '@mikro-orm/postgresql'
 import type { CommandBus } from '@open-mercato/shared/lib/commands/command-bus'
 import type { OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi/types'
+import { isCrudHttpError } from '@open-mercato/shared/lib/crud/errors'
+import { enforceCommandOptimisticLock } from '@open-mercato/shared/lib/crud/optimistic-lock-command'
 import { findOneWithDecryption, findWithDecryption } from '@open-mercato/shared/lib/encryption/find'
 import { User } from '../../../auth/data/entities'
 import { Message, MessageObject, MessageRecipient } from '../../data/entities'
 import { updateDraftSchema } from '../../data/validators'
 import { buildResolvedMessageActions } from '../../lib/actions'
+import { MESSAGE_OPTIMISTIC_LOCK_RESOURCE_KIND } from '../../lib/constants'
 import { getMessageObjectType } from '../../lib/message-objects-registry'
 import { getMessageTypeOrDefault } from '../../lib/message-types-registry'
 import { attachOperationMetadataHeader } from '../../lib/operationMetadata'
 import { hasOrganizationAccess, resolveMessageContext } from '../../lib/routeHelpers'
+import { resolveUserFeatures, runMessageMutationGuardAfterSuccess, runMessageMutationGuards } from '../guards'
 import {
   errorResponseSchema,
   messageDetailResponseSchema,
   okResponseSchema,
   updateDraftSchema as updateDraftOpenApiSchema,
 } from '../openapi'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('messages').child({ component: 'api' })
 
 export const metadata = {
-  GET: { requireAuth: true, requireFeatures: ['messages.view'] },
+  GET: { requireAuth: true },
   PATCH: { requireAuth: true, requireFeatures: ['messages.compose'] },
   DELETE: { requireAuth: true, requireFeatures: ['messages.view'] },
 }
@@ -38,11 +45,17 @@ export async function GET(req: Request, { params }: { params: { id: string } }) 
   const skipMarkReadParam = url.searchParams.get('skipMarkRead')
   const skipMarkRead = skipMarkReadParam === '1'
 
-  const message = await em.findOne(Message, {
-    id: params.id,
-    tenantId: scope.tenantId,
-    deletedAt: null,
-  })
+  const message = await findOneWithDecryption(
+    em,
+    Message,
+    {
+      id: params.id,
+      tenantId: scope.tenantId,
+      deletedAt: null,
+    },
+    undefined,
+    { tenantId: scope.tenantId, organizationId: scope.organizationId },
+  )
 
   if (!message) {
     return Response.json({ error: 'Message not found' }, { status: 404 })
@@ -65,25 +78,8 @@ export async function GET(req: Request, { params }: { params: { id: string } }) 
     return Response.json({ error: 'Access denied' }, { status: 403 })
   }
 
-  if (!skipMarkRead && recipient && recipient.status === 'unread') {
-    const commandBus = ctx.container.resolve('commandBus') as CommandBus
-    await commandBus.execute('messages.recipients.mark_read', {
-      input: {
-        messageId: params.id,
-        tenantId: scope.tenantId,
-        organizationId: scope.organizationId,
-        userId: scope.userId,
-      },
-      ctx: {
-        container: ctx.container,
-        auth: ctx.auth ?? null,
-        organizationScope: null,
-        selectedOrganizationId: scope.organizationId,
-        organizationIds: scope.organizationId ? [scope.organizationId] : null,
-        request: req,
-      },
-    })
-  }
+  const autoMarkRead = !skipMarkRead && recipient?.status === 'unread'
+  const readAt = autoMarkRead ? new Date() : recipient?.readAt ?? null
 
   const objects = await em.find(MessageObject, { messageId: params.id })
   const objectPreviews = await Promise.all(
@@ -96,17 +92,15 @@ export async function GET(req: Request, { params }: { params: { id: string } }) 
           organizationId: scope.organizationId,
         })
       } catch (error) {
-        console.error(
-          `[messages] Failed to load preview for ${item.entityModule}:${item.entityType}:${item.entityId}`,
-          error,
-        )
+        logger.error('Failed to load preview', { entityModule: item.entityModule, entityType: item.entityType, entityId: item.entityId, err: error })
         return null
       }
     }),
   )
   const allRecipients = await em.find(MessageRecipient, { messageId: params.id, deletedAt: null })
 
-  const threadMessages = await em.find(
+  const threadMessages = await findWithDecryption(
+    em,
     Message,
     {
       threadId: message.threadId ?? message.id,
@@ -115,7 +109,8 @@ export async function GET(req: Request, { params }: { params: { id: string } }) 
       deletedAt: null,
       isDraft: false,
     },
-    { orderBy: { sentAt: 'ASC' } }
+    { orderBy: { sentAt: 'ASC' } },
+    { tenantId: scope.tenantId, organizationId: scope.organizationId },
   )
   const threadMessageIds = threadMessages.map((item) => item.id)
   const visibleRecipientRows = threadMessageIds.length > 0
@@ -129,6 +124,19 @@ export async function GET(req: Request, { params }: { params: { id: string } }) 
   const actorVisibleThreadMessages = threadMessages.filter((threadMessage) => (
     threadMessage.senderUserId === scope.userId || visibleRecipientMessageIds.has(threadMessage.id)
   ))
+
+  const actorRecipientStatusByMessageId = new Map<string, string>()
+  for (const row of visibleRecipientRows) {
+    actorRecipientStatusByMessageId.set(row.messageId, row.status)
+  }
+  if (recipient) {
+    actorRecipientStatusByMessageId.set(params.id, autoMarkRead ? 'read' : recipient.status)
+  }
+  const actorRecipientStatuses = Array.from(actorRecipientStatusByMessageId.values())
+  const conversationArchived = actorRecipientStatuses.length > 0
+    && actorRecipientStatuses.every((status) => status === 'archived')
+  const conversationAllUnread = actorRecipientStatuses.length > 0
+    && actorRecipientStatuses.every((status) => status === 'unread')
 
   const threadSenderIds = actorVisibleThreadMessages
     .map((threadMessage) => threadMessage.senderUserId)
@@ -162,11 +170,34 @@ export async function GET(req: Request, { params }: { params: { id: string } }) 
   const messageType = getMessageTypeOrDefault(message.type)
   const resolvedActionData = buildResolvedMessageActions(message, objects)
 
+  if (autoMarkRead) {
+    const commandBus = ctx.container.resolve('commandBus') as CommandBus
+    await commandBus.execute('messages.recipients.mark_read', {
+      input: {
+        messageId: params.id,
+        tenantId: scope.tenantId,
+        organizationId: scope.organizationId,
+        userId: scope.userId,
+      },
+      ctx: {
+        container: ctx.container,
+        auth: ctx.auth ?? null,
+        organizationScope: null,
+        selectedOrganizationId: scope.organizationId,
+        organizationIds: scope.organizationId ? [scope.organizationId] : null,
+        request: req,
+      },
+    })
+  }
+
   return Response.json({
     id: message.id,
+    updatedAt: message.updatedAt ?? null,
     type: message.type,
     isDraft: message.isDraft,
     canEditDraft: message.isDraft && message.senderUserId === scope.userId,
+    canArchive: Boolean(recipient),
+    isArchived: recipient?.status === 'archived',
     visibility: message.visibility,
     sourceEntityType: message.sourceEntityType,
     sourceEntityId: message.sourceEntityId,
@@ -201,8 +232,8 @@ export async function GET(req: Request, { params }: { params: { id: string } }) 
     recipients: allRecipients.map((item) => ({
       userId: item.recipientUserId,
       type: item.recipientType,
-      status: item.status,
-      readAt: item.readAt,
+      status: autoMarkRead && item.recipientUserId === scope.userId ? 'read' : item.status,
+      readAt: autoMarkRead && item.recipientUserId === scope.userId ? readAt : item.readAt,
     })),
     objects: objects.map((item, index) => ({
       id: item.id,
@@ -231,7 +262,9 @@ export async function GET(req: Request, { params }: { params: { id: string } }) 
         sentAt: threadMessage.sentAt,
       }
     }),
-    isRead: recipient ? recipient.status !== 'unread' : true,
+    isRead: recipient ? (autoMarkRead || recipient.status !== 'unread') : true,
+    conversationArchived,
+    conversationAllUnread,
   })
 }
 
@@ -264,7 +297,38 @@ export async function PATCH(req: Request, { params }: { params: { id: string } }
     return Response.json({ error: 'Only draft messages can be edited' }, { status: 409 })
   }
 
+  const guardResult = await runMessageMutationGuards(
+    ctx.container,
+    {
+      tenantId: scope.tenantId,
+      organizationId: scope.organizationId,
+      userId: scope.userId,
+      resourceKind: 'messages.message',
+      resourceId: message.id,
+      operation: 'update',
+      requestMethod: req.method,
+      requestHeaders: req.headers,
+      mutationPayload: input as Record<string, unknown>,
+    },
+    resolveUserFeatures(ctx.auth),
+  )
+  if (!guardResult.ok) {
+    return Response.json(
+      guardResult.errorBody ?? { error: 'Operation blocked by guard' },
+      { status: guardResult.errorStatus ?? 422 },
+    )
+  }
+
   try {
+    // Reject stale draft edits/sends before mutating: compare the client's
+    // expected version (extension header) against the loaded draft.
+    enforceCommandOptimisticLock({
+      resourceKind: MESSAGE_OPTIMISTIC_LOCK_RESOURCE_KIND,
+      resourceId: message.id,
+      current: message.updatedAt,
+      request: req,
+    })
+
     const { logEntry } = await commandBus.execute('messages.messages.update_draft', {
       input: {
         ...input,
@@ -288,8 +352,21 @@ export async function PATCH(req: Request, { params }: { params: { id: string } }
       resourceKind: 'messages.message',
       resourceId: message.id,
     })
+    await runMessageMutationGuardAfterSuccess(guardResult.afterSuccessCallbacks, {
+      tenantId: scope.tenantId,
+      organizationId: scope.organizationId,
+      userId: scope.userId,
+      resourceKind: 'messages.message',
+      resourceId: message.id,
+      operation: 'update',
+      requestMethod: req.method,
+      requestHeaders: req.headers,
+    })
     return response
   } catch (error) {
+    if (isCrudHttpError(error)) {
+      return Response.json(error.body, { status: error.status })
+    }
     if (error instanceof Error) {
       if (error.message === 'Message type cannot be created by users') {
         return Response.json({ error: error.message }, { status: 400 })
@@ -325,7 +402,38 @@ export async function DELETE(req: Request, { params }: { params: { id: string } 
     return Response.json({ error: 'Access denied' }, { status: 403 })
   }
 
+  const guardResult = await runMessageMutationGuards(
+    ctx.container,
+    {
+      tenantId: scope.tenantId,
+      organizationId: scope.organizationId,
+      userId: scope.userId,
+      resourceKind: 'messages.message',
+      resourceId: params.id,
+      operation: 'delete',
+      requestMethod: req.method,
+      requestHeaders: req.headers,
+      mutationPayload: null,
+    },
+    resolveUserFeatures(ctx.auth),
+  )
+  if (!guardResult.ok) {
+    return Response.json(
+      guardResult.errorBody ?? { error: 'Operation blocked by guard' },
+      { status: guardResult.errorStatus ?? 422 },
+    )
+  }
+
   try {
+    // Reject a stale delete before mutating: a tab that loaded an older version
+    // of the message must refresh rather than silently delete a changed record.
+    enforceCommandOptimisticLock({
+      resourceKind: MESSAGE_OPTIMISTIC_LOCK_RESOURCE_KIND,
+      resourceId: message.id,
+      current: message.updatedAt,
+      request: req,
+    })
+
     const { logEntry } = await commandBus.execute('messages.messages.delete_for_actor', {
       input: {
         messageId: params.id,
@@ -348,8 +456,21 @@ export async function DELETE(req: Request, { params }: { params: { id: string } 
       resourceKind: 'messages.message',
       resourceId: params.id,
     })
+    await runMessageMutationGuardAfterSuccess(guardResult.afterSuccessCallbacks, {
+      tenantId: scope.tenantId,
+      organizationId: scope.organizationId,
+      userId: scope.userId,
+      resourceKind: 'messages.message',
+      resourceId: params.id,
+      operation: 'delete',
+      requestMethod: req.method,
+      requestHeaders: req.headers,
+    })
     return response
   } catch (error) {
+    if (isCrudHttpError(error)) {
+      return Response.json(error.body, { status: error.status })
+    }
     if (error instanceof Error && error.message === 'Access denied') {
       return Response.json({ error: 'Access denied' }, { status: 403 })
     }
@@ -384,7 +505,7 @@ export const openApi: OpenApiRouteDoc = {
       errors: [
         { status: 403, description: 'Access denied', schema: errorResponseSchema },
         { status: 404, description: 'Message not found', schema: errorResponseSchema },
-        { status: 409, description: 'Only drafts can be edited', schema: errorResponseSchema },
+        { status: 409, description: 'Only drafts can be edited, or the draft was modified concurrently (optimistic lock conflict)', schema: errorResponseSchema },
       ],
     },
     DELETE: {
@@ -395,6 +516,7 @@ export const openApi: OpenApiRouteDoc = {
       errors: [
         { status: 403, description: 'Access denied', schema: errorResponseSchema },
         { status: 404, description: 'Message not found', schema: errorResponseSchema },
+        { status: 409, description: 'Message was modified concurrently (optimistic lock conflict)', schema: errorResponseSchema },
       ],
     },
   },

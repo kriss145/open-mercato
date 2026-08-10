@@ -1,12 +1,21 @@
 import type { BootstrapData, BootstrapOptions } from './types'
 import { registerOrmEntities } from '../db/mikro'
-import { registerDiRegistrars } from '../di/container'
+import { registerAppDiRegistrar, registerDiRegistrars } from '../di/container'
 import { registerModules } from '../modules/registry'
 import { registerEntityIds } from '../encryption/entityIds'
 import { registerEntityFields } from '../encryption/entityFields'
 import { registerSearchModuleConfigs } from '../../modules/search'
 import { registerAnalyticsModuleConfigs } from '../../modules/analytics'
+import { registerCodeWorkflowEntries } from '../../modules/workflows/code-registry'
 import { registerResponseEnrichers } from '../crud/enricher-registry'
+import { registerApiInterceptors } from '../crud/interceptor-registry'
+import { registerComponentOverrides } from '../../modules/widgets/component-registry'
+import { registerMutationGuards } from '../crud/mutation-guard-store'
+import { registerCommandInterceptors } from '../commands/command-interceptor-store'
+import { registerCommandLoaders } from '../commands/registry'
+import { registerNotificationHandlers } from '../notifications/handler-registry'
+import { clearRegisteredIntegrations, registerBundles, registerIntegrations } from '../../modules/integrations/types'
+import { applyComponentOverridesToEntries } from '../../modules/overrides'
 
 let _bootstrapped = false
 
@@ -25,6 +34,9 @@ let _asyncRegistrationPromise: Promise<void> | null = null
  */
 export function createBootstrap(data: BootstrapData, options: BootstrapOptions = {}) {
   return function bootstrap(): void {
+    if (options.appDiRegistrar) {
+      registerAppDiRegistrar(options.appDiRegistrar)
+    }
     // In development, always re-run registrations to handle HMR
     // (Module state may be reset when Turbopack reloads packages)
     if (_bootstrapped && process.env.NODE_ENV !== 'development') return
@@ -36,6 +48,15 @@ export function createBootstrap(data: BootstrapData, options: BootstrapOptions =
 
     // === 2. Modules registry (required by i18n, query engine, dashboards, CLI) ===
     registerModules(data.modules)
+    clearRegisteredIntegrations()
+    for (const module of data.modules) {
+      if (module.integrations?.length) {
+        registerIntegrations(module.integrations)
+      }
+      if (module.bundles?.length) {
+        registerBundles(module.bundles)
+      }
+    }
 
     // === 3. Entity IDs (required by encryption, indexing, entity links) ===
     registerEntityIds(data.entityIds)
@@ -55,9 +76,46 @@ export function createBootstrap(data: BootstrapData, options: BootstrapOptions =
       registerAnalyticsModuleConfigs(data.analyticsModuleConfigs)
     }
 
+    // === 6a. Code workflow definitions (so CLI/worker processes resolve them like the app runtime) ===
+    if (data.codeWorkflows?.length) {
+      registerCodeWorkflowEntries(data.codeWorkflows)
+    }
+
     // === 6b. Response enrichers (for CRUD response enrichment) ===
     if (data.enricherEntries) {
       registerResponseEnrichers(data.enricherEntries)
+    }
+
+    // === 6c. API interceptors (for CRUD route interception) ===
+    if (data.interceptorEntries) {
+      registerApiInterceptors(data.interceptorEntries)
+    }
+
+    // === 6d. Component overrides (for page/component replacement) ===
+    if (data.componentOverrideEntries) {
+      const finalEntries = applyComponentOverridesToEntries(data.componentOverrideEntries)
+      const allOverrides = finalEntries.flatMap((entry) => entry.componentOverrides ?? [])
+      registerComponentOverrides(allOverrides)
+    }
+
+    // === 6e. Mutation guards (for CRUD mutation lifecycle) ===
+    if (data.guardEntries) {
+      registerMutationGuards(data.guardEntries)
+    }
+
+    // === 6f. Command interceptors (for command bus lifecycle) ===
+    if (data.commandInterceptorEntries) {
+      registerCommandInterceptors(data.commandInterceptorEntries)
+    }
+
+    // === 6f.1. Command loaders (for lazy command handler registration) ===
+    if (data.commandLoaderEntries) {
+      registerCommandLoaders(data.commandLoaderEntries)
+    }
+
+    // === 6g. Notification handlers (reactive notification side-effects) ===
+    if (data.notificationHandlerEntries) {
+      registerNotificationHandlers(data.notificationHandlerEntries)
     }
 
     // === 7-8. UI Widgets and Optional packages (async to avoid circular deps) ===
@@ -92,6 +150,9 @@ async function registerWidgetsAndOptionalPackages(data: BootstrapData, options: 
     injectionRegistry.registerInjectionWidgets(data.injectionWidgetEntries)
     coreInjection.registerCoreInjectionWidgets(data.injectionWidgetEntries)
     coreInjection.registerCoreInjectionTables(data.injectionTables)
+    coreInjection.registerEnabledModuleIds(
+      data.modules.map((module) => module.id).filter((id): id is string => typeof id === 'string' && id.length > 0),
+    )
   } catch {
     // UI packages may not be available in all contexts
   }

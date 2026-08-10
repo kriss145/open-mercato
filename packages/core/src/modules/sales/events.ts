@@ -10,6 +10,8 @@ const events = [
   { id: 'sales.order.created', label: 'Sales Order Created', entity: 'order', category: 'crud' },
   { id: 'sales.order.updated', label: 'Sales Order Updated', entity: 'order', category: 'crud' },
   { id: 'sales.order.deleted', label: 'Sales Order Deleted', entity: 'order', category: 'crud' },
+  { id: 'sales.order.confirmed', label: 'Sales Order Confirmed', entity: 'order', category: 'lifecycle' },
+  { id: 'sales.order.cancelled', label: 'Sales Order Cancelled', entity: 'order', category: 'lifecycle' },
 
   // Quotes
   { id: 'sales.quote.created', label: 'Quote Created', entity: 'quote', category: 'crud' },
@@ -20,6 +22,11 @@ const events = [
   { id: 'sales.invoice.created', label: 'Invoice Created', entity: 'invoice', category: 'crud' },
   { id: 'sales.invoice.updated', label: 'Invoice Updated', entity: 'invoice', category: 'crud' },
   { id: 'sales.invoice.deleted', label: 'Invoice Deleted', entity: 'invoice', category: 'crud' },
+
+  // Credit Memos
+  { id: 'sales.credit_memo.created', label: 'Credit Memo Created', entity: 'credit_memo', category: 'crud' },
+  { id: 'sales.credit_memo.updated', label: 'Credit Memo Updated', entity: 'credit_memo', category: 'crud' },
+  { id: 'sales.credit_memo.deleted', label: 'Credit Memo Deleted', entity: 'credit_memo', category: 'crud' },
 
   // Order Lines
   { id: 'sales.line.created', label: 'Order Line Created', entity: 'line', category: 'crud' },
@@ -35,6 +42,11 @@ const events = [
   { id: 'sales.shipment.created', label: 'Shipment Created', entity: 'shipment', category: 'crud' },
   { id: 'sales.shipment.updated', label: 'Shipment Updated', entity: 'shipment', category: 'crud' },
   { id: 'sales.shipment.deleted', label: 'Shipment Deleted', entity: 'shipment', category: 'crud' },
+
+  // Returns
+  { id: 'sales.return.created', label: 'Return Created', entity: 'return', category: 'crud' },
+  { id: 'sales.return.updated', label: 'Return Updated', entity: 'return', category: 'crud' },
+  { id: 'sales.return.deleted', label: 'Return Deleted', entity: 'return', category: 'crud' },
 
   // Notes
   { id: 'sales.note.created', label: 'Note Created', entity: 'note', category: 'crud' },

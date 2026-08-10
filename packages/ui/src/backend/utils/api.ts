@@ -3,9 +3,13 @@
 // Used across UI data utilities to avoid duplication.
 import { flash } from '../FlashMessages'
 import { deserializeOperationMetadata } from '@open-mercato/shared/lib/commands/operationMetadata'
+import { readJsonSafe } from '@open-mercato/shared/lib/http/readJsonSafe'
 import { pushOperation } from '../operations/store'
 import { pushPartialIndexWarning } from '../indexes/store'
 import { createScopedHeaderStack } from './scopedHeaderStack'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('ui').child({ component: 'apiFetch' })
 
 const scopedHeaders = createScopedHeaderStack()
 
@@ -18,8 +22,41 @@ function mergeHeaders(base: HeadersInit | undefined, scoped: Record<string, stri
   return headers
 }
 
+function readRedirectOverride(headers: Headers, headerName: string): boolean {
+  return headers.get(headerName) === '0'
+}
+
+function isSameOriginRequest(input: RequestInfo | URL): boolean {
+  if (typeof window === 'undefined') return false
+  const host = window.location?.host
+  if (!host) return false
+  let urlString: string
+  if (typeof input === 'string') urlString = input
+  else if (input instanceof URL) urlString = input.toString()
+  else if (typeof Request !== 'undefined' && input instanceof Request) urlString = input.url
+  else return false
+  if (!/^[a-z][a-z0-9+.-]*:/i.test(urlString)) return true
+  try {
+    return new URL(urlString).host === host
+  } catch {
+    return false
+  }
+}
+
 export async function withScopedApiHeaders<T>(headers: Record<string, string>, run: () => Promise<T>): Promise<T> {
   return scopedHeaders.withScopedHeaders(headers, run)
+}
+
+function readPathname(): string {
+  return typeof window !== 'undefined' ? window.location?.pathname ?? '' : ''
+}
+
+function isLoginPathname(pathname: string): boolean {
+  return pathname.startsWith('/login')
+}
+
+function isPortalPathname(pathname: string): boolean {
+  return /\/[^/]+\/portal(\/|$)/.test(pathname)
 }
 
 export class UnauthorizedError extends Error {
@@ -35,6 +72,8 @@ export function redirectToSessionRefresh() {
   const current = window.location.pathname + window.location.search
   // Avoid redirect loops if already on an auth/session route
   if (window.location.pathname.startsWith('/api/auth')) return
+  // Portal routes have their own customer auth — never redirect to staff login
+  if (/\/[^/]+\/portal(\/|$)/.test(window.location.pathname)) return
   try {
     flash('Session expired. Redirecting to sign in…', 'warning')
     setTimeout(() => {
@@ -47,9 +86,17 @@ export function redirectToSessionRefresh() {
 
 export class ForbiddenError extends Error {
   readonly status = 403
-  constructor(message = 'Forbidden') {
+  readonly requiredFeatures: string[] | null
+  readonly requiredRoles: string[] | null
+
+  constructor(
+    message = 'Forbidden',
+    options?: { requiredFeatures?: string[] | null; requiredRoles?: string[] | null },
+  ) {
     super(message)
     this.name = 'ForbiddenError'
+    this.requiredFeatures = options?.requiredFeatures?.length ? [...options.requiredFeatures] : null
+    this.requiredRoles = options?.requiredRoles?.length ? [...options.requiredRoles] : null
   }
 }
 
@@ -61,29 +108,46 @@ export function setAuthRedirectConfig(cfg: { defaultForbiddenRoles?: readonly st
   }
 }
 
-export function redirectToForbiddenLogin(options?: { requiredRoles?: string[] | null; requiredFeatures?: string[] | null }) {
+function formatForbiddenAccessMessage(options?: { requiredRoles?: string[] | null; requiredFeatures?: string[] | null }): string {
+  const features = options?.requiredFeatures?.filter(Boolean) ?? []
+  const roles = options?.requiredRoles?.filter(Boolean) ?? []
+  const effectiveRoles = roles.length ? roles : DEFAULT_FORBIDDEN_ROLES.filter(Boolean)
+  if (features.length) {
+    return `Access denied: you are missing the required permission "${features.join(', ')}". Contact your administrator.`
+  }
+  if (effectiveRoles.length) {
+    return `Access denied: this area requires the role "${effectiveRoles.join(', ')}". Contact your administrator.`
+  }
+  return 'Access denied: you do not have permission to perform this action.'
+}
+
+/**
+ * Signal a forbidden access attempt for an authenticated user via a flash banner.
+ *
+ * Authenticated 403 responses must never redirect to `/login` — that creates an
+ * infinite loop because the login page detects the active session and bounces
+ * the user back to the failing destination (see GH #2070). Pages that need an
+ * inline banner should catch `ForbiddenError` and render `AccessDeniedMessage`
+ * from `@open-mercato/ui/backend/detail`.
+ */
+export function notifyForbiddenAccess(options?: { requiredRoles?: string[] | null; requiredFeatures?: string[] | null }) {
   if (typeof window === 'undefined') return
-  if (window.location.pathname.startsWith('/login')) return
+  // Portal routes have their own customer auth — keep the existing no-op contract.
+  if (/\/[^/]+\/portal(\/|$)/.test(window.location.pathname)) return
   try {
-    const current = window.location.pathname + window.location.search
-    const features = options?.requiredFeatures?.filter(Boolean) ?? []
-    const roles = options?.requiredRoles?.filter(Boolean) ?? []
-    const fallbackRoles = DEFAULT_FORBIDDEN_ROLES.filter(Boolean)
-    const effectiveRoles = roles.length ? roles : fallbackRoles
-    const query = features.length
-      ? `requireFeature=${encodeURIComponent(features.join(','))}`
-      : effectiveRoles.length
-        ? `requireRole=${encodeURIComponent(effectiveRoles.map(String).join(','))}`
-        : ''
-    const url = query
-      ? `/login?${query}&redirect=${encodeURIComponent(current)}`
-      : `/login?redirect=${encodeURIComponent(current)}`
-    flash('Insufficient permissions. Redirecting to login…', 'warning')
-    setTimeout(() => { window.location.href = url }, 60)
+    flash(formatForbiddenAccessMessage(options), 'warning')
   } catch {
     // no-op
   }
 }
+
+/**
+ * @deprecated Renamed to {@link notifyForbiddenAccess}. The previous name
+ * implied a `/login` redirect that no longer happens (see GH #2070). Kept as an
+ * exported alias for one minor version so third-party module imports keep
+ * building; update imports to `notifyForbiddenAccess`.
+ */
+export const redirectToForbiddenLogin = notifyForbiddenAccess
 
 export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
   type FetchType = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
@@ -100,14 +164,33 @@ export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Pr
     )
   }
   const scoped = scopedHeaders.resolveScopedHeaders()
-  const mergedInit = Object.keys(scoped).length
+  const baseInit: RequestInit = Object.keys(scoped).length
     ? { ...(init ?? {}), headers: mergeHeaders(init?.headers, scoped) }
-    : init
+    : init ?? {}
+  // Only auto-inject credentials: 'include' for same-origin requests so cookies
+  // round-trip across Next.js proxy.ts rewrites (custom-domain portal flows)
+  // without leaking session cookies to third-party hosts.
+  const mergedInit: RequestInit = baseInit.credentials
+    ? baseInit
+    : isSameOriginRequest(input)
+      ? { ...baseInit, credentials: 'include' }
+      : baseInit
+  const requestHeaders = new Headers(mergedInit?.headers)
+  const disableUnauthorizedRedirect = readRedirectOverride(requestHeaders, 'x-om-unauthorized-redirect')
+  const disableForbiddenRedirect = readRedirectOverride(requestHeaders, 'x-om-forbidden-redirect')
+  // Snapshot the pathname BEFORE the request is sent. A 401 for a request that
+  // started on the login page must stay silent even when the response lands after
+  // the post-login client-side navigation to /backend — otherwise the stale
+  // pre-auth 401 raises a bogus "Session expired" banner right after signing in.
+  const requestPathname = readPathname()
   const res = await baseFetch(input, mergedInit)
-  const onLoginPage = typeof window !== 'undefined' && window.location.pathname.startsWith('/login')
+  const responsePathname = readPathname()
+  const onLoginPage = isLoginPathname(requestPathname) || isLoginPathname(responsePathname)
+  const onPortalRoute = isPortalPathname(requestPathname) || isPortalPathname(responsePathname)
   if (res.status === 401) {
     // Trigger same redirect flow as protected pages
-    if (!onLoginPage) {
+    // Skip for staff login page and all portal routes (portal has its own auth)
+    if (!onLoginPage && !onPortalRoute && !disableUnauthorizedRedirect) {
       redirectToSessionRefresh()
       // Throw a typed error for callers that might still handle it
       throw new UnauthorizedError(await res.text().catch(() => 'Unauthorized'))
@@ -119,15 +202,18 @@ export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Pr
     let roles: string[] | null = null
     let features: string[] | null = null
     let payload: unknown = null
-    try {
-      const clone = res.clone()
-      const data = await clone.json()
-      if (Array.isArray(data?.requiredRoles)) roles = data.requiredRoles.map((r: any) => String(r))
-      if (Array.isArray(data?.requiredFeatures)) features = data.requiredFeatures.map((f: any) => String(f))
-      if (data && typeof data === 'object') payload = data
-    } catch {}
-    // Only redirect if not already on login page
-    if (!onLoginPage) {
+    const aclData = await readJsonSafe<Record<string, unknown>>(res.clone(), null)
+    if (aclData && typeof aclData === 'object') {
+      if (Array.isArray(aclData.requiredRoles)) {
+        roles = aclData.requiredRoles.map((r) => String(r))
+      }
+      if (Array.isArray(aclData.requiredFeatures)) {
+        features = aclData.requiredFeatures.map((f) => String(f))
+      }
+      payload = aclData
+    }
+    // Only redirect if not already on login page or a portal route
+    if (!onLoginPage && !onPortalRoute && !disableForbiddenRedirect) {
       const target =
         typeof input === 'string'
           ? input
@@ -137,8 +223,7 @@ export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Pr
               ? input.url
               : 'unknown'
       try {
-        // eslint-disable-next-line no-console
-        console.warn('[apiFetch] Forbidden response', {
+        logger.warn('Forbidden response', {
           url: target,
           status: res.status,
           requiredRoles: roles,
@@ -148,10 +233,21 @@ export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Pr
       } catch {}
       const hasAclHints = Boolean((roles && roles.length) || (features && features.length))
       if (hasAclHints) {
-        redirectToForbiddenLogin({ requiredRoles: roles, requiredFeatures: features })
+        notifyForbiddenAccess({ requiredRoles: roles, requiredFeatures: features })
       }
-      const msg = await res.clone().text().catch(() => 'Forbidden')
-      throw new ForbiddenError(msg)
+      let msg = 'Forbidden'
+      if (aclData && typeof aclData === 'object') {
+        if (typeof aclData.error === 'string') {
+          msg = aclData.error
+        } else if (typeof aclData.message === 'string') {
+          msg = aclData.message
+        }
+      } else {
+        msg = await res.clone().text().catch(() => 'Forbidden')
+      }
+      // Attach ACL hints so callers (e.g. flashMutationError) can name the
+      // missing permission instead of surfacing a bare "Forbidden" toast.
+      throw new ForbiddenError(msg, { requiredFeatures: features, requiredRoles: roles })
     }
     // If already on login, just return the response for the caller to handle
   }

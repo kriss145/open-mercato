@@ -4,11 +4,23 @@ import * as React from 'react'
 import Link from 'next/link'
 import type { DashboardWidgetComponentProps } from '@open-mercato/shared/modules/dashboard/widgets'
 import { apiCall } from '@open-mercato/ui/backend/utils/apiCall'
+import { Input } from '@open-mercato/ui/primitives/input'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@open-mercato/ui/primitives/select'
 import { Spinner } from '@open-mercato/ui/primitives/spinner'
 import { Badge } from '@open-mercato/ui/primitives/badge'
 import { formatRelativeTime } from '@open-mercato/shared/lib/time'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
 import { DEFAULT_SETTINGS, hydrateSalesNewQuotesSettings, type DatePeriodOption, type SalesNewQuotesSettings } from './config'
+import { readString, toDateInputValue, openNativeDatePicker, formatAmount } from '../shared'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('sales')
 
 type NewQuoteItem = {
   id: string
@@ -28,10 +40,6 @@ type NewQuoteItem = {
 type NewQuotesApiPayload = {
   items?: unknown[]
   error?: string
-}
-
-function readString(value: unknown): string | null {
-  return typeof value === 'string' ? value : null
 }
 
 function parseNewQuoteItems(payload: NewQuotesApiPayload | null): NewQuoteItem[] {
@@ -87,45 +95,6 @@ function resolveDetailHref(item: NewQuoteItem): string | null {
   return item.id ? `/backend/sales/quotes/${encodeURIComponent(item.id)}` : null
 }
 
-function toDateInputValue(value: string | null | undefined): string {
-  if (!value) return ''
-  const parsed = new Date(value)
-  if (Number.isNaN(parsed.getTime())) return ''
-  const year = String(parsed.getFullYear())
-  const month = String(parsed.getMonth() + 1).padStart(2, '0')
-  const day = String(parsed.getDate()).padStart(2, '0')
-  return `${year}-${month}-${day}`
-}
-
-function openNativeDatePicker(event: React.SyntheticEvent<HTMLInputElement>) {
-  const input = event.currentTarget
-  if (typeof input.showPicker === 'function') {
-    input.showPicker()
-  }
-}
-
-function formatAmount(value: string, currency: string | null, locale?: string): string {
-  const numeric = Number(value)
-  if (!Number.isFinite(numeric)) return '--'
-  try {
-    if (currency && currency.trim().length > 0) {
-      return new Intl.NumberFormat(locale ?? undefined, {
-        style: 'currency',
-        currency,
-        minimumFractionDigits: 2,
-        maximumFractionDigits: 2,
-      }).format(numeric)
-    }
-    return new Intl.NumberFormat(locale ?? undefined, {
-      style: 'decimal',
-      minimumFractionDigits: 0,
-      maximumFractionDigits: 2,
-    }).format(numeric)
-  } catch {
-    return String(numeric)
-  }
-}
-
 
 const SalesNewQuotesWidget: React.FC<DashboardWidgetComponentProps<SalesNewQuotesSettings>> = ({
   mode,
@@ -155,7 +124,7 @@ const SalesNewQuotesWidget: React.FC<DashboardWidgetComponentProps<SalesNewQuote
       const data = await loadNewQuotes(hydrated)
       setItems(data)
     } catch (err) {
-      console.error('Failed to load new quotes widget data', err)
+      logger.error('Failed to load new quotes widget data', { err })
       setError(translate('sales.widgets.newQuotes.error', 'Failed to load quotes'))
     } finally {
       setLoading(false)
@@ -174,12 +143,12 @@ const SalesNewQuotesWidget: React.FC<DashboardWidgetComponentProps<SalesNewQuote
           <label htmlFor="sales-new-quotes-page-size" className="text-xs font-semibold uppercase text-muted-foreground">
             {translate('sales.widgets.newQuotes.settings.pageSize', 'Number of Quotes')}
           </label>
-          <input
+          <Input
             id="sales-new-quotes-page-size"
             type="number"
             min={1}
             max={20}
-            className="w-24 rounded-md border border-input bg-background px-2 py-1 text-sm text-foreground focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+            className="w-24"
             value={hydrated.pageSize}
             onChange={(event) => {
               const next = Number(event.target.value)
@@ -194,19 +163,22 @@ const SalesNewQuotesWidget: React.FC<DashboardWidgetComponentProps<SalesNewQuote
           <label htmlFor="sales-new-quotes-date-period" className="text-xs font-semibold uppercase text-muted-foreground">
             {translate('sales.widgets.newQuotes.settings.datePeriod', 'Date Period')}
           </label>
-          <select
-            id="sales-new-quotes-date-period"
+          <Select
             value={hydrated.datePeriod}
-            onChange={(event) => {
-              onSettingsChange?.({ ...hydrated, datePeriod: event.target.value as DatePeriodOption })
+            onValueChange={(value) => {
+              onSettingsChange?.({ ...hydrated, datePeriod: value as DatePeriodOption })
             }}
-            className="w-full rounded-md border border-input bg-background px-2 py-1 text-sm text-foreground focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
           >
-            <option value="last24h">{translate('sales.widgets.newQuotes.settings.last24h', 'Last 24 hours')}</option>
-            <option value="last7d">{translate('sales.widgets.newQuotes.settings.last7d', 'Last 7 days')}</option>
-            <option value="last30d">{translate('sales.widgets.newQuotes.settings.last30d', 'Last 30 days')}</option>
-            <option value="custom">{translate('sales.widgets.newQuotes.settings.custom', 'Custom range')}</option>
-          </select>
+            <SelectTrigger id="sales-new-quotes-date-period" size="sm">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="last24h">{translate('sales.widgets.newQuotes.settings.last24h', 'Last 24 hours')}</SelectItem>
+              <SelectItem value="last7d">{translate('sales.widgets.newQuotes.settings.last7d', 'Last 7 days')}</SelectItem>
+              <SelectItem value="last30d">{translate('sales.widgets.newQuotes.settings.last30d', 'Last 30 days')}</SelectItem>
+              <SelectItem value="custom">{translate('sales.widgets.newQuotes.settings.custom', 'Custom range')}</SelectItem>
+            </SelectContent>
+          </Select>
         </div>
 
         {hydrated.datePeriod === 'custom' ? (
@@ -224,7 +196,7 @@ const SalesNewQuotesWidget: React.FC<DashboardWidgetComponentProps<SalesNewQuote
                 }}
                 onFocus={openNativeDatePicker}
                 onClick={openNativeDatePicker}
-                className="w-full rounded-md border border-input bg-background px-2 py-1 text-sm text-foreground focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+                className="w-full rounded-md border border-input bg-background px-2 py-1 text-sm text-foreground focus-visible:border-ring focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
               />
             </div>
             <div className="space-y-1.5">
@@ -240,7 +212,7 @@ const SalesNewQuotesWidget: React.FC<DashboardWidgetComponentProps<SalesNewQuote
                 }}
                 onFocus={openNativeDatePicker}
                 onClick={openNativeDatePicker}
-                className="w-full rounded-md border border-input bg-background px-2 py-1 text-sm text-foreground focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+                className="w-full rounded-md border border-input bg-background px-2 py-1 text-sm text-foreground focus-visible:border-ring focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
               />
             </div>
           </div>

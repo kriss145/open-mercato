@@ -20,6 +20,8 @@ export async function GET(req: Request) {
 
   const ctx = { tenantId: auth.tenantId, organizationId: auth.orgId }
 
+  await progressService.markStaleJobsFailed(auth.tenantId, undefined, auth.orgId)
+
   const [jobs, recentlyCompleted] = await Promise.all([
     progressService.getActiveJobs(ctx),
     progressService.getRecentlyCompletedJobs(ctx),
@@ -43,6 +45,7 @@ function formatJob(job: ProgressJob) {
     totalCount: job.totalCount,
     etaSeconds: job.etaSeconds,
     cancellable: job.cancellable,
+    meta: job.meta ?? null,
     startedAt: job.startedAt?.toISOString() ?? null,
     finishedAt: job.finishedAt?.toISOString() ?? null,
     errorMessage: job.errorMessage,

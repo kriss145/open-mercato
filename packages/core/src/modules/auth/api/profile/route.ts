@@ -6,12 +6,15 @@ import { createRequestContainer } from '@open-mercato/shared/lib/di/container'
 import { getAuthFromRequest } from '@open-mercato/shared/lib/auth/server'
 import { signJwt } from '@open-mercato/shared/lib/auth/jwt'
 import { resolveTranslations } from '@open-mercato/shared/lib/i18n/server'
-import { CrudHttpError } from '@open-mercato/shared/lib/crud/errors'
+import { isCrudHttpError } from '@open-mercato/shared/lib/crud/errors'
 import { AuthService } from '@open-mercato/core/modules/auth/services/authService'
 import { User } from '@open-mercato/core/modules/auth/data/entities'
 import type { EntityManager } from '@mikro-orm/postgresql'
 import { findOneWithDecryption } from '@open-mercato/shared/lib/encryption/find'
 import { buildPasswordSchema } from '@open-mercato/shared/lib/auth/passwordPolicy'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('auth').child({ component: 'profile' })
 
 const profileResponseSchema = z.object({
   email: z.string().email(),
@@ -20,13 +23,48 @@ const profileResponseSchema = z.object({
 
 const passwordSchema = buildPasswordSchema()
 
-const updateSchema = z.object({
+const updateSchemaBase = z.object({
   email: z.string().email().optional(),
+  currentPassword: z.string().trim().min(1).optional(),
   password: passwordSchema.optional(),
-}).refine((data) => Boolean(data.email || data.password), {
-  message: 'Provide an email or password.',
-  path: ['email'],
 })
+
+function buildUpdateSchema(translate: (key: string, fallback: string) => string) {
+  return updateSchemaBase.superRefine((data, ctx) => {
+    if (!data.email && !data.password) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: translate(
+          'auth.profile.form.errors.emailOrPasswordRequired',
+          'Provide an email or password.',
+        ),
+        path: ['email'],
+      })
+    }
+    if (data.password && !data.currentPassword) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: translate(
+          'auth.profile.form.errors.currentPasswordRequired',
+          'Current password is required.',
+        ),
+        path: ['currentPassword'],
+      })
+    }
+    if (data.currentPassword && !data.password) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: translate(
+          'auth.profile.form.errors.newPasswordRequired',
+          'New password is required.',
+        ),
+        path: ['password'],
+      })
+    }
+  })
+}
+
+const updateSchema = buildUpdateSchema((_key, fallback) => fallback)
 
 const profileUpdateResponseSchema = z.object({
   ok: z.literal(true),
@@ -70,7 +108,7 @@ export async function GET(req: Request) {
     }
     return NextResponse.json({ email: String(user.email), roles: auth.roles ?? [] })
   } catch (err) {
-    console.error('auth.profile.load failed', err)
+    logger.error('Profile load failed', { err })
     return NextResponse.json({ error: translate('auth.profile.form.errors.load', 'Failed to load profile.') }, { status: 400 })
   }
 }
@@ -83,7 +121,7 @@ export async function PUT(req: Request) {
   }
   try {
     const body = await req.json().catch(() => ({}))
-    const parsed = updateSchema.safeParse(body)
+    const parsed = buildUpdateSchema(translate).safeParse(body)
     if (!parsed.success) {
       return NextResponse.json(
         {
@@ -94,6 +132,35 @@ export async function PUT(req: Request) {
       )
     }
     const container = await createRequestContainer()
+    const em = (container.resolve('em') as EntityManager)
+    const authService = container.resolve('authService') as AuthService
+    if (parsed.data.password) {
+      const user = await findOneWithDecryption(
+        em,
+        User,
+        { id: auth.sub, deletedAt: null },
+        undefined,
+        { tenantId: auth.tenantId ?? null, organizationId: auth.orgId ?? null },
+      )
+      if (!user) {
+        return NextResponse.json({ error: translate('auth.users.form.errors.notFound', 'User not found') }, { status: 404 })
+      }
+      const currentPassword = parsed.data.currentPassword?.trim() ?? ''
+      const isCurrentPasswordValid = await authService.verifyPassword(user, currentPassword)
+      if (!isCurrentPasswordValid) {
+        const message = translate(
+          'auth.profile.form.errors.currentPasswordInvalid',
+          'Current password is incorrect.',
+        )
+        return NextResponse.json(
+          {
+            error: message,
+            issues: [{ path: ['currentPassword'], message }],
+          },
+          { status: 400 },
+        )
+      }
+    }
     const commandBus = (container.resolve('commandBus') as CommandBus)
     const ctx = buildCommandContext(container, auth, req)
     const { result } = await commandBus.execute<{ id: string; email?: string; password?: string }, User>(
@@ -107,10 +174,10 @@ export async function PUT(req: Request) {
         ctx,
       },
     )
-    const authService = container.resolve('authService') as AuthService
     const roles = await authService.getUserRoles(result, result.tenantId ? String(result.tenantId) : null)
     const jwt = signJwt({
       sub: String(result.id),
+      sid: typeof auth.sid === 'string' ? auth.sid : undefined,
       tenantId: result.tenantId ? String(result.tenantId) : null,
       orgId: result.organizationId ? String(result.organizationId) : null,
       email: result.email,
@@ -126,10 +193,10 @@ export async function PUT(req: Request) {
     })
     return res
   } catch (err) {
-    if (err instanceof CrudHttpError) {
+    if (isCrudHttpError(err)) {
       return NextResponse.json(err.body, { status: err.status })
     }
-    console.error('auth.profile.update failed', err)
+    logger.error('Profile update failed', { err })
     return NextResponse.json({ error: translate('auth.profile.form.errors.save', 'Failed to update profile.') }, { status: 400 })
   }
 }

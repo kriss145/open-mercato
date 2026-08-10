@@ -1,7 +1,18 @@
 import type { NotificationDto } from '@open-mercato/shared/modules/notifications/types'
 import { Notification } from '../data/entities'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('notifications').child({ component: 'mapper' })
 
 export function toNotificationDto(notification: Notification): NotificationDto {
+  const createdAt = notification.createdAt instanceof Date
+    ? notification.createdAt
+    : (() => {
+      if (process.env.NODE_ENV !== 'test') {
+        logger.warn('Invalid createdAt on notification entity, falling back to current time', { id: notification.id, createdAt: notification.createdAt })
+      }
+      return new Date()
+    })()
   return {
     id: notification.id,
     type: notification.type,
@@ -26,7 +37,7 @@ export function toNotificationDto(notification: Notification): NotificationDto {
     sourceEntityType: notification.sourceEntityType,
     sourceEntityId: notification.sourceEntityId,
     linkHref: notification.linkHref,
-    createdAt: notification.createdAt.toISOString(),
+    createdAt: createdAt.toISOString(),
     readAt: notification.readAt?.toISOString() ?? null,
     actionTaken: notification.actionTaken,
   }

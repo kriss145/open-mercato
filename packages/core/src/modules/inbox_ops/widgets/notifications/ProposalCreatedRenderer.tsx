@@ -39,10 +39,18 @@ export function ProposalCreatedRenderer({
   return (
     <div
       className={cn(
-        'group relative px-4 py-3 hover:bg-muted/50 cursor-pointer transition-colors border-l-4 border-l-amber-500',
-        isUnread && 'bg-amber-50/50 dark:bg-amber-950/20',
+        'group relative px-4 py-3 hover:bg-muted/50 cursor-pointer transition-colors border-l-4 border-l-status-warning-border',
+        isUnread && 'bg-status-warning-bg',
       )}
       onClick={handleReview}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault()
+          handleReview()
+        }
+      }}
+      role="button"
+      tabIndex={0}
     >
       {isUnread && (
         <div className="absolute left-1.5 top-1/2 -translate-y-1/2 h-2 w-2 rounded-full bg-primary" />
@@ -50,8 +58,8 @@ export function ProposalCreatedRenderer({
 
       <div className="flex gap-3">
         <div className="flex-shrink-0 mt-0.5">
-          <div className="h-10 w-10 rounded-lg bg-amber-100 dark:bg-amber-900/40 flex items-center justify-center">
-            <Inbox className="h-5 w-5 text-amber-600 dark:text-amber-400" />
+          <div className="h-10 w-10 rounded-lg bg-status-warning-bg flex items-center justify-center">
+            <Inbox className="h-5 w-5 text-status-warning-icon" />
           </div>
         </div>
 

@@ -1,5 +1,6 @@
 'use client'
 
+import { createLogger } from '@open-mercato/shared/lib/logger'
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react'
 import type {
   AgentStatus,
@@ -19,12 +20,16 @@ import type {
   DebugEventType,
   OpenCodeQuestion,
 } from '../types'
+import { apiCall } from '@open-mercato/ui/backend/utils/apiCall'
+import { apiFetch } from '@open-mercato/ui/backend/utils/api'
 import { COMMAND_PALETTE_SHORTCUT, AI_CHAT_SHORTCUT } from '../constants'
 import { filterTools } from '../utils/toolMatcher'
 import { useMcpTools } from './useMcpTools'
 import { useRecentActions } from './useRecentActions'
 import { useRecentTools } from './useRecentTools'
 import { useAiAssistantVisibility } from './useAiAssistantVisibility'
+
+const logger = createLogger('ai_assistant').child({ component: 'command-palette' })
 
 interface UseCommandPaletteOptions {
   pageContext: PageContext | null
@@ -196,11 +201,11 @@ export function useCommandPalette(options: UseCommandPaletteOptions) {
     if (state.isOpen && tools.length > 0) {
       // Fetch auth context if not already loaded
       if (!initialContext) {
-        console.log('[CommandPalette] Fetching initial context via context_whoami...')
+        logger.debug('Fetching initial context via context_whoami')
         executeToolApi('context_whoami', {})
           .then((result) => {
             if (result.success && result.result) {
-              console.log('[CommandPalette] Got initial context:', result.result)
+              logger.debug('Got initial context')
               const ctx = result.result as {
                 tenantId: string | null
                 organizationId: string | null
@@ -212,25 +217,25 @@ export function useCommandPalette(options: UseCommandPaletteOptions) {
             }
           })
           .catch((err) => {
-            console.error('[CommandPalette] Failed to fetch initial context:', err)
+            logger.error('Failed to fetch initial context', { err })
           })
       }
 
       // Fetch available entity types if not already loaded
       if (!availableEntities) {
-        console.log('[CommandPalette] Fetching available entities via search_schema...')
+        logger.debug('Fetching available entities via search_schema')
         executeToolApi('search_schema', {})
           .then((result) => {
             if (result.success && result.result) {
               const schemaResult = result.result as { entities?: Array<{ entityId: string; enabled: boolean }> }
-              console.log('[CommandPalette] Got entity schema:', schemaResult.entities?.length, 'entities')
+              logger.debug('Got entity schema', { entities: schemaResult.entities?.length })
               if (schemaResult.entities) {
                 setAvailableEntities(schemaResult.entities.filter(e => e.enabled))
               }
             }
           })
           .catch((err) => {
-            console.error('[CommandPalette] Failed to fetch entity schema:', err)
+            logger.error('Failed to fetch entity schema', { err })
           })
       }
     }
@@ -497,7 +502,7 @@ export function useCommandPalette(options: UseCommandPaletteOptions) {
   // Route query using fast model
   const routeQuery = useCallback(
     async (query: string): Promise<RouteResult> => {
-      const response = await fetch('/api/ai_assistant/route', {
+      const { ok, result, status } = await apiCall<RouteResult>('/api/ai_assistant/route', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -509,11 +514,15 @@ export function useCommandPalette(options: UseCommandPaletteOptions) {
         }),
       })
 
-      if (!response.ok) {
-        throw new Error(`Routing failed: ${response.status}`)
+      if (!ok) {
+        throw new Error(`Routing failed: ${status}`)
       }
 
-      return response.json()
+      if (!result) {
+        throw new Error('Routing returned empty response')
+      }
+
+      return result
     },
     [tools]
   )
@@ -547,7 +556,7 @@ export function useCommandPalette(options: UseCommandPaletteOptions) {
         const controller = new AbortController()
         currentStreamController.current = controller
 
-        const response = await fetch('/api/ai_assistant/chat', {
+        const response = await apiFetch('/api/ai_assistant/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -562,7 +571,7 @@ export function useCommandPalette(options: UseCommandPaletteOptions) {
 
         if (!response.ok) {
           const errorText = await response.text()
-          console.error('[startAgenticChat] Error response body:', errorText)
+          logger.error('Chat request returned error response', { status: response.status })
           throw new Error(`Chat request failed: ${response.status} - ${errorText}`)
         }
 
@@ -595,7 +604,6 @@ export function useCommandPalette(options: UseCommandPaletteOptions) {
 
               try {
                 const event = JSON.parse(data)
-
 
                 // Track all events for debug panel (except question - handled separately with enriched data)
                 if (event.type !== 'question') {
@@ -670,7 +678,7 @@ export function useCommandPalette(options: UseCommandPaletteOptions) {
                     setAgentStatus({ type: 'thinking' })
                   }
                 } else if (event.type === 'error') {
-                  console.error('[startAgenticChat] Error event:', event.error)
+                  logger.error('Chat stream error event', { err: event.error })
                   setAgentStatus({ type: 'idle' })
                 } else if (event.type === 'done') {
                   setIsThinking(false)
@@ -711,7 +719,7 @@ export function useCommandPalette(options: UseCommandPaletteOptions) {
                   setIsSessionAuthorized(true)
                 }
               } catch (parseError) {
-                console.warn('[startAgenticChat] Failed to parse event:', data, parseError)
+                logger.warn('Failed to parse chat stream event', { err: parseError })
               }
             }
           }
@@ -724,7 +732,7 @@ export function useCommandPalette(options: UseCommandPaletteOptions) {
         if (error instanceof Error && error.name === 'AbortError') {
           return
         }
-        console.error('[startAgenticChat] Error:', error)
+        logger.error('Agentic chat failed', { err: error })
         setAgentStatus({ type: 'idle' })
         setMessages((prev) => [
           ...prev,
@@ -765,7 +773,7 @@ export function useCommandPalette(options: UseCommandPaletteOptions) {
         }
         setMessages([userMessage])
 
-        const response = await fetch('/api/ai_assistant/chat', {
+        const response = await apiFetch('/api/ai_assistant/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -818,7 +826,7 @@ export function useCommandPalette(options: UseCommandPaletteOptions) {
 
         setMessages((prev) => prev.map((m) => (m.id === 'streaming' ? { ...m, id: generateId() } : m)))
       } catch (error) {
-        console.error('General chat error:', error)
+        logger.error('General chat failed', { err: error })
         setMessages((prev) => [
           ...prev,
           {
@@ -978,7 +986,7 @@ export function useCommandPalette(options: UseCommandPaletteOptions) {
         currentStreamController.current = controller
 
         // Send to chat API with OpenCode session for context persistence
-        const response = await fetch('/api/ai_assistant/chat', {
+        const response = await apiFetch('/api/ai_assistant/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1022,7 +1030,6 @@ export function useCommandPalette(options: UseCommandPaletteOptions) {
 
               try {
                 const event = JSON.parse(data)
-
 
                 // Track all events for debug panel (except question - handled separately with enriched data)
                 if (event.type !== 'question') {
@@ -1201,7 +1208,7 @@ export function useCommandPalette(options: UseCommandPaletteOptions) {
         if (error instanceof Error && error.name === 'AbortError') {
           return
         }
-        console.error('Tool chat error:', error)
+        logger.error('Tool chat failed', { err: error })
         setAgentStatus({ type: 'idle' })
         setMessages((prev) => [
           ...prev,
@@ -1271,7 +1278,7 @@ export function useCommandPalette(options: UseCommandPaletteOptions) {
       try {
         // Send answer as simple POST - the original SSE stream will receive the follow-up
         const sessionId = pendingQuestion.sessionID
-        const response = await fetch('/api/ai_assistant/chat', {
+        const { ok, result, status } = await apiCall<{ error?: string }>('/api/ai_assistant/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1283,15 +1290,14 @@ export function useCommandPalette(options: UseCommandPaletteOptions) {
           }),
         })
 
-        if (!response.ok) {
-          const errorData = await response.json().catch(() => ({}))
-          throw new Error(errorData.error || `Answer request failed: ${response.status}`)
+        if (!ok) {
+          throw new Error(result?.error || `Answer request failed: ${status}`)
         }
 
         // Answer sent successfully - the original stream will handle the response
         // Note: isThinking stays true until the original stream sends 'done' or more 'text'
       } catch (error) {
-        console.error('[answerQuestion] Error:', error)
+        logger.error('Answer question failed', { err: error })
         setIsThinking(false)
         setAgentStatus({ type: 'idle' })
         setMessages((prev) => [
@@ -1325,7 +1331,7 @@ export function useCommandPalette(options: UseCommandPaletteOptions) {
 
       try {
         // Send to chat API
-        const response = await fetch('/api/ai_assistant/chat', {
+        const response = await apiFetch('/api/ai_assistant/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1383,7 +1389,7 @@ export function useCommandPalette(options: UseCommandPaletteOptions) {
         // Finalize the assistant message
         setMessages((prev) => prev.map((m) => (m.id === 'streaming' ? { ...m, id: generateId() } : m)))
       } catch (error) {
-        console.error('Chat error:', error)
+        logger.error('Chat failed', { err: error })
         // Add error message
         setMessages((prev) => [
           ...prev,

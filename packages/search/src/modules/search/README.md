@@ -7,9 +7,22 @@ The search module provides unified search capabilities across all entities in Op
 - **Multi-strategy search**: Combines full-text search (Meilisearch), vector-based semantic search, and token matching
 - **Automatic indexing**: Subscribes to entity events for real-time index updates
 - **Queue-based processing**: Supports async batch processing via Redis/BullMQ for high-volume indexing
+- **Topbar progress integration**: Fulltext and vector reindex operations create `progress_jobs` entries and stream updates to the global progress bar
 - **Configurable embeddings**: Supports OpenAI, Ollama, and other embedding providers
 - **Tenant-scoped**: All indexes are scoped by tenant and optionally by organization
 - **Admin-configurable**: Global search (Cmd+K) strategies can be configured per-tenant
+
+## Reindex Progress and SSE
+
+Search reindex endpoints now integrate with the Progress module:
+
+- `POST /api/search/reindex` (fulltext) creates/updates a progress job with `jobType = search.reindex.fulltext`
+- `POST /api/search/embeddings/reindex` (vector) creates/updates a progress job with `jobType = search.reindex.vector`
+- Queue workers increment progress as batches are processed and complete jobs when totals are reached
+- The backend topbar (`ProgressTopBar`) receives real-time updates via SSE (`progress.job.*` events), so no periodic polling is required for progress updates
+- Search settings sections (`FulltextSearchSection`, `VectorSearchSection`) now refresh logs/settings on `progress.job.*` and `om:bridge:reconnected` events instead of 5s polling loops
+
+Cancellation endpoints (`/api/search/reindex/cancel`, `/api/search/embeddings/reindex/cancel`) now also cancel the corresponding progress job.
 
 ## Global Search Settings
 
@@ -443,6 +456,11 @@ yarn mercato search worker fulltext-indexing --concurrency=5
 | `OPENAI_API_KEY` | OpenAI API key for embeddings | - |
 | `OM_SEARCH_ENABLED` | Enable/disable search module | `true` |
 | `OM_SEARCH_DEBUG` | Enable debug logging for search module | `false` |
+| `OM_SEARCH_MIN_LEN` | Minimum token length for the Postgres `search_tokens` index; also the floor of prefix expansion (token strategy only) | `3` |
+| `OM_SEARCH_ENABLE_PARTIAL` | Prefix/partial expansion for `search_tokens` (indexing "john" stores hashes for `joh`,`john`). Token/Postgres only — Meilisearch unaffected. Increases `search_tokens` size ~5–6× | `true` |
+| `OM_SEARCH_HASH_ALGO` | Hash algorithm for `search_tokens` tokens (`sha256`/`sha1`/`md5`); token strategy only | `sha256` |
+| `OM_SEARCH_STORE_RAW_TOKENS` | Store plaintext token alongside the hash in `search_tokens` — **security-sensitive** (retains plaintext of otherwise-hashed values); token strategy only | `false` |
+| `OM_SEARCH_FIELD_BLOCKLIST` | Comma-separated extra field names excluded from tokenization (merged with built-in `password,token,secret,hash`); token strategy only | - |
 | `SEARCH_EXCLUDE_ENCRYPTED_FIELDS` | Exclude encrypted fields from Meilisearch indexing | `false` |
 | `QUEUE_STRATEGY` | Queue strategy (`local` or `async`) | `local` |
 | `REDIS_URL` | Redis connection URL for async queues | - |
@@ -450,7 +468,7 @@ yarn mercato search worker fulltext-indexing --concurrency=5
 
 ### Debug Logging
 
-Set `OM_SEARCH_DEBUG=true` to enable verbose debug logging for the search module. This outputs detailed information about indexing operations, strategy selection, and error handling. Errors are always logged regardless of this flag.
+Set `OM_SEARCH_DEBUG=true` to enable verbose debug logging for the search module. This outputs information about indexing operations, strategy selection, and error handling. Debug output is redacted: it includes field names, token hashes, and counts, but never raw token text, document values, or decrypted PII. Errors are always logged regardless of this flag.
 
 ```env
 OM_SEARCH_DEBUG=true

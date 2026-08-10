@@ -1,12 +1,9 @@
 import { NextResponse, type NextRequest } from 'next/server'
-import { findApi, type HttpMethod } from '@open-mercato/shared/modules/registry'
-import { CrudHttpError } from '@open-mercato/shared/lib/crud/errors'
-import { modules } from '@/.mercato/generated/modules.generated'
-import { getAuthFromRequest } from '@open-mercato/shared/lib/auth/server'
+import { findApiRouteManifestMatch, getApiRouteManifests, registerApiRouteManifests, type HttpMethod } from '@open-mercato/shared/modules/registry'
+import { isCrudHttpError } from '@open-mercato/shared/lib/crud/errors'
+import { apiRoutes } from '@/.mercato/generated/api-routes.generated'
+import { resolveAuthFromRequestDetailed } from '@open-mercato/shared/lib/auth/server'
 import { bootstrap } from '@/bootstrap'
-
-// Ensure all package registrations are initialized for API routes
-bootstrap()
 import type { AuthContext } from '@open-mercato/shared/lib/auth/server'
 import { createRequestContainer } from '@open-mercato/shared/lib/di/container'
 import { RbacService } from '@open-mercato/core/modules/auth/services/rbacService'
@@ -16,15 +13,37 @@ import { runWithCacheTenant } from '@open-mercato/cache'
 import { resolveTranslations } from '@open-mercato/shared/lib/i18n/server'
 import type { RateLimitConfig } from '@open-mercato/shared/lib/ratelimit/types'
 import { getCachedRateLimiterService } from '@open-mercato/core/bootstrap'
-import { checkRateLimit, getClientIp, RATE_LIMIT_ERROR_KEY, RATE_LIMIT_ERROR_FALLBACK } from '@open-mercato/shared/lib/ratelimit/helpers'
+import { checkRateLimit, getClientIp, RATE_LIMIT_ERROR_KEY, RATE_LIMIT_ERROR_FALLBACK, RATE_LIMIT_FALLBACK_KEY } from '@open-mercato/shared/lib/ratelimit/helpers'
 import { getGlobalEventBus } from '@open-mercato/shared/modules/events'
 import { applicationLifecycleEvents, type ApplicationLifecycleEventId } from '@open-mercato/shared/lib/runtime/events'
+import { withModuleResourceUsage } from '@open-mercato/shared/lib/modules/resource-usage'
+
+// Ensure all package registrations are initialized for API routes.
+bootstrap()
+registerApiRouteManifests(apiRoutes)
+
+const warnedDeprecatedRequireRoles = new Set<string>()
+
+function warnDeprecatedRequireRoles(pathname: string, method: HttpMethod): void {
+  const warnKey = `${method} ${pathname}`
+  if (warnedDeprecatedRequireRoles.has(warnKey)) return
+  warnedDeprecatedRequireRoles.add(warnKey)
+  console.warn(
+    '[api] Ignoring deprecated `requireRoles` guard — role names are mutable and spoofable, so they no longer authorize requests. Migrate to `requireFeatures` with immutable acl.ts feature IDs.',
+    { path: pathname, method },
+  )
+}
 
 type MethodMetadata = {
   requireAuth?: boolean
+  /** @deprecated Ignored at runtime — role names are mutable and can be spoofed. Use `requireFeatures` instead. */
   requireRoles?: string[]
   requireFeatures?: string[]
   rateLimit?: RateLimitConfig
+  /** Route-declared opt-out from module-resource-usage tracking (e.g. an endpoint that itself
+   * reads/clears that telemetry, so tracking it would perturb the data it just reported). Set
+   * `skipModuleResourceUsageTracking: true` in the route's `metadata` export for the method. */
+  skipModuleResourceUsageTracking?: boolean
 }
 
 type HandlerContext = {
@@ -35,6 +54,19 @@ type HandlerContext = {
 type LifecycleEventBus = {
   emit?: (event: string, payload: unknown) => Promise<void>
   emitEvent?: (event: string, payload: unknown) => Promise<void>
+}
+
+function clearStaffAuthCookies(response: Response): Response {
+  const nextResponse = response instanceof NextResponse
+    ? response
+    : new NextResponse(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+      })
+  nextResponse.cookies.set('auth_token', '', { path: '/', maxAge: 0 })
+  nextResponse.cookies.set('session_token', '', { path: '/', maxAge: 0 })
+  return nextResponse
 }
 
 function buildRequestId(req: NextRequest): string {
@@ -71,9 +103,11 @@ async function emitLifecycleEvent(eventId: ApplicationLifecycleEventId, payload:
 
 function extractMethodMetadata(metadata: unknown, method: HttpMethod): MethodMetadata | null {
   if (!metadata || typeof metadata !== 'object') return null
-  const entry = (metadata as Partial<Record<HttpMethod, unknown>>)[method]
-  if (!entry || typeof entry !== 'object') return null
-  const source = entry as Record<string, unknown>
+  const metadataRecord = metadata as Partial<Record<HttpMethod, unknown>>
+  const entry = metadataRecord[method]
+  const source = entry && typeof entry === 'object'
+    ? entry as Record<string, unknown>
+    : metadata as Record<string, unknown>
   const normalized: MethodMetadata = {}
   if (typeof source.requireAuth === 'boolean') normalized.requireAuth = source.requireAuth
   if (Array.isArray(source.requireRoles)) {
@@ -93,27 +127,45 @@ function extractMethodMetadata(metadata: unknown, method: HttpMethod): MethodMet
       }
     }
   }
-  return normalized
+  if (typeof source.skipModuleResourceUsageTracking === 'boolean') {
+    normalized.skipModuleResourceUsageTracking = source.skipModuleResourceUsageTracking
+  }
+  return Object.keys(normalized).length > 0 ? normalized : null
 }
 
-async function checkAuthorization(
+function normalizeLoadedMetadata(
+  metadata: unknown,
+  method: HttpMethod,
+  routeKind: 'route-file' | 'legacy'
+): unknown {
+  if (routeKind !== 'legacy') return metadata
+  if (!metadata || typeof metadata !== 'object') return metadata
+  const source = metadata as Record<string, unknown>
+  if (['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].some((entryMethod) => entryMethod in source)) {
+    return metadata
+  }
+  return { [method]: metadata }
+}
+
+export async function checkAuthorization(
   methodMetadata: MethodMetadata | null,
   auth: AuthContext,
   req: NextRequest
 ): Promise<NextResponse | null> {
   const { t } = await resolveTranslations()
-  if (methodMetadata?.requireAuth && !auth) {
+  const requiresAuthentication = methodMetadata?.requireAuth !== false
+  if (requiresAuthentication && !auth) {
     return NextResponse.json({ error: t('api.errors.unauthorized', 'Unauthorized') }, { status: 401 })
   }
 
-  const requiredRoles = methodMetadata?.requireRoles ?? []
   const requiredFeatures = methodMetadata?.requireFeatures ?? []
 
-  if (
-    requiredRoles.length &&
-    (!auth || !Array.isArray(auth.roles) || !requiredRoles.some((role) => auth.roles!.includes(role)))
-  ) {
-    return NextResponse.json({ error: t('api.errors.forbidden', 'Forbidden'), requiredRoles }, { status: 403 })
+  // `requireRoles` is deprecated and intentionally NOT enforced: role names are
+  // tenant-mutable and spoofable, so honoring them would let a tenant admin create
+  // or rename a role to satisfy the guard. Authorization decisions must use
+  // immutable feature IDs via `requireFeatures`. We warn so operators migrate.
+  if (methodMetadata?.requireRoles?.length) {
+    warnDeprecatedRequireRoles(req.nextUrl.pathname, req.method.toUpperCase() as HttpMethod)
   }
 
   let container: Awaited<ReturnType<typeof createRequestContainer>> | null = null
@@ -122,25 +174,32 @@ async function checkAuthorization(
     return container
   }
 
-  if (auth && methodMetadata?.requireAuth !== false) {
-    const rawTenantCandidate = await extractTenantCandidate(req)
-    if (rawTenantCandidate !== undefined) {
+  if (auth && requiresAuthentication) {
+    // HTTP parameter pollution hardening (issue #2665): a request can carry `tenantId`
+    // more than once — repeated `?tenantId=` query params, or in both the query string
+    // and the body. The dispatcher and downstream handlers may disagree on which
+    // occurrence wins (here historically `getAll().last`, handlers use `get()` first),
+    // so the authorization gate must validate EVERY distinct candidate. If any one
+    // targets a tenant the actor may not select, the request is rejected — making this
+    // decision binding regardless of how a handler later parses the same request.
+    const rawTenantCandidates = await extractTenantCandidates(req)
+    const actorTenant = normalizeTenantId(auth.tenantId ?? null) ?? null
+    const enforcedCandidates = new Set<string | null>()
+    for (const rawTenantCandidate of rawTenantCandidates) {
       const tenantCandidate = sanitizeTenantCandidate(rawTenantCandidate)
-      if (tenantCandidate !== undefined) {
-        const normalizedCandidate = normalizeTenantId(tenantCandidate) ?? null
-        const actorTenant = normalizeTenantId(auth.tenantId ?? null) ?? null
-        const tenantDiffers = normalizedCandidate !== actorTenant
-        if (tenantDiffers) {
-          try {
-            const guardContainer = await ensureContainer()
-            await enforceTenantSelection({ auth, container: guardContainer }, tenantCandidate)
-          } catch (error) {
-            if (error instanceof CrudHttpError) {
-              return NextResponse.json(error.body ?? { error: t('api.errors.forbidden', 'Forbidden') }, { status: error.status })
-            }
-            throw error
-          }
+      if (tenantCandidate === undefined) continue
+      const normalizedCandidate = normalizeTenantId(tenantCandidate) ?? null
+      if (normalizedCandidate === actorTenant) continue
+      if (enforcedCandidates.has(normalizedCandidate)) continue
+      enforcedCandidates.add(normalizedCandidate)
+      try {
+        const guardContainer = await ensureContainer()
+        await enforceTenantSelection({ auth, container: guardContainer }, tenantCandidate)
+      } catch (error) {
+        if (isCrudHttpError(error)) {
+          return NextResponse.json(error.body ?? { error: t('api.errors.forbidden', 'Forbidden') }, { status: error.status })
         }
+        throw error
       }
     }
   }
@@ -204,17 +263,12 @@ function sanitizeTenantCandidate(candidate: unknown): unknown {
   return candidate
 }
 
-async function extractTenantCandidate(req: NextRequest): Promise<unknown> {
-  const tenantParams = req.nextUrl?.searchParams?.getAll?.('tenantId') ?? []
-  if (tenantParams.length > 0) {
-    return tenantParams[tenantParams.length - 1]
-  }
-
+function bodyCarriesTenantId(req: NextRequest): boolean {
   const method = (req.method || 'GET').toUpperCase()
-  if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') {
-    return undefined
-  }
+  return method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS'
+}
 
+async function extractBodyTenantCandidate(req: NextRequest): Promise<unknown> {
   const rawContentType = req.headers.get('content-type')
   if (!rawContentType) return undefined
   const contentType = rawContentType.split(';')[0].trim().toLowerCase()
@@ -229,7 +283,7 @@ async function extractTenantCandidate(req: NextRequest): Promise<unknown> {
       const form = await req.clone().formData()
       if (form.has('tenantId')) {
         const value = form.get('tenantId')
-        if (value instanceof File) return value.name
+        if (value instanceof File) return undefined
         return value
       }
     }
@@ -238,6 +292,35 @@ async function extractTenantCandidate(req: NextRequest): Promise<unknown> {
   }
 
   return undefined
+}
+
+export async function extractTenantCandidate(req: NextRequest): Promise<unknown> {
+  const tenantParams = req.nextUrl?.searchParams?.getAll?.('tenantId') ?? []
+  if (tenantParams.length > 0) {
+    return tenantParams[tenantParams.length - 1]
+  }
+
+  if (!bodyCarriesTenantId(req)) {
+    return undefined
+  }
+
+  return extractBodyTenantCandidate(req)
+}
+
+// Returns every `tenantId` candidate the request carries — each repeated `?tenantId=`
+// query param plus any body-level value. The dispatcher enforces tenant selection
+// against all of them so a downstream handler that reads a different occurrence
+// (e.g. `searchParams.get()` first vs. `getAll()` last) cannot be tricked into using a
+// candidate that was never authorized (issue #2665).
+export async function extractTenantCandidates(req: NextRequest): Promise<unknown[]> {
+  const candidates: unknown[] = [...(req.nextUrl?.searchParams?.getAll?.('tenantId') ?? [])]
+
+  if (bodyCarriesTenantId(req)) {
+    const bodyCandidate = await extractBodyTenantCandidate(req)
+    if (bodyCandidate !== undefined) candidates.push(bodyCandidate)
+  }
+
+  return candidates
 }
 
 async function handleRequest(
@@ -257,8 +340,8 @@ async function handleRequest(
     receivedAt: new Date().toISOString(),
   }
   await emitLifecycleEvent(applicationLifecycleEvents.requestReceived, receivedPayload)
-  const api = findApi(modules, method, pathname)
-  if (!api) {
+  const match = findApiRouteManifestMatch(getApiRouteManifests(), method, pathname)
+  if (!match) {
     const response = NextResponse.json({ error: t('api.errors.notFound', 'Not Found') }, { status: 404 })
     await emitLifecycleEvent(applicationLifecycleEvents.requestNotFound, {
       ...receivedPayload,
@@ -267,7 +350,23 @@ async function handleRequest(
     })
     return response
   }
-  const auth = await getAuthFromRequest(req)
+  const loadedRouteModule = await match.route.load()
+  const rawHandler = match.route.kind === 'legacy'
+    ? (loadedRouteModule.default ?? loadedRouteModule[method] ?? loadedRouteModule.handler)
+    : loadedRouteModule[method]
+  if (typeof rawHandler !== 'function') {
+    const response = NextResponse.json({ error: t('api.errors.notFound', 'Not Found') }, { status: 404 })
+    await emitLifecycleEvent(applicationLifecycleEvents.requestNotFound, {
+      ...receivedPayload,
+      status: response.status,
+      durationMs: Date.now() - startedAt,
+    })
+    return response
+  }
+  const handler = rawHandler as (req: NextRequest, ctx?: HandlerContext) => Promise<Response> | Response
+  const routeMetadata = normalizeLoadedMetadata(loadedRouteModule.metadata, method, match.route.kind)
+  const authResolution = await resolveAuthFromRequestDetailed(req)
+  const auth = authResolution.auth
   await emitLifecycleEvent(applicationLifecycleEvents.requestAuthResolved, {
     ...receivedPayload,
     authenticated: !!auth,
@@ -275,49 +374,32 @@ async function handleRequest(
     tenantId: auth?.tenantId ?? null,
   })
 
-  const methodMetadata = extractMethodMetadata(api.metadata, method)
+  const methodMetadata = extractMethodMetadata(routeMetadata, method)
   const authError = await checkAuthorization(methodMetadata, auth, req)
   if (authError) {
-    await emitLifecycleEvent(applicationLifecycleEvents.requestAuthorizationDenied, {
-      ...receivedPayload,
-      status: authError.status,
-      userId: auth?.sub ?? null,
-      tenantId: auth?.tenantId ?? null,
-      durationMs: Date.now() - startedAt,
-    })
-    return authError
-  }
-
-  if (methodMetadata?.rateLimit) {
-    const rateLimiterService = getCachedRateLimiterService()
-    if (rateLimiterService) {
-      const clientIp = getClientIp(req, rateLimiterService.trustProxyDepth)
-      if (clientIp) {
-        const rateLimitError = await checkRateLimit(
-          rateLimiterService,
-          methodMetadata.rateLimit,
-          clientIp,
-          t(RATE_LIMIT_ERROR_KEY, RATE_LIMIT_ERROR_FALLBACK),
-        )
-        if (rateLimitError) {
-          await emitLifecycleEvent(applicationLifecycleEvents.requestRateLimited, {
-            ...receivedPayload,
-            status: rateLimitError.status,
-            clientIp,
-            userId: auth?.sub ?? null,
-            tenantId: auth?.tenantId ?? null,
-            durationMs: Date.now() - startedAt,
-          })
-          return rateLimitError
-        }
-      }
+    // Auth could not be verified because of a transient/unexpected failure (DB
+    // unavailable, pool exhausted, timeout). Do NOT clear the session cookies or
+    // return 401 — that would force-log-out every active user at once during a
+    // shared infrastructure blip (issue #4176). Return a retryable 503 instead
+    // and leave the cookies intact so the session survives once the DB recovers.
+    if (authResolution.status === 'error' && authError.status === 401) {
+      const response = NextResponse.json(
+        { error: t('api.errors.serviceUnavailable', 'Service temporarily unavailable') },
+        { status: 503, headers: { 'retry-after': '2' } },
+      )
+      await emitLifecycleEvent(applicationLifecycleEvents.requestAuthorizationDenied, {
+        ...receivedPayload,
+        status: response.status,
+        userId: auth?.sub ?? null,
+        tenantId: auth?.tenantId ?? null,
+        durationMs: Date.now() - startedAt,
+      })
+      return response
     }
-  }
-
-  try {
-    const handlerContext: HandlerContext = { params: api.params, auth }
-    const response = await runWithCacheTenant(auth?.tenantId ?? null, () => api.handler(req, handlerContext))
-    await emitLifecycleEvent(applicationLifecycleEvents.requestCompleted, {
+    const response = authResolution.status === 'invalid' && authError.status === 401
+      ? clearStaffAuthCookies(authError)
+      : authError
+    await emitLifecycleEvent(applicationLifecycleEvents.requestAuthorizationDenied, {
       ...receivedPayload,
       status: response.status,
       userId: auth?.sub ?? null,
@@ -325,6 +407,57 @@ async function handleRequest(
       durationMs: Date.now() - startedAt,
     })
     return response
+  }
+
+  if (methodMetadata?.rateLimit) {
+    const rateLimiterService = getCachedRateLimiterService()
+    if (rateLimiterService) {
+      const clientIp = getClientIp(req, rateLimiterService.trustProxyDepth)
+      const rateLimitError = await checkRateLimit(
+        rateLimiterService,
+        methodMetadata.rateLimit,
+        clientIp ?? RATE_LIMIT_FALLBACK_KEY,
+        t(RATE_LIMIT_ERROR_KEY, RATE_LIMIT_ERROR_FALLBACK),
+      )
+      if (rateLimitError) {
+        await emitLifecycleEvent(applicationLifecycleEvents.requestRateLimited, {
+          ...receivedPayload,
+          status: rateLimitError.status,
+          clientIp,
+          userId: auth?.sub ?? null,
+          tenantId: auth?.tenantId ?? null,
+          durationMs: Date.now() - startedAt,
+        })
+        return rateLimitError
+      }
+    }
+  }
+
+  try {
+    const handlerContext: HandlerContext = { params: match.params, auth }
+    const runHandler = () => runWithCacheTenant(auth?.tenantId ?? null, () => handler(req, handlerContext))
+    const response = methodMetadata?.skipModuleResourceUsageTracking !== true
+      ? await withModuleResourceUsage(
+        {
+          moduleId: match.route.moduleId,
+          surface: 'api',
+          operation: `${method} ${match.route.path}`,
+          resourceId: `${method} ${match.route.path}`,
+        },
+        runHandler,
+      )
+      : await runHandler()
+    const finalResponse = authResolution.status === 'invalid' && response.status === 401
+      ? clearStaffAuthCookies(response)
+      : response
+    await emitLifecycleEvent(applicationLifecycleEvents.requestCompleted, {
+      ...receivedPayload,
+      status: finalResponse.status,
+      userId: auth?.sub ?? null,
+      tenantId: auth?.tenantId ?? null,
+      durationMs: Date.now() - startedAt,
+    })
+    return finalResponse
   } catch (error) {
     await emitLifecycleEvent(applicationLifecycleEvents.requestFailed, {
       ...receivedPayload,

@@ -2,7 +2,14 @@
 
 import * as React from 'react'
 import type { DashboardWidgetComponentProps } from '@open-mercato/shared/modules/dashboard/widgets'
-import { DEFAULT_SETTINGS, hydrateWelcomeSettings, type WelcomeSettings } from './config'
+import {
+  DEFAULT_SETTINGS,
+  WELCOME_HEADLINE_KEY,
+  WELCOME_MESSAGE_KEY,
+  hydrateWelcomeSettings,
+  resolveWelcomeText,
+  type WelcomeSettings,
+} from './config'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
 
 const WelcomeWidgetClient: React.FC<DashboardWidgetComponentProps<WelcomeSettings>> = ({
@@ -40,7 +47,7 @@ const WelcomeWidgetClient: React.FC<DashboardWidgetComponentProps<WelcomeSetting
           </label>
           <input
             id="welcome-headline"
-            className="w-full rounded-md border px-3 py-2 text-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+            className="w-full rounded-md border px-3 py-2 text-sm focus-visible:border-ring focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
             value={value.headline}
             onChange={(event) => handleChange('headline', event.target.value)}
             placeholder={t('example.widgets.welcome.settings.headlinePlaceholder', 'Welcome back, {{user}}!')}
@@ -55,24 +62,26 @@ const WelcomeWidgetClient: React.FC<DashboardWidgetComponentProps<WelcomeSetting
           </label>
           <textarea
             id="welcome-message"
-            className="min-h-[120px] w-full resize-y rounded-md border px-3 py-2 text-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+            className="min-h-[120px] w-full resize-y rounded-md border px-3 py-2 text-sm focus-visible:border-ring focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
             value={value.message ?? ''}
             onChange={(event) => handleChange('message', event.target.value)}
-            placeholder={DEFAULT_SETTINGS.message}
+            placeholder={t('example.widgets.welcome.settings.messagePlaceholder', DEFAULT_SETTINGS.message ?? '')}
           />
         </div>
       </form>
     )
   }
-  const headline = value.headline.includes('{{user}}')
-    ? value.headline.replace(/{{user}}/g, userLabel)
-    : value.headline
+  const headlineTemplate = resolveWelcomeText(value.headline, DEFAULT_SETTINGS.headline, WELCOME_HEADLINE_KEY, t)
+  const headline = headlineTemplate.includes('{{user}}')
+    ? headlineTemplate.replace(/{{user}}/g, userLabel)
+    : headlineTemplate
+  const message = resolveWelcomeText(value.message ?? '', DEFAULT_SETTINGS.message ?? '', WELCOME_MESSAGE_KEY, t)
 
   return (
     <div className="space-y-2">
       <h2 className="text-lg font-semibold leading-tight">{headline}</h2>
-      {value.message ? (
-        <p className="text-sm text-muted-foreground whitespace-pre-line">{value.message}</p>
+      {message ? (
+        <p className="text-sm text-muted-foreground whitespace-pre-line">{message}</p>
       ) : null}
     </div>
   )

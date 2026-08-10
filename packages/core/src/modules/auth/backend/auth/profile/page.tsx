@@ -12,6 +12,9 @@ import { LoadingMessage, ErrorMessage } from '@open-mercato/ui/backend/detail'
 import { Button } from '@open-mercato/ui/primitives/button'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
 import { buildPasswordSchema, formatPasswordRequirements, getPasswordPolicy } from '@open-mercato/shared/lib/auth/passwordPolicy'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('auth').child({ component: 'profile-page' })
 
 type ProfileResponse = {
   email?: string | null
@@ -24,6 +27,7 @@ type ProfileUpdateResponse = {
 
 type ProfileFormValues = {
   email: string
+  currentPassword?: string
   password?: string
   confirmPassword?: string
 }
@@ -54,11 +58,11 @@ export default function AuthProfilePage() {
       setError(null)
       try {
         const { ok, result } = await apiCall<ProfileResponse>('/api/auth/profile')
-        if (!ok) throw new Error('load_failed')
+        if (!ok) throw new Error(t('auth.profile.form.errors.load', 'Failed to load profile.'))
         const resolvedEmail = typeof result?.email === 'string' ? result.email : ''
         if (!cancelled) setEmail(resolvedEmail)
       } catch (err) {
-        console.error('Failed to load auth profile', err)
+        logger.error('Failed to load auth profile', { err })
         if (!cancelled) setError(t('auth.profile.form.errors.load', 'Failed to load profile.'))
       } finally {
         if (!cancelled) setLoading(false)
@@ -71,12 +75,21 @@ export default function AuthProfilePage() {
   const fields = React.useMemo<CrudField[]>(() => [
     { id: 'email', label: t('auth.profile.form.email', 'Email'), type: 'text', required: true },
     {
+      id: 'currentPassword',
+      label: t('auth.profile.form.currentPassword', 'Current password'),
+      type: 'password',
+    },
+    {
       id: 'password',
       label: t('auth.profile.form.password', 'New password'),
-      type: 'text',
+      type: 'password',
       description: passwordDescription,
     },
-    { id: 'confirmPassword', label: t('auth.profile.form.confirmPassword', 'Confirm new password'), type: 'text' },
+    {
+      id: 'confirmPassword',
+      label: t('auth.profile.form.confirmPassword', 'Confirm new password'),
+      type: 'password',
+    },
   ], [passwordDescription, t])
 
   const schema = React.useMemo(() => {
@@ -87,12 +100,37 @@ export default function AuthProfilePage() {
     const optionalPasswordSchema = z.union([z.literal(''), passwordSchema]).optional()
     return z.object({
       email: z.string().trim().min(1, t('auth.profile.form.errors.emailRequired', 'Email is required.')),
+      currentPassword: z.string().optional(),
       password: optionalPasswordSchema,
       confirmPassword: z.string().optional(),
     }).superRefine((values, ctx) => {
+      const currentPassword = values.currentPassword?.trim() ?? ''
       const password = values.password?.trim() ?? ''
       const confirmPassword = values.confirmPassword?.trim() ?? ''
-      if ((password || confirmPassword) && password !== confirmPassword) {
+      const hasPasswordIntent = Boolean(currentPassword || password || confirmPassword)
+
+      if (hasPasswordIntent && !currentPassword) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: t('auth.profile.form.errors.currentPasswordRequired', 'Current password is required.'),
+          path: ['currentPassword'],
+        })
+      }
+      if (hasPasswordIntent && !password) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: t('auth.profile.form.errors.newPasswordRequired', 'New password is required.'),
+          path: ['password'],
+        })
+      }
+      if (hasPasswordIntent && !confirmPassword) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: t('auth.profile.form.errors.confirmPasswordRequired', 'Please confirm the new password.'),
+          path: ['confirmPassword'],
+        })
+      }
+      if (password && confirmPassword && password !== confirmPassword) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           message: t('auth.profile.form.errors.passwordMismatch', 'Passwords do not match.'),
@@ -104,14 +142,16 @@ export default function AuthProfilePage() {
 
   const handleSubmit = React.useCallback(async (values: ProfileFormValues) => {
     const nextEmail = values.email?.trim() ?? ''
+    const currentPassword = values.currentPassword?.trim() ?? ''
     const password = values.password?.trim() ?? ''
 
     if (!password && nextEmail === email) {
       throw createCrudFormError(t('auth.profile.form.errors.noChanges', 'No changes to save.'))
     }
 
-    const payload: { email: string; password?: string } = { email: nextEmail }
+    const payload: { email: string; currentPassword?: string; password?: string } = { email: nextEmail }
     if (password) payload.password = password
+    if (password) payload.currentPassword = currentPassword
 
     const result = await readApiResultOrThrow<ProfileUpdateResponse>(
       '/api/auth/profile',
@@ -158,6 +198,7 @@ export default function AuthProfilePage() {
               fields={fields}
               initialValues={{
                 email,
+                currentPassword: '',
                 password: '',
                 confirmPassword: '',
               }}

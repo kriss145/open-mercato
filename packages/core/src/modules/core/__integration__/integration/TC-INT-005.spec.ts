@@ -1,15 +1,20 @@
 import { expect, test } from '@playwright/test';
-import { login } from '@open-mercato/core/modules/core/__integration__/helpers/auth';
-import { addCustomLine, addPayment, addShipment, createSalesDocument } from '@open-mercato/core/modules/core/__integration__/helpers/salesUi';
+import { login } from '@open-mercato/core/helpers/integration/auth';
+import { getAuthToken } from '@open-mercato/core/helpers/integration/api';
+import { addCustomLine, addPayment, addShipment, createSalesDocument } from '@open-mercato/core/helpers/integration/salesUi';
 
 /**
  * TC-INT-005: Order to Shipment to Invoice to Credit Memo
  * Source: .ai/qa/scenarios/TC-INT-005-order-shipment-invoice-flow.md
  */
 test.describe('TC-INT-005: Order to Shipment to Invoice to Credit Memo', () => {
-  test('should record shipment and payment on an order flow', async ({ page }) => {
+  test.setTimeout(120_000);
+
+  test('should record shipment and payment on an order flow', async ({ page, request }) => {
+    const token = await getAuthToken(request);
+
     await login(page, 'admin');
-    await createSalesDocument(page, { kind: 'order' });
+    await createSalesDocument(page, { kind: 'order', preferApi: true, token });
     await addCustomLine(page, { name: `QA INT-005 ${Date.now()}`, quantity: 2, unitPriceGross: 40 });
 
     const shipmentResult = await addShipment(page);

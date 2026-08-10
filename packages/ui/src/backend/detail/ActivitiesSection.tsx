@@ -4,6 +4,13 @@ import * as React from 'react'
 import Link from 'next/link'
 import { ArrowUpRightSquare, Pencil, Plus, Trash2 } from 'lucide-react'
 import { Button } from '@open-mercato/ui/primitives/button'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@open-mercato/ui/primitives/select'
 import { flash } from '@open-mercato/ui/backend/FlashMessages'
 import { createCrudFormError } from '@open-mercato/ui/backend/utils/serverErrors'
 import { CrudForm, type CrudField, type CrudFormGroup } from '@open-mercato/ui/backend/CrudForm'
@@ -16,6 +23,8 @@ import { useT } from '@open-mercato/shared/lib/i18n/context'
 import { createTranslatorWithFallback } from '@open-mercato/shared/lib/i18n/translate'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@open-mercato/ui/primitives/dialog'
 import { useConfirmDialog } from '../confirm-dialog'
+import { ComponentReplacementHandles } from '@open-mercato/shared/modules/widgets/component-registry'
+import { useRegisteredComponent } from '../injection/useRegisteredComponent'
 
 type Translator = (key: string, fallback?: string, params?: Record<string, string | number>) => string
 
@@ -175,7 +184,7 @@ function TimelineItemHeader({
   return (
     <div className={['flex items-start gap-3', className].filter(Boolean).join(' ')}>
       {iconNode ? (
-        <span className={['inline-flex items-center justify-center rounded border border-border bg-muted/40', wrapperSize].join(' ')}>
+        <span className={['inline-flex items-center justify-center rounded border border-border bg-muted/50', wrapperSize].join(' ')}>
           {iconNode}
         </span>
       ) : null}
@@ -320,17 +329,21 @@ function ActivityForm({
           const currentValue =
             typeof value === 'string' && value.length ? value : normalizedEntityOptions[0]?.id ?? ''
           return (
-            <select
-              className="h-9 w-full rounded border border-muted-foreground/40 bg-background px-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
-              value={currentValue}
-              onChange={(event) => setValue(event.target.value)}
+            <Select
+              value={currentValue || undefined}
+              onValueChange={(next) => setValue(next ?? '')}
             >
-              {normalizedEntityOptions.map((option) => (
-                <option key={option.id} value={option.id}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {normalizedEntityOptions.map((option) => (
+                  <SelectItem key={option.id} value={option.id}>
+                    {option.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           )
         },
       } as CrudField)
@@ -345,20 +358,21 @@ function ActivityForm({
         component: ({ value, setValue }) => {
           const currentValue = typeof value === 'string' ? value : ''
           return (
-            <select
-              className="h-9 w-full rounded border border-muted-foreground/40 bg-background px-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
-              value={currentValue}
-              onChange={(event) => setValue(event.target.value)}
+            <Select
+              value={currentValue || undefined}
+              onValueChange={(next) => setValue(next ?? '')}
             >
-              <option value="">
-                {translate('fields.dealPlaceholder', 'No linked deal')}
-              </option>
-              {normalizedDealOptions.map((option) => (
-                <option key={option.id} value={option.id}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
+              <SelectTrigger>
+                <SelectValue placeholder={translate('fields.dealPlaceholder', 'No linked deal')} />
+              </SelectTrigger>
+              <SelectContent>
+                {normalizedDealOptions.map((option) => (
+                  <SelectItem key={option.id} value={option.id}>
+                    {option.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           )
         },
       } as CrudField)
@@ -381,6 +395,7 @@ function ActivityForm({
           allowInlineCreate
           appearanceLabels={appearanceLabels}
           selectClassName="w-full"
+          sortOptions="none"
           manageHref={manageHref}
         />
       ),
@@ -408,7 +423,7 @@ function ActivityForm({
       component: ({ value, setValue }) => (
         <input
           type="datetime-local"
-          className="w-full rounded-md border px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+          className="w-full rounded-md border px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           value={typeof value === 'string' ? value : ''}
           onChange={(event) => setValue(event.target.value || '')}
           onFocus={(event) => {
@@ -692,7 +707,7 @@ export type ActivitiesSectionProps<C = unknown> = {
   manageHref?: string
 }
 
-export function ActivitiesSection<C = unknown>({
+function ActivitiesSectionImpl<C = unknown>({
   entityId,
   dealId,
   addActionLabel,
@@ -763,22 +778,24 @@ export function ActivitiesSection<C = unknown>({
   const [initialValues, setInitialValues] = React.useState<Partial<ActivityFormBaseValues & Record<string, unknown>> | undefined>(undefined)
   const [visibleCount, setVisibleCount] = React.useState(0)
   const pendingCounterRef = React.useRef(0)
+  const onLoadingChangeRef = React.useRef(onLoadingChange)
+  React.useEffect(() => { onLoadingChangeRef.current = onLoadingChange })
 
   const t = translate
 
   const pushLoading = React.useCallback(() => {
     pendingCounterRef.current += 1
     if (pendingCounterRef.current === 1) {
-      onLoadingChange?.(true)
+      onLoadingChangeRef.current?.(true)
     }
-  }, [onLoadingChange])
+  }, [])
 
   const popLoading = React.useCallback(() => {
     pendingCounterRef.current = Math.max(0, pendingCounterRef.current - 1)
     if (pendingCounterRef.current === 0) {
-      onLoadingChange?.(false)
+      onLoadingChangeRef.current?.(false)
     }
-  }, [onLoadingChange])
+  }, [])
 
   const updateVisibleCount = React.useCallback((length: number) => {
     if (!length) {
@@ -838,12 +855,12 @@ export function ActivitiesSection<C = unknown>({
       setLoadError(null)
       setIsLoading(false)
       pendingCounterRef.current = 0
-      onLoadingChange?.(false)
+      onLoadingChangeRef.current?.(false)
       updateVisibleCount(0)
       return
     }
     loadActivities().catch(() => {})
-  }, [dealId, entityId, loadActivities, onLoadingChange, updateVisibleCount])
+  }, [dealId, entityId, loadActivities, updateVisibleCount])
 
   const openCreateDialog = React.useCallback(() => {
     setDialogMode('create')
@@ -913,12 +930,6 @@ export function ActivitiesSection<C = unknown>({
         await dataAdapter.create({ ...payload, context: dataContext })
         await loadActivities()
         flash(t('success', 'Activity saved'), 'success')
-      } catch (err) {
-        const message =
-          err instanceof Error
-            ? err.message
-            : t('error', 'Failed to save activity')
-        throw err instanceof Error ? err : new Error(message)
       } finally {
         setPendingAction(null)
         popLoading()
@@ -950,12 +961,6 @@ export function ActivitiesSection<C = unknown>({
         await dataAdapter.update({ id: activityId, patch, context: dataContext })
         await loadActivities()
         flash(t('updateSuccess', 'Activity updated.'), 'success')
-      } catch (err) {
-        const message =
-          err instanceof Error
-            ? err.message
-            : t('error', 'Failed to save activity')
-        throw err instanceof Error ? err : new Error(message)
       } finally {
         setPendingAction(null)
         popLoading()
@@ -968,8 +973,7 @@ export function ActivitiesSection<C = unknown>({
     async (activity: ActivitySummary) => {
       if (!activity.id) return
       const confirmed = await confirm({
-        title: t('deleteConfirm', 'Delete this activity?'),
-        text: 'This action cannot be undone.',
+        title: t('deleteConfirm', 'Delete this activity? You can restore it using version history.'),
         variant: 'destructive',
       })
       if (!confirmed) return
@@ -984,7 +988,6 @@ export function ActivitiesSection<C = unknown>({
             ? err.message
             : t('deleteError', 'Failed to delete activity.')
         flash(message, 'error')
-        throw err instanceof Error ? err : new Error(message)
       } finally {
         setPendingAction(null)
       }
@@ -994,14 +997,20 @@ export function ActivitiesSection<C = unknown>({
 
   const handleDialogSubmit = React.useCallback(
     async (payload: ActivityFormSubmitPayload) => {
-      if (dialogMode === 'edit' && editingActivityId) {
-        await handleUpdate(editingActivityId, payload)
-      } else {
-        await handleCreate(payload)
+      try {
+        if (dialogMode === 'edit' && editingActivityId) {
+          await handleUpdate(editingActivityId, payload)
+        } else {
+          await handleCreate(payload)
+        }
+        closeDialog()
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : t('error', 'Failed to save activity')
+        flash(message, 'error')
       }
-      closeDialog()
     },
-    [closeDialog, dialogMode, editingActivityId, handleCreate, handleUpdate],
+    [closeDialog, dialogMode, editingActivityId, handleCreate, handleUpdate, t],
   )
 
   React.useEffect(() => {
@@ -1124,7 +1133,7 @@ export function ActivitiesSection<C = unknown>({
                   return (
                     <div
                       key={activity.id}
-                      className="group space-y-3 rounded-lg border bg-card p-4 transition hover:border-border/80 cursor-pointer"
+                      className="group space-y-3 rounded-lg border bg-card p-4 transition hover:border-border/70 cursor-pointer"
                       role="button"
                       tabIndex={0}
                       onClick={() => openEditDialog(activity)}
@@ -1244,6 +1253,20 @@ export function ActivitiesSection<C = unknown>({
         appearanceLabels={appearanceLabels}
       />
       {ConfirmDialogElement}
+    </div>
+  )
+}
+
+export function ActivitiesSection<C = unknown>(props: ActivitiesSectionProps<C>) {
+  const handle = ComponentReplacementHandles.section('ui.detail', 'ActivitiesSection')
+  const Resolved = useRegisteredComponent<ActivitiesSectionProps<C>>(
+    handle,
+    ActivitiesSectionImpl as React.ComponentType<ActivitiesSectionProps<C>>,
+  )
+
+  return (
+    <div data-component-handle={handle}>
+      <Resolved {...props} />
     </div>
   )
 }

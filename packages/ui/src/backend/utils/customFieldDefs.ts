@@ -19,10 +19,13 @@ export type CustomFieldDefDto = {
   input?: string
   priority?: number
   fieldset?: string
+  fieldsets?: string[]
   group?: { code: string; title?: string; hint?: string }
   // attachments-specific config
   maxAttachmentSizeMb?: number
   acceptExtensions?: string[]
+  // phone-specific config
+  defaultCountryIso2?: string
   // optional validation rules
   validation?: Array<
     | { rule: 'required'; message: string }
@@ -35,6 +38,7 @@ export type CustomFieldDefDto = {
   >
   dictionaryId?: string
   dictionaryInlineCreate?: boolean
+  defaultValue?: string | number | boolean | null
 }
 
 export type CustomFieldsetGroupDto = {

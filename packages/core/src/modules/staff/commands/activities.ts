@@ -7,6 +7,7 @@ import {
   requireId,
   parseWithCustomFields,
   setCustomFieldsIfAny,
+  normalizeAuthorUserId,
 } from '@open-mercato/shared/lib/commands/helpers'
 import type { DataEngine } from '@open-mercato/shared/lib/data/engine'
 import type { EntityManager } from '@mikro-orm/postgresql'
@@ -20,7 +21,22 @@ import {
   type StaffTeamMemberActivityCreateInput,
   type StaffTeamMemberActivityUpdateInput,
 } from '../data/validators'
-import { ensureOrganizationScope, ensureTenantScope, extractUndoPayload, requireTeamMember } from './shared'
+import { staffTeamMemberActivityCrudEvents } from '../lib/crud'
+import {
+  applyScopeToWhere,
+  commandActorScope,
+  commandInputScope,
+  ensureOrganizationScope,
+  ensureTenantScope,
+  explicitStaffCommandScope,
+  extractUndoPayload,
+  requireTeamMember,
+  scopedStaffSnapshotWhere,
+  staffSnapshotScopeFromContext,
+  staffSnapshotScopeFromSnapshot,
+  type StaffSnapshotScope,
+} from './shared'
+import { resolveRedoSnapshot } from '@open-mercato/shared/lib/commands/redo'
 import { E } from '#generated/entities.ids.generated'
 import {
   loadCustomFieldSnapshot,
@@ -59,8 +75,8 @@ type ActivityChangeMap = Record<string, { from: unknown; to: unknown }> & {
   custom?: CustomFieldChangeSet
 }
 
-async function loadActivitySnapshot(em: EntityManager, id: string): Promise<ActivitySnapshot | null> {
-  const activity = await em.findOne(StaffTeamMemberActivity, { id })
+async function loadActivitySnapshot(em: EntityManager, id: string, scope?: StaffSnapshotScope | null): Promise<ActivitySnapshot | null> {
+  const activity = await em.findOne(StaffTeamMemberActivity, scopedStaffSnapshotWhere(id, scope))
   if (!activity) return null
   const custom = await loadCustomFieldSnapshot(em, {
     entityId: E.staff.staff_team_member_activity,
@@ -115,16 +131,16 @@ const createActivityCommand: CommandHandler<
     const { parsed, custom } = parseWithCustomFields(staffTeamMemberActivityCreateSchema, rawInput)
     ensureTenantScope(ctx, parsed.tenantId)
     ensureOrganizationScope(ctx, parsed.organizationId)
-    const authSub = ctx.auth?.isApiKey ? null : ctx.auth?.sub ?? null
-    const normalizedAuthor = (() => {
-      if (parsed.authorUserId) return parsed.authorUserId
-      if (!authSub) return null
-      const uuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/
-      return uuidRegex.test(authSub) ? authSub : null
-    })()
+    const scope = commandInputScope(ctx, parsed.tenantId, parsed.organizationId)
+    const normalizedAuthor = normalizeAuthorUserId(parsed.authorUserId, ctx.auth)
 
     const em = (ctx.container.resolve('em') as EntityManager).fork()
-    const member = await requireTeamMember(em, parsed.entityId, 'Team member not found')
+    const member = await requireTeamMember(
+      em,
+      parsed.entityId,
+      scope,
+      'Team member not found',
+    )
     ensureTenantScope(ctx, member.tenantId)
     ensureOrganizationScope(ctx, member.organizationId)
 
@@ -157,6 +173,7 @@ const createActivityCommand: CommandHandler<
         organizationId: activity.organizationId,
         tenantId: activity.tenantId,
       },
+      events: staffTeamMemberActivityCrudEvents,
       indexer: activityCrudIndexer,
     })
 
@@ -164,7 +181,7 @@ const createActivityCommand: CommandHandler<
   },
   captureAfter: async (_input, result, ctx) => {
     const em = (ctx.container.resolve('em') as EntityManager).fork()
-    return await loadActivitySnapshot(em, result.activityId)
+    return await loadActivitySnapshot(em, result.activityId, staffSnapshotScopeFromContext(ctx))
   },
   buildLog: async ({ result, snapshots }) => {
     const { translate } = await resolveTranslations()
@@ -186,14 +203,80 @@ const createActivityCommand: CommandHandler<
     }
   },
   undo: async ({ logEntry, ctx }) => {
-    const activityId = logEntry?.resourceId ?? null
+    const payload = extractUndoPayload<ActivityUndoPayload>(logEntry)
+    const after = payload?.after
+    const activityId = after?.activity.id ?? logEntry?.resourceId ?? null
     if (!activityId) return
     const em = (ctx.container.resolve('em') as EntityManager).fork()
-    const existing = await em.findOne(StaffTeamMemberActivity, { id: activityId })
+    const existing = await em.findOne(
+      StaffTeamMemberActivity,
+      scopedStaffSnapshotWhere(activityId, staffSnapshotScopeFromSnapshot(after?.activity)),
+    )
     if (existing) {
       em.remove(existing)
       await em.flush()
     }
+  },
+  redo: async ({ logEntry, ctx }) => {
+    const after = resolveRedoSnapshot<ActivitySnapshot>(logEntry)
+    if (!after) {
+      throw new CrudHttpError(400, { error: '[internal] redo snapshot unavailable for activity create' })
+    }
+    const em = (ctx.container.resolve('em') as EntityManager).fork()
+    const snapshotScope = staffSnapshotScopeFromSnapshot(after.activity)
+    const member = await requireTeamMember(
+      em,
+      after.activity.memberId,
+      explicitStaffCommandScope(after.activity.tenantId, after.activity.organizationId),
+      'Team member not found',
+    )
+    let activity = await em.findOne(StaffTeamMemberActivity, scopedStaffSnapshotWhere(after.activity.id, snapshotScope))
+    if (!activity) {
+      activity = em.create(StaffTeamMemberActivity, {
+        id: after.activity.id,
+        organizationId: after.activity.organizationId,
+        tenantId: after.activity.tenantId,
+        member,
+        activityType: after.activity.activityType,
+        subject: after.activity.subject,
+        body: after.activity.body,
+        occurredAt: after.activity.occurredAt ?? null,
+        authorUserId: after.activity.authorUserId,
+        appearanceIcon: after.activity.appearanceIcon,
+        appearanceColor: after.activity.appearanceColor,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      })
+      em.persist(activity)
+    } else {
+      activity.member = member
+      activity.activityType = after.activity.activityType
+      activity.subject = after.activity.subject
+      activity.body = after.activity.body
+      activity.occurredAt = after.activity.occurredAt ?? null
+      activity.authorUserId = after.activity.authorUserId
+      activity.appearanceIcon = after.activity.appearanceIcon
+      activity.appearanceColor = after.activity.appearanceColor
+    }
+    await em.flush()
+
+    await setActivityCustomFields(ctx, activity.id, activity.organizationId, activity.tenantId, after.custom ?? {})
+
+    const de = (ctx.container.resolve('dataEngine') as DataEngine)
+    await emitCrudSideEffects({
+      dataEngine: de,
+      action: 'created',
+      entity: activity,
+      identifiers: {
+        id: activity.id,
+        organizationId: activity.organizationId,
+        tenantId: activity.tenantId,
+      },
+      events: staffTeamMemberActivityCrudEvents,
+      indexer: activityCrudIndexer,
+    })
+
+    return { activityId: activity.id, authorUserId: activity.authorUserId ?? null }
   },
 }
 
@@ -202,19 +285,23 @@ const updateActivityCommand: CommandHandler<StaffTeamMemberActivityUpdateInput, 
   async prepare(rawInput, ctx) {
     const parsed = staffTeamMemberActivityUpdateSchema.parse(rawInput)
     const em = (ctx.container.resolve('em') as EntityManager)
-    const snapshot = await loadActivitySnapshot(em, parsed.id)
+    const snapshot = await loadActivitySnapshot(em, parsed.id, staffSnapshotScopeFromContext(ctx))
     return snapshot ? { before: snapshot } : {}
   },
   async execute(rawInput, ctx) {
     const { parsed, custom } = parseWithCustomFields(staffTeamMemberActivityUpdateSchema, rawInput)
     const em = (ctx.container.resolve('em') as EntityManager).fork()
-    const activity = await em.findOne(StaffTeamMemberActivity, { id: parsed.id })
+    const scope = commandActorScope(ctx)
+    const activity = await em.findOne(
+      StaffTeamMemberActivity,
+      applyScopeToWhere<StaffTeamMemberActivity>({ id: parsed.id }, scope),
+    )
     if (!activity) throw new CrudHttpError(404, { error: 'Activity not found' })
     ensureTenantScope(ctx, activity.tenantId)
     ensureOrganizationScope(ctx, activity.organizationId)
 
     if (parsed.entityId !== undefined) {
-      const member = await requireTeamMember(em, parsed.entityId, 'Team member not found')
+      const member = await requireTeamMember(em, parsed.entityId, scope, 'Team member not found')
       ensureTenantScope(ctx, member.tenantId)
       ensureOrganizationScope(ctx, member.organizationId)
       activity.member = member
@@ -241,6 +328,7 @@ const updateActivityCommand: CommandHandler<StaffTeamMemberActivityUpdateInput, 
         organizationId: activity.organizationId,
         tenantId: activity.tenantId,
       },
+      events: staffTeamMemberActivityCrudEvents,
       indexer: activityCrudIndexer,
     })
 
@@ -248,7 +336,7 @@ const updateActivityCommand: CommandHandler<StaffTeamMemberActivityUpdateInput, 
   },
   captureAfter: async (_input, result, ctx) => {
     const em = (ctx.container.resolve('em') as EntityManager).fork()
-    return await loadActivitySnapshot(em, result.activityId)
+    return await loadActivitySnapshot(em, result.activityId, staffSnapshotScopeFromContext(ctx))
   },
   buildLog: async ({ snapshots }) => {
     const { translate } = await resolveTranslations()
@@ -299,8 +387,14 @@ const updateActivityCommand: CommandHandler<StaffTeamMemberActivityUpdateInput, 
     const before = payload?.before
     if (!before) return
     const em = (ctx.container.resolve('em') as EntityManager).fork()
-    let activity = await em.findOne(StaffTeamMemberActivity, { id: before.activity.id })
-    const member = await requireTeamMember(em, before.activity.memberId, 'Team member not found')
+    const snapshotScope = staffSnapshotScopeFromSnapshot(before.activity)
+    let activity = await em.findOne(StaffTeamMemberActivity, scopedStaffSnapshotWhere(before.activity.id, snapshotScope))
+    const member = await requireTeamMember(
+      em,
+      before.activity.memberId,
+      explicitStaffCommandScope(before.activity.tenantId, before.activity.organizationId),
+      'Team member not found',
+    )
 
     if (!activity) {
       activity = em.create(StaffTeamMemberActivity, {
@@ -341,6 +435,7 @@ const updateActivityCommand: CommandHandler<StaffTeamMemberActivityUpdateInput, 
         organizationId: activity.organizationId,
         tenantId: activity.tenantId,
       },
+      events: staffTeamMemberActivityCrudEvents,
       indexer: activityCrudIndexer,
     })
 
@@ -365,13 +460,17 @@ const deleteActivityCommand: CommandHandler<{ body?: Record<string, unknown>; qu
     async prepare(input, ctx) {
       const id = requireId(input, 'Activity id required')
       const em = (ctx.container.resolve('em') as EntityManager)
-      const snapshot = await loadActivitySnapshot(em, id)
+      const snapshot = await loadActivitySnapshot(em, id, staffSnapshotScopeFromContext(ctx))
       return snapshot ? { before: snapshot } : {}
     },
     async execute(input, ctx) {
       const id = requireId(input, 'Activity id required')
       const em = (ctx.container.resolve('em') as EntityManager).fork()
-      const activity = await em.findOne(StaffTeamMemberActivity, { id })
+      const scope = commandActorScope(ctx)
+      const activity = await em.findOne(
+        StaffTeamMemberActivity,
+        applyScopeToWhere<StaffTeamMemberActivity>({ id }, scope),
+      )
       if (!activity) throw new CrudHttpError(404, { error: 'Activity not found' })
       ensureTenantScope(ctx, activity.tenantId)
       ensureOrganizationScope(ctx, activity.organizationId)
@@ -388,7 +487,8 @@ const deleteActivityCommand: CommandHandler<{ body?: Record<string, unknown>; qu
           organizationId: activity.organizationId,
           tenantId: activity.tenantId,
         },
-        indexer: activityCrudIndexer,
+        events: staffTeamMemberActivityCrudEvents,
+      indexer: activityCrudIndexer,
       })
       return { activityId: activity.id }
     },
@@ -417,8 +517,14 @@ const deleteActivityCommand: CommandHandler<{ body?: Record<string, unknown>; qu
       const before = payload?.before
       if (!before) return
       const em = (ctx.container.resolve('em') as EntityManager).fork()
-      const member = await requireTeamMember(em, before.activity.memberId, 'Team member not found')
-      let activity = await em.findOne(StaffTeamMemberActivity, { id: before.activity.id })
+      const snapshotScope = staffSnapshotScopeFromSnapshot(before.activity)
+      const member = await requireTeamMember(
+        em,
+        before.activity.memberId,
+        explicitStaffCommandScope(before.activity.tenantId, before.activity.organizationId),
+        'Team member not found',
+      )
+      let activity = await em.findOne(StaffTeamMemberActivity, scopedStaffSnapshotWhere(before.activity.id, snapshotScope))
       if (!activity) {
         activity = em.create(StaffTeamMemberActivity, {
           id: before.activity.id,
@@ -458,7 +564,8 @@ const deleteActivityCommand: CommandHandler<{ body?: Record<string, unknown>; qu
           organizationId: activity.organizationId,
           tenantId: activity.tenantId,
         },
-        indexer: activityCrudIndexer,
+        events: staffTeamMemberActivityCrudEvents,
+      indexer: activityCrudIndexer,
       })
 
       const resetValues = buildCustomFieldResetMap(before.custom, undefined)

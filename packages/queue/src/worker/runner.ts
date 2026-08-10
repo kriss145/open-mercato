@@ -1,5 +1,8 @@
 import { createQueue } from '../factory'
-import type { JobHandler, AsyncQueueOptions, QueueStrategyType } from '../types'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+import type { Queue, JobHandler, AsyncQueueOptions, QueueStrategyType } from '../types'
+
+const logger = createLogger('queue').child({ component: 'worker' })
 
 /**
  * Options for running a queue worker.
@@ -19,6 +22,78 @@ export type WorkerRunnerOptions<T = unknown> = {
   background?: boolean
   /** Queue strategy to use. Defaults to QUEUE_STRATEGY env var or 'local' */
   strategy?: QueueStrategyType
+}
+
+const managedQueues = new Set<Queue<unknown>>()
+const managedShutdownHooks = new Set<() => Promise<void> | void>()
+let shutdownHandlersRegistered = false
+let shutdownInProgress = false
+
+function unregisterShutdownHandlers(sigtermHandler: () => void, sigintHandler: () => void): void {
+  process.off('SIGTERM', sigtermHandler)
+  process.off('SIGINT', sigintHandler)
+  shutdownHandlersRegistered = false
+}
+
+function registerShutdownHandlers(): void {
+  if (shutdownHandlersRegistered) return
+
+  const shutdown = async (signal: string) => {
+    if (shutdownInProgress) return
+    shutdownInProgress = true
+
+    logger.info('Received signal, shutting down gracefully', { signal })
+
+    let hasError = false
+    for (const queue of managedQueues) {
+      try {
+        await queue.close()
+      } catch (error) {
+        hasError = true
+        logger.error('Error during shutdown', { err: error })
+      }
+    }
+
+    managedQueues.clear()
+    for (const hook of managedShutdownHooks) {
+      try {
+        await hook()
+      } catch (error) {
+        hasError = true
+        logger.error('Error during shutdown hook', { err: error })
+      }
+    }
+    managedShutdownHooks.clear()
+    unregisterShutdownHandlers(sigtermHandler, sigintHandler)
+    shutdownInProgress = false
+
+    if (!hasError) {
+      logger.info('Worker closed successfully')
+    }
+
+    process.exit(hasError ? 1 : 0)
+  }
+
+  const sigtermHandler = () => {
+    void shutdown('SIGTERM')
+  }
+
+  const sigintHandler = () => {
+    void shutdown('SIGINT')
+  }
+
+  process.on('SIGTERM', sigtermHandler)
+  process.on('SIGINT', sigintHandler)
+  shutdownHandlersRegistered = true
+}
+
+/**
+ * Register a process-local service that must stop before a worker exits.
+ * The returned callback removes the hook when the service is stopped early.
+ */
+export function registerWorkerShutdownHook(hook: () => Promise<void> | void): () => void {
+  managedShutdownHooks.add(hook)
+  return () => managedShutdownHooks.delete(hook)
 }
 
 /**
@@ -64,7 +139,7 @@ export async function runWorker<T = unknown>(
   const strategy: QueueStrategyType = strategyOption
     ?? (process.env.QUEUE_STRATEGY === 'async' ? 'async' : 'local')
 
-  console.log(`[worker] Starting worker for queue "${queueName}" (strategy: ${strategy})...`)
+  logger.info('Starting worker for queue', { queueName, strategy })
 
   const queue = createQueue<T>(queueName, strategy, {
     connection,
@@ -73,33 +148,21 @@ export async function runWorker<T = unknown>(
 
   // Set up graceful shutdown
   if (gracefulShutdown) {
-    const shutdown = async (signal: string) => {
-      console.log(`[worker] Received ${signal}, shutting down gracefully...`)
-      try {
-        await queue.close()
-        console.log('[worker] Worker closed successfully')
-        process.exit(0)
-      } catch (error) {
-        console.error('[worker] Error during shutdown:', error)
-        process.exit(1)
-      }
-    }
-
-    process.on('SIGTERM', () => shutdown('SIGTERM'))
-    process.on('SIGINT', () => shutdown('SIGINT'))
+    managedQueues.add(queue as Queue<unknown>)
+    registerShutdownHandlers()
   }
 
   // Start processing
   await queue.process(handler)
 
-  console.log(`[worker] Worker running with concurrency ${concurrency}`)
+  logger.info('Worker running', { concurrency })
 
   if (background) {
     // Return immediately for multi-queue mode
     return
   }
 
-  console.log('[worker] Press Ctrl+C to stop')
+  logger.info('Press Ctrl+C to stop')
 
   // Keep the process alive (single-queue mode)
   await new Promise(() => {
@@ -131,7 +194,7 @@ export function createRoutedHandler<T extends { type: string }>(
     const handler = handlers[type]
 
     if (!handler) {
-      console.warn(`[worker] No handler registered for job type "${type}"`)
+      logger.warn('No handler registered for job type', { type })
       return
     }
 

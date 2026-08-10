@@ -1,12 +1,13 @@
 import { NextResponse } from 'next/server'
 import type { OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
-import { toAbsoluteUrl } from '@open-mercato/shared/lib/url'
 import { createRequestContainer } from '@open-mercato/shared/lib/di/container'
 import { AuthService } from '@open-mercato/core/modules/auth/services/authService'
 import { signJwt } from '@open-mercato/shared/lib/auth/jwt'
 import { resolveTranslations } from '@open-mercato/shared/lib/i18n/server'
 import { refreshSessionRequestSchema } from '@open-mercato/core/modules/auth/data/validators'
 import { checkAuthRateLimit } from '@open-mercato/core/modules/auth/lib/rateLimitCheck'
+import { buildSafeRedirectResponse, resolveTrustedRedirectBase } from '@open-mercato/core/modules/auth/lib/requestRedirect'
+import { sanitizeRedirectPath } from '@open-mercato/core/modules/auth/lib/safeRedirect'
 import { readEndpointRateLimitConfig } from '@open-mercato/shared/lib/ratelimit/config'
 import { rateLimitErrorSchema } from '@open-mercato/shared/lib/ratelimit/helpers'
 import { z } from 'zod'
@@ -24,31 +25,61 @@ function parseCookie(req: Request, name: string): string | null {
   return m ? decodeURIComponent(m[1]) : null
 }
 
-function sanitizeRedirect(param: string | null, baseUrl: string): string {
-  const value = param || '/'
-  try {
-    const base = new URL(baseUrl)
-    const resolved = new URL(value, baseUrl)
-    if (resolved.origin === base.origin && resolved.pathname.startsWith('/')) {
-      return resolved.pathname + resolved.search + resolved.hash
-    }
-  } catch {}
-  return '/'
+type RefreshedSession = NonNullable<Awaited<ReturnType<AuthService['refreshFromSessionToken']>>>
+
+// Scope claims must stay absent rather than stringified when the user has no tenant/org:
+// `String(null)` yields the literal "null", which is not a UUID, so session-integrity
+// resolution rejects the token it just minted and the caller is stuck in a refresh loop.
+// Mirrors how `api/login.ts` builds the same claims.
+function buildStaffJwtClaims({ user, roles, session }: RefreshedSession) {
+  return {
+    sub: String(user.id),
+    sid: session ? String(session.id) : undefined,
+    tenantId: user.tenantId ? String(user.tenantId) : null,
+    orgId: user.organizationId ? String(user.organizationId) : null,
+    email: user.email,
+    roles,
+  }
+}
+
+function clearStaffAuthCookies(response: NextResponse) {
+  response.cookies.set('auth_token', '', {
+    httpOnly: true,
+    path: '/',
+    sameSite: 'lax',
+    secure: process.env.NODE_ENV === 'production',
+    maxAge: 0,
+  })
+  response.cookies.set('session_token', '', {
+    httpOnly: true,
+    path: '/',
+    sameSite: 'lax',
+    secure: process.env.NODE_ENV === 'production',
+    maxAge: 0,
+  })
+  return response
 }
 
 export async function GET(req: Request) {
   const url = new URL(req.url)
-  const baseUrl = process.env.APP_URL || `${url.protocol}//${url.host}`
-  const redirectTo = sanitizeRedirect(url.searchParams.get('redirect'), baseUrl)
+  const baseUrl = resolveTrustedRedirectBase(req) ?? url.origin
+  const redirectTo = sanitizeRedirectPath(url.searchParams.get('redirect'), baseUrl, '/')
   const token = parseCookie(req, 'session_token')
-  if (!token) return NextResponse.redirect(toAbsoluteUrl(req, '/login?redirect=' + encodeURIComponent(redirectTo)))
+  if (!token) {
+    return clearStaffAuthCookies(
+      buildSafeRedirectResponse(req, '/login?redirect=' + encodeURIComponent(redirectTo))
+    )
+  }
   const c = await createRequestContainer()
   const auth = c.resolve<AuthService>('authService')
   const ctx = await auth.refreshFromSessionToken(token)
-  if (!ctx) return NextResponse.redirect(toAbsoluteUrl(req, '/login?redirect=' + encodeURIComponent(redirectTo)))
-  const { user, roles } = ctx
-  const jwt = signJwt({ sub: String(user.id), tenantId: String(user.tenantId), orgId: String(user.organizationId), email: user.email, roles })
-  const res = NextResponse.redirect(toAbsoluteUrl(req, redirectTo))
+  if (!ctx) {
+    return clearStaffAuthCookies(
+      buildSafeRedirectResponse(req, '/login?redirect=' + encodeURIComponent(redirectTo))
+    )
+  }
+  const jwt = signJwt(buildStaffJwtClaims(ctx))
+  const res = buildSafeRedirectResponse(req, redirectTo)
   res.cookies.set('auth_token', jwt, { httpOnly: true, path: '/', sameSite: 'lax', secure: process.env.NODE_ENV === 'production', maxAge: 60 * 60 * 8 })
   return res
 }
@@ -76,10 +107,12 @@ export async function POST(req: Request) {
   if (rateLimitError) return rateLimitError
 
   if (!token) {
-    return NextResponse.json({
-      ok: false,
-      error: translate('auth.session.refresh.errors.invalidPayload', 'Missing or invalid refresh token'),
-    }, { status: 400 })
+    return clearStaffAuthCookies(
+      NextResponse.json({
+        ok: false,
+        error: translate('auth.session.refresh.errors.invalidPayload', 'Missing or invalid refresh token'),
+      }, { status: 400 })
+    )
   }
 
   const c = await createRequestContainer()
@@ -87,20 +120,15 @@ export async function POST(req: Request) {
   const ctx = await auth.refreshFromSessionToken(token)
 
   if (!ctx) {
-    return NextResponse.json({
-      ok: false,
-      error: translate('auth.session.refresh.errors.invalidToken', 'Invalid or expired refresh token'),
-    }, { status: 401 })
+    return clearStaffAuthCookies(
+      NextResponse.json({
+        ok: false,
+        error: translate('auth.session.refresh.errors.invalidToken', 'Invalid or expired refresh token'),
+      }, { status: 401 })
+    )
   }
 
-  const { user, roles } = ctx
-  const jwt = signJwt({
-    sub: String(user.id),
-    tenantId: String(user.tenantId),
-    orgId: String(user.organizationId),
-    email: user.email,
-    roles,
-  })
+  const jwt = signJwt(buildStaffJwtClaims(ctx))
 
   const res = NextResponse.json({
     ok: true,

@@ -15,6 +15,8 @@ import {
   type ResourcesResourceTypeCreateInput,
   type ResourcesResourceTypeUpdateInput,
 } from '../data/validators'
+import { resourcesResourceTypeCrudEvents } from '../lib/crud'
+import { makeCreateRedo } from '@open-mercato/shared/lib/commands/redo'
 import { ensureOrganizationScope, ensureTenantScope, extractUndoPayload } from './shared'
 import { E } from '#generated/entities.ids.generated'
 
@@ -110,6 +112,7 @@ const createResourceTypeCommand: CommandHandler<ResourcesResourceTypeCreateInput
         organizationId: record.organizationId,
         tenantId: record.tenantId,
       },
+      events: resourcesResourceTypeCrudEvents,
       indexer: resourceTypeCrudIndexer,
     })
     return { resourceTypeId: record.id }
@@ -163,10 +166,31 @@ const createResourceTypeCommand: CommandHandler<ResourcesResourceTypeCreateInput
           organizationId: resourceType.organizationId,
           tenantId: resourceType.tenantId,
         },
-        indexer: resourceTypeCrudIndexer,
+        events: resourcesResourceTypeCrudEvents,
+      indexer: resourceTypeCrudIndexer,
       })
     }
   },
+  redo: makeCreateRedo<ResourcesResourceType, ResourceTypeSnapshot, ResourcesResourceTypeCreateInput, { resourceTypeId: string }>({
+    entityClass: ResourcesResourceType,
+    buildResult: (entity) => ({ resourceTypeId: entity.id }),
+    events: resourcesResourceTypeCrudEvents,
+    indexer: resourceTypeCrudIndexer,
+    afterRestore: async ({ ctx, entity, logEntry }) => {
+      const payload = extractUndoPayload<ResourceTypeUndoPayload>(logEntry)
+      if (!payload?.customAfter) return
+      const dataEngine = (ctx.container.resolve('dataEngine') as DataEngine)
+      const reset = buildCustomFieldResetMap(payload.customAfter, undefined)
+      await setCustomFieldsIfAny({
+        dataEngine,
+        entityId: E.resources.resources_resource_type,
+        recordId: entity.id,
+        tenantId: entity.tenantId,
+        organizationId: entity.organizationId,
+        values: reset,
+      })
+    },
+  }),
 }
 
 const updateResourceTypeCommand: CommandHandler<ResourcesResourceTypeUpdateInput, { resourceTypeId: string }> = {
@@ -219,6 +243,7 @@ const updateResourceTypeCommand: CommandHandler<ResourcesResourceTypeUpdateInput
         organizationId: record.organizationId,
         tenantId: record.tenantId,
       },
+      events: resourcesResourceTypeCrudEvents,
       indexer: resourceTypeCrudIndexer,
     })
     return { resourceTypeId: record.id }
@@ -305,6 +330,7 @@ const updateResourceTypeCommand: CommandHandler<ResourcesResourceTypeUpdateInput
         organizationId: resourceType.organizationId,
         tenantId: resourceType.tenantId,
       },
+      events: resourcesResourceTypeCrudEvents,
       indexer: resourceTypeCrudIndexer,
     })
   },
@@ -358,6 +384,7 @@ const deleteResourceTypeCommand: CommandHandler<{ id?: string }, { resourceTypeI
         organizationId: record.organizationId,
         tenantId: record.tenantId,
       },
+      events: resourcesResourceTypeCrudEvents,
       indexer: resourceTypeCrudIndexer,
     })
     return { resourceTypeId: record.id }
@@ -434,6 +461,7 @@ const deleteResourceTypeCommand: CommandHandler<{ id?: string }, { resourceTypeI
         organizationId: resourceType.organizationId,
         tenantId: resourceType.tenantId,
       },
+      events: resourcesResourceTypeCrudEvents,
       indexer: resourceTypeCrudIndexer,
     })
   },

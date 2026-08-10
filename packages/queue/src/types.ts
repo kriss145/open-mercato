@@ -73,8 +73,14 @@ export type RedisConnectionOptions = {
   host?: string
   /** Redis port */
   port?: number
+  /** Redis username */
+  username?: string
   /** Redis password */
   password?: string
+  /** Redis database number */
+  db?: number
+  /** TLS configuration for rediss / encrypted Redis */
+  tls?: Record<string, unknown>
 }
 
 /**
@@ -94,6 +100,16 @@ export type AsyncQueueOptions = {
 export type QueueOptions<S extends QueueStrategyType> = S extends 'async'
   ? AsyncQueueOptions
   : LocalQueueOptions
+
+/**
+ * Optional job scheduling options.
+ */
+export type EnqueueOptions = {
+  /**
+   * Delay job execution by this many milliseconds.
+   */
+  delayMs?: number
+}
 
 // ============================================================================
 // Process Types
@@ -119,6 +135,12 @@ export type ProcessResult = {
   lastJobId?: string
 }
 
+export type QueueJobScope = {
+  tenantId: string
+  organizationId?: string | null
+  jobTypes?: readonly string[]
+}
+
 // ============================================================================
 // Queue Interface
 // ============================================================================
@@ -136,9 +158,10 @@ export interface Queue<T = unknown> {
   /**
    * Add a job to the queue.
    * @param data - The job payload
+   * @param options - Optional scheduling options
    * @returns Promise resolving to the job ID
    */
-  enqueue(data: T): Promise<string>
+  enqueue(data: T, options?: EnqueueOptions): Promise<string>
 
   /**
    * Process jobs from the queue.
@@ -157,6 +180,13 @@ export interface Queue<T = unknown> {
    * @returns Promise with count of removed jobs
    */
   clear(): Promise<{ removed: number }>
+
+  /**
+   * Remove queued jobs whose payload belongs to the provided tenant/org scope.
+   * Active jobs are not forcibly terminated; callers should rely on their own
+   * cancellation/heartbeat contracts for in-flight work.
+   */
+  removeQueuedJobsByScope?(scope: QueueJobScope): Promise<{ removed: number }>
 
   /**
    * Close the queue and release resources.

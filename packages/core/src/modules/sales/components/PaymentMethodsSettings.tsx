@@ -12,13 +12,12 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@open-mercato/ui/primitives/dialog'
-import { Input } from '@open-mercato/ui/primitives/input'
 import { Label } from '@open-mercato/ui/primitives/label'
-import { Switch } from '@open-mercato/ui/primitives/switch'
-import { Textarea } from '@open-mercato/ui/primitives/textarea'
 import { CrudForm, type CrudField, type CrudCustomFieldRenderProps } from '@open-mercato/ui/backend/CrudForm'
 import { flash } from '@open-mercato/ui/backend/FlashMessages'
-import { apiCall, readApiResultOrThrow } from '@open-mercato/ui/backend/utils/apiCall'
+import { apiCall, readApiResultOrThrow, withScopedApiRequestHeaders } from '@open-mercato/ui/backend/utils/apiCall'
+import { buildOptimisticLockHeader } from '@open-mercato/ui/backend/utils/optimisticLock'
+import { surfaceRecordConflict } from '@open-mercato/ui/backend/conflicts'
 import { raiseCrudError } from '@open-mercato/ui/backend/utils/serverErrors'
 import { useOrganizationScopeVersion } from '@open-mercato/shared/lib/frontend/useOrganizationScope'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
@@ -26,8 +25,12 @@ import { useConfirmDialog } from '@open-mercato/ui/backend/confirm-dialog'
 import {
   listPaymentProviders,
   type PaymentProvider,
-  type ProviderSettingField,
 } from '../lib/providers'
+import { isRecord } from '@open-mercato/shared/lib/utils'
+import { renderProviderFieldInput } from './ProviderFieldInput'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('sales')
 
 type PaymentMethodRow = {
   id: string
@@ -66,89 +69,6 @@ const DEFAULT_FORM: PaymentFormValues = {
   terms: '',
   isActive: true,
   providerSettings: {},
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === 'object' && !Array.isArray(value)
-}
-
-function renderFieldInput(opts: {
-  field: ProviderSettingField
-  value: unknown
-  onChange: (next: unknown) => void
-}) {
-  const { field, value, onChange } = opts
-  const common = { id: field.key, 'data-provider-setting': field.key }
-  switch (field.type) {
-    case 'textarea':
-      return (
-        <Textarea
-          {...common}
-          value={typeof value === 'string' ? value : ''}
-          onChange={(evt) => onChange(evt.target.value)}
-          placeholder={field.placeholder}
-        />
-      )
-    case 'number':
-      return (
-        <Input
-          {...common}
-          type="number"
-          value={typeof value === 'number' || typeof value === 'string' ? String(value) : ''}
-          onChange={(evt) => onChange(evt.target.value === '' ? '' : Number(evt.target.value))}
-          placeholder={field.placeholder}
-        />
-      )
-    case 'boolean':
-      return (
-        <div className="flex items-center gap-2 py-1">
-          <Switch
-            id={field.key}
-            checked={Boolean(value)}
-            onCheckedChange={(checked) => onChange(checked)}
-          />
-          <Label htmlFor={field.key}>{field.placeholder ?? ''}</Label>
-        </div>
-      )
-    case 'select':
-      return (
-        <select
-          {...common}
-          className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-          value={typeof value === 'string' ? value : ''}
-          onChange={(evt) => onChange(evt.target.value)}
-        >
-          <option value="">—</option>
-          {(field.options ?? []).map((opt) => (
-            <option key={opt.value} value={opt.value}>
-              {opt.label}
-            </option>
-          ))}
-        </select>
-      )
-    case 'secret':
-      return (
-        <Input
-          {...common}
-          type="password"
-          value={typeof value === 'string' ? value : ''}
-          onChange={(evt) => onChange(evt.target.value)}
-          placeholder={field.placeholder}
-        />
-      )
-    case 'url':
-    case 'text':
-    default:
-      return (
-        <Input
-          {...common}
-          type={field.type === 'url' ? 'url' : 'text'}
-          value={typeof value === 'string' ? value : ''}
-          onChange={(evt) => onChange(evt.target.value)}
-          placeholder={field.placeholder}
-        />
-      )
-  }
 }
 
 function createPaymentProviderSettingsRenderer(params: {
@@ -200,7 +120,7 @@ function createPaymentProviderSettingsRenderer(params: {
               {field.description ? (
                 <p className="text-xs text-muted-foreground">{field.description}</p>
               ) : null}
-              {renderFieldInput({
+              {renderProviderFieldInput({
                 field,
                 value: fieldValue,
                 onChange: (next) => setValue({ ...settings, [field.key]: next }),
@@ -330,7 +250,7 @@ export function PaymentMethodsSettings() {
         })
       )
     } catch (err) {
-      console.error('sales.payment-methods.list failed', err)
+      logger.error('sales.payment-methods.list failed', { err })
       flash(translations.errors.load, 'error')
     } finally {
       setLoading(false)
@@ -376,18 +296,20 @@ export function PaymentMethodsSettings() {
     })
     if (!confirmed) return
     try {
-      const call = await apiCall('/api/sales/payment-methods', {
+      const headers = buildOptimisticLockHeader(entry.updatedAt)
+      const call = await withScopedApiRequestHeaders(headers, () => apiCall('/api/sales/payment-methods', {
         method: 'DELETE',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ id: entry.id }),
-      })
+      }))
       if (!call.ok) {
+        if (surfaceRecordConflict({ status: call.status, body: call.result }, t)) return
         await raiseCrudError(call.response, translations.errors.delete)
       }
       flash(translations.messages.deleted, 'success')
       await loadEntries()
     } catch (err) {
-      console.error('sales.payment-methods.delete failed', err)
+      logger.error('sales.payment-methods.delete failed', { err })
       const message =
         err instanceof Error ? err.message : translations.errors.delete
       flash(message, 'error')
@@ -410,19 +332,22 @@ export function PaymentMethodsSettings() {
     const method = dialog.mode === 'create' ? 'POST' : 'PUT'
     if (dialog.mode === 'edit') payload.id = dialog.entry.id
     try {
-      const call = await apiCall(path, {
+      const savePaymentMethod = () => apiCall(path, {
         method,
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(payload),
       })
+      const headers = buildOptimisticLockHeader(dialog.mode === 'edit' ? dialog.entry.updatedAt : null)
+      const call = await withScopedApiRequestHeaders(headers, savePaymentMethod)
       if (!call.ok) {
+        if (surfaceRecordConflict({ status: call.status, body: call.result }, t)) return
         await raiseCrudError(call.response, translations.errors.save)
       }
       flash(translations.messages.saved, 'success')
       await loadEntries()
       closeDialog()
     } catch (err) {
-      console.error('sales.payment-methods.save failed', err)
+      logger.error('sales.payment-methods.save failed', { err })
       const message = err instanceof Error ? err.message : translations.errors.save
       flash(message, 'error')
     } finally {
@@ -551,6 +476,7 @@ export function PaymentMethodsSettings() {
             schema={paymentFormSchema}
             fields={fields}
             initialValues={formValues}
+            optimisticLockUpdatedAt={dialog?.mode === 'edit' ? dialog.entry.updatedAt : null}
             submitLabel={translations.form.save}
             onSubmit={handleSubmit}
             cancelHref={undefined}

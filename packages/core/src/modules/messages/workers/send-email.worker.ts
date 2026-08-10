@@ -9,6 +9,9 @@ import {
   sendMessageEmailToExternal,
   sendMessageEmailToRecipient,
 } from '../lib/email-sender'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('messages').child({ component: 'send-email' })
 
 export const MESSAGES_EMAIL_QUEUE_NAME = 'messages-email'
 
@@ -51,7 +54,7 @@ async function emitEmailDeliveryEvent(
     error?: string
     tenantId: string
     organizationId?: string | null
-  }
+  },
 ) {
   const eventBus = ctx.resolve<{ emit?: unknown } | null>('eventBus')
   if (!eventBus || typeof eventBus !== 'object' || typeof (eventBus as { emit?: unknown }).emit !== 'function') {
@@ -82,12 +85,18 @@ async function resolveMessageScope(
   em: EntityManager,
   payload: SendMessageEmailJob
 ) {
-  return await em.findOne(Message, {
-    id: payload.messageId,
-    tenantId: payload.tenantId,
-    organizationId: payload.organizationId ?? null,
-    deletedAt: null,
-  })
+  return await findOneWithDecryption(
+    em,
+    Message,
+    {
+      id: payload.messageId,
+      tenantId: payload.tenantId,
+      organizationId: payload.organizationId ?? null,
+      deletedAt: null,
+    },
+    undefined,
+    { tenantId: payload.tenantId, organizationId: payload.organizationId ?? null },
+  )
 }
 
 export async function claimRecipientDelivery(
@@ -185,7 +194,7 @@ export default async function handle(
 
   const message = await resolveMessageScope(em, payload)
   if (!message) {
-    console.error('[messages:send-email] Message not found', payload.messageId)
+    logger.error('Message not found', { messageId: payload.messageId })
     return
   }
 
@@ -216,6 +225,7 @@ export default async function handle(
         messageId: message.id,
         target: 'external',
         email: payload.email,
+        recipientUserId: message.senderUserId,
         tenantId: message.tenantId,
         organizationId: message.organizationId ?? null,
       })
@@ -232,10 +242,11 @@ export default async function handle(
         target: 'external',
         email: payload.email,
         error: errorMessage,
+        recipientUserId: message.senderUserId,
         tenantId: message.tenantId,
         organizationId: message.organizationId ?? null,
       })
-      console.error('[messages:send-email] External email send failed', error)
+      logger.error('External email send failed', { err: error })
     }
     return
   }
@@ -245,7 +256,7 @@ export default async function handle(
     recipientUserId: payload.recipientUserId,
   })
   if (!recipientRecord) {
-    console.error('[messages:send-email] Recipient row not found', payload)
+    logger.error('Recipient row not found', { messageId: payload.messageId, recipientUserId: payload.recipientUserId })
     return
   }
 
@@ -316,6 +327,6 @@ export default async function handle(
       tenantId: message.tenantId,
       organizationId: message.organizationId ?? null,
     })
-    console.error('[messages:send-email] Recipient email send failed', error)
+    logger.error('Recipient email send failed', { err: error })
   }
 }

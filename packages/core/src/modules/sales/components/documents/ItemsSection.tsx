@@ -1,7 +1,8 @@
 "use client";
 
 import * as React from "react";
-import { apiCall } from "@open-mercato/ui/backend/utils/apiCall";
+import { apiCall, withScopedApiRequestHeaders } from "@open-mercato/ui/backend/utils/apiCall";
+import { buildOptimisticLockHeader } from "@open-mercato/ui/backend/utils/optimisticLock";
 import { deleteCrud } from "@open-mercato/ui/backend/utils/crud";
 import { normalizeCrudServerError } from "@open-mercato/ui/backend/utils/serverErrors";
 import { LoadingMessage, TabEmptyState } from "@open-mercato/ui/backend/detail";
@@ -19,12 +20,19 @@ import { useOrganizationScopeDetail } from "@open-mercato/shared/lib/frontend/us
 import { useConfirmDialog } from "@open-mercato/ui/backend/confirm-dialog";
 import { emitSalesDocumentTotalsRefresh } from "@open-mercato/core/modules/sales/lib/frontend/documentTotalsEvents";
 import { LineItemDialog } from "./LineItemDialog";
+import { handleSectionMutationError } from "./optimisticLock";
 import type { SalesLineRecord } from "./lineItemTypes";
 import { formatMoney, normalizeNumber } from "./lineItemUtils";
 import type { SectionAction } from "@open-mercato/ui/backend/detail";
 import { extractCustomFieldValues } from "./customFieldHelpers";
 import { canonicalizeUnitCode } from "@open-mercato/shared/lib/units/unitCodes";
 import type { SalesLineUomSnapshot } from "../../lib/types";
+import { useInjectionDataWidgets } from "@open-mercato/ui/backend/injection/useInjectionDataWidgets";
+import type { InjectionColumnDefinition } from "@open-mercato/shared/modules/widgets/injection";
+import { OrderItemsInjectionContext } from "../../widgets/injection/order-items-context";
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('sales')
 
 type ResolvedUnitPriceReference = {
   grossPerReference: number;
@@ -105,10 +113,24 @@ function getUomFields(item: Record<string, unknown>) {
   };
 }
 
+function resolveInjectedColumnValue(
+  row: Record<string, unknown>,
+  accessorKey: string,
+): unknown {
+  const segments = accessorKey.split(".").filter(Boolean);
+  let current: unknown = row;
+  for (const segment of segments) {
+    if (!current || typeof current !== "object") return undefined;
+    current = (current as Record<string, unknown>)[segment];
+  }
+  return current;
+}
+
 type SalesDocumentItemsSectionProps = {
   documentId: string;
   kind: "order" | "quote";
   currencyCode: string | null | undefined;
+  documentUpdatedAt?: string | null;
   organizationId?: string | null;
   tenantId?: string | null;
   onActionChange?: (action: SectionAction | null) => void;
@@ -119,6 +141,7 @@ export function SalesDocumentItemsSection({
   documentId,
   kind,
   currencyCode,
+  documentUpdatedAt,
   organizationId: orgFromProps,
   tenantId: tenantFromProps,
   onActionChange,
@@ -141,6 +164,22 @@ export function SalesDocumentItemsSection({
     new Map(),
   );
 
+  const { widgets: allColumnWidgets } = useInjectionDataWidgets(
+    "data-table:sales.order.items:columns",
+  );
+  const columnWidgets = kind === "order" ? allColumnWidgets : [];
+  const injectedColumns = React.useMemo<InjectionColumnDefinition[]>(() => {
+    const cols: InjectionColumnDefinition[] = [];
+    for (const widget of columnWidgets) {
+      if (!("columns" in widget)) continue;
+      for (const def of (widget as { columns?: InjectionColumnDefinition[] })
+        .columns ?? []) {
+        cols.push(def);
+      }
+    }
+    return cols;
+  }, [columnWidgets]);
+
   const resourcePath = React.useMemo(
     () => (kind === "order" ? "sales/order-lines" : "sales/quote-lines"),
     [kind],
@@ -157,10 +196,10 @@ export function SalesDocumentItemsSection({
       }>(`/api/sales/order-line-statuses?${params.toString()}`, undefined, {
         fallback: { items: [] },
       });
-      const entries = normalizeDictionaryEntries(response.result?.items ?? []);
+      const entries = normalizeDictionaryEntries(response.result?.items ?? [], { sort: false });
       setLineStatusMap(createDictionaryMap(entries));
     } catch (err) {
-      console.error("sales.document.line-statuses.load", err);
+      logger.error('sales.document.line-statuses.load', { err });
       setLineStatusMap({});
     }
   }, []);
@@ -311,7 +350,7 @@ export function SalesDocumentItemsSection({
         if (onItemsChange) onItemsChange([]);
       }
     } catch (err) {
-      console.error("sales.document.items.load", err);
+      logger.error('sales.document.items.load', { err });
       setError(t("sales.documents.items.errorLoad", "Failed to load items."));
       if (onItemsChange) onItemsChange([]);
     } finally {
@@ -360,7 +399,7 @@ export function SalesDocumentItemsSection({
         setShippedTotals(new Map());
       }
     } catch (err) {
-      console.error("sales.document.shipments.load", err);
+      logger.error('sales.document.shipments.load', { err });
       setShippedTotals(new Map());
     }
   }, [documentId, kind]);
@@ -397,17 +436,13 @@ export function SalesDocumentItemsSection({
 
   React.useEffect(() => {
     if (!onActionChange) return;
-    if (items.length === 0) {
-      onActionChange(null);
-      return;
-    }
     onActionChange({
       label: t("sales.documents.items.add", "Add item"),
       onClick: openCreate,
       disabled: false,
     });
     return () => onActionChange(null);
-  }, [items.length, onActionChange, openCreate, t]);
+  }, [onActionChange, openCreate, t]);
 
   const handleEdit = React.useCallback((line: SalesLineRecord) => {
     setLineForEdit(line);
@@ -453,25 +488,30 @@ export function SalesDocumentItemsSection({
       });
       if (!confirmed) return;
       try {
-        const result = await deleteCrud(resourcePath, {
-          body: {
-            id: line.id,
-            [documentKey]: documentId,
-            organizationId: resolvedOrganizationId ?? undefined,
-            tenantId: resolvedTenantId ?? undefined,
-          },
-          errorMessage: t(
-            "sales.documents.items.errorDelete",
-            "Failed to delete line.",
-          ),
-        });
+        const result = await withScopedApiRequestHeaders(
+          buildOptimisticLockHeader(documentUpdatedAt),
+          () =>
+            deleteCrud(resourcePath, {
+              body: {
+                id: line.id,
+                [documentKey]: documentId,
+                organizationId: resolvedOrganizationId ?? undefined,
+                tenantId: resolvedTenantId ?? undefined,
+              },
+              errorMessage: t(
+                "sales.documents.items.errorDelete",
+                "Failed to delete line.",
+              ),
+            }),
+        );
         if (result.ok) {
           flash(t("sales.documents.items.deleted", "Line removed."), "success");
           await loadItems();
           emitSalesDocumentTotalsRefresh({ documentId, kind });
         }
       } catch (err) {
-        console.error("sales.document.items.delete", err);
+        if (handleSectionMutationError(err, t, () => void loadItems())) return;
+        logger.error('sales.document.items.delete', { err });
         const normalized = normalizeCrudServerError(err);
         const fallback = t(
           "sales.documents.items.errorDelete",
@@ -484,6 +524,7 @@ export function SalesDocumentItemsSection({
       confirm,
       documentId,
       documentKey,
+      documentUpdatedAt,
       kind,
       loadItems,
       resolvedOrganizationId,
@@ -566,6 +607,7 @@ export function SalesDocumentItemsSection({
   };
 
   return (
+    <OrderItemsInjectionContext.Provider value={{ documentId, kind }}>
     <div className="space-y-4">
       {loading ? (
         <LoadingMessage
@@ -606,6 +648,14 @@ export function SalesDocumentItemsSection({
                 <th className="px-3 py-2 font-medium">
                   {t("sales.documents.items.table.total", "Total")}
                 </th>
+                {injectedColumns.map((col) => (
+                  <th
+                    key={col.id}
+                    className="px-3 py-2 font-medium whitespace-nowrap"
+                  >
+                    {col.headerKey ? t(col.headerKey, col.header) : col.header}
+                  </th>
+                ))}
                 <th className="px-3 py-2 font-medium sr-only">
                   {t("sales.documents.items.table.actions", "Actions")}
                 </th>
@@ -761,6 +811,22 @@ export function SalesDocumentItemsSection({
                         </span>
                       </div>
                     </td>
+                    {injectedColumns.map((col) => {
+                      const colValue = resolveInjectedColumnValue(
+                        item as unknown as Record<string, unknown>,
+                        col.accessorKey,
+                      );
+                      const Cell = col.cell;
+                      return (
+                        <td
+                          key={col.id}
+                          className="px-3 py-3"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          {Cell ? <Cell getValue={() => colValue} /> : null}
+                        </td>
+                      );
+                    })}
                     <td className="px-3 py-3">
                       <div className="flex items-center gap-2 justify-end">
                         <Button
@@ -804,9 +870,15 @@ export function SalesDocumentItemsSection({
         kind={kind}
         documentId={documentId}
         currencyCode={currencyCode}
+        documentUpdatedAt={documentUpdatedAt}
         organizationId={resolvedOrganizationId}
         tenantId={resolvedTenantId}
         initialLine={lineForEdit}
+        shippedQuantity={
+          lineForEdit
+            ? Math.max(0, shippedTotals.get(lineForEdit.id) ?? 0)
+            : 0
+        }
         onSaved={async () => {
           await loadItems();
           emitSalesDocumentTotalsRefresh({ documentId, kind });
@@ -814,5 +886,6 @@ export function SalesDocumentItemsSection({
       />
       {ConfirmDialogElement}
     </div>
+    </OrderItemsInjectionContext.Provider>
   );
 }

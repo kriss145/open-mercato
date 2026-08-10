@@ -11,12 +11,16 @@ import { z } from 'zod'
 import { createRequestContainer } from '@open-mercato/shared/lib/di/container'
 import { getAuthFromRequest } from '@open-mercato/shared/lib/auth/server'
 import { resolveOrganizationScopeForRequest } from '@open-mercato/core/modules/directory/utils/organizationScope'
+import { resolveOrganizationScopeFilter } from '@open-mercato/core/modules/directory/utils/organizationScopeFilter'
 import { UserTask } from '../../../data/entities'
 import {
   workflowsTag,
   userTaskDetailResponseSchema,
   workflowErrorSchema,
 } from '../../openapi'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('workflows')
 
 export const metadata = {
   requireAuth: true,
@@ -43,11 +47,11 @@ export async function GET(
 
     const scope = await resolveOrganizationScopeForRequest({ container, auth, request })
     const tenantId = auth.tenantId
-    const organizationId = scope?.selectedId ?? auth.orgId
+    const orgFilter = resolveOrganizationScopeFilter(scope, auth)
 
-    if (!tenantId || !organizationId) {
+    if (!tenantId) {
       return NextResponse.json(
-        { error: 'Missing tenant or organization context' },
+        { error: 'Missing tenant context' },
         { status: 400 }
       )
     }
@@ -55,7 +59,7 @@ export async function GET(
     const task = await em.findOne(UserTask, {
       id: params.id,
       tenantId,
-      organizationId,
+      ...orgFilter.where,
     })
 
     if (!task) {
@@ -69,7 +73,7 @@ export async function GET(
       data: task,
     })
   } catch (error) {
-    console.error('Error fetching user task:', error)
+    logger.error('Error fetching user task', { err: error })
     return NextResponse.json(
       {
         error: 'Failed to fetch user task',

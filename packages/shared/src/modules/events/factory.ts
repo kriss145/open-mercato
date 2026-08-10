@@ -4,6 +4,7 @@
  * Provides factory functions for creating type-safe event configurations.
  */
 
+import { createLogger } from '../../lib/logger'
 import type {
   EventDefinition,
   EventModuleConfig,
@@ -12,6 +13,8 @@ import type {
   CreateModuleEventsOptions,
   ModuleEventEmitter,
 } from './types'
+
+const logger = createLogger('events').child({ component: 'factory' })
 
 // =============================================================================
 // Global Event Bus Reference
@@ -68,6 +71,14 @@ const allDeclaredEventIds = new Set<string>()
 // Global registry of all declared events with their full definitions
 const allDeclaredEvents: EventDefinition[] = []
 
+function addDeclaredEvent(event: EventDefinition): void {
+  allDeclaredEventIds.add(event.id)
+  // Avoid duplicates if createModuleEvents/registerEventModuleConfigs is called multiple times (e.g., HMR)
+  if (!allDeclaredEvents.find(e => e.id === event.id)) {
+    allDeclaredEvents.push(event)
+  }
+}
+
 /**
  * Check if an event ID has been declared by any module.
  * Used for runtime validation to ensure only declared events are emitted.
@@ -101,6 +112,15 @@ export function isBroadcastEvent(eventId: string): boolean {
   return event?.clientBroadcast === true
 }
 
+/**
+ * Check if an event has portalBroadcast enabled.
+ * Used by the portal SSE endpoint to filter events for the Portal Event Bridge.
+ */
+export function isPortalBroadcastEvent(eventId: string): boolean {
+  const event = allDeclaredEvents.find(e => e.id === eventId)
+  return event?.portalBroadcast === true
+}
+
 // =============================================================================
 // Bootstrap Registration (similar to searchModuleConfigs pattern)
 // =============================================================================
@@ -113,9 +133,14 @@ let _registeredEventConfigs: EventModuleConfig[] | null = null
  */
 export function registerEventModuleConfigs(configs: EventModuleConfig[]): void {
   if (_registeredEventConfigs !== null && process.env.NODE_ENV === 'development') {
-    console.debug('[Bootstrap] Event module configs re-registered (this may occur during HMR)')
+    logger.debug('Event module configs re-registered (this may occur during HMR)')
   }
   _registeredEventConfigs = configs
+  for (const config of configs) {
+    for (const event of config.events) {
+      addDeclaredEvent(event)
+    }
+  }
 }
 
 /**
@@ -180,15 +205,9 @@ export function createModuleEvents<
     module: moduleId,
   }))
 
-  // Register all event IDs and definitions in the global registry
-  for (const eventId of validEventIds) {
-    allDeclaredEventIds.add(eventId)
-  }
+  // Register all event IDs and definitions in the global registry.
   for (const event of fullEvents) {
-    // Avoid duplicates if createModuleEvents is called multiple times (e.g., HMR)
-    if (!allDeclaredEvents.find(e => e.id === event.id)) {
-      allDeclaredEvents.push(event)
-    }
+    addDeclaredEvent(event)
   }
 
   /**
@@ -208,7 +227,7 @@ export function createModuleEvents<
       if (strict) {
         throw new Error(message)
       } else {
-        console.error(message)
+        logger.error('Module tried to emit undeclared event — add it to the module events.ts first', { moduleId, eventId })
         // In non-strict mode, still emit but with warning
       }
     }
@@ -216,7 +235,7 @@ export function createModuleEvents<
     // Get event bus from global reference
     const eventBus = getGlobalEventBus()
     if (!eventBus) {
-      console.warn(`[events] Event bus not available, cannot emit "${eventId}"`)
+      logger.warn('Event bus not available, cannot emit event', { eventId })
       return
     }
 

@@ -1,6 +1,9 @@
 import { FeatureToggle, FeatureToggleOverride } from "../data/entities"
 import { EntityManager } from "@mikro-orm/core"
-import { CacheService } from "@open-mercato/cache"
+import { CacheService, runWithCacheTenant } from "@open-mercato/cache"
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('feature_toggles').child({ component: 'flag-check' })
 
 type ToggleValueType = "boolean" | "string" | "number" | "json"
 
@@ -62,6 +65,13 @@ const getCacheTags = (identifier: string, tenantId: string) => {
 
 export class FeatureTogglesService {
   private cacheTtlMs: number = 1 * 60 * 1000 // 1 minute
+  // Resolution cache can be disabled via env (e.g. integration tests that flip
+  // overrides rapidly between cases). The 1-minute TTL is a production
+  // optimization; under fast flag churn it can serve a stale value across
+  // override set/clear despite invalidation, so tests opt out for determinism.
+  private readonly cacheDisabled: boolean =
+    process.env.OM_FEATURE_TOGGLES_CACHE_DISABLED === '1' ||
+    process.env.OM_FEATURE_TOGGLES_CACHE_DISABLED === 'true'
   constructor(
     private readonly cache: CacheService,
     private readonly em: EntityManager
@@ -72,17 +82,23 @@ export class FeatureTogglesService {
     tenantId: string,
     result: ToggleResolutionResult,
   ) {
+    if (this.cacheDisabled) return
     const key = getIsEnabledCacheKey(identifier, tenantId)
-    await this.cache.set(key, result, { ttl: this.cacheTtlMs, tags: getCacheTags(identifier, tenantId) })
+    await runWithCacheTenant(
+      tenantId,
+      () => this.cache.set(key, result, { ttl: this.cacheTtlMs, tags: getCacheTags(identifier, tenantId) }),
+    )
   }
 
   private async resolveToggle(identifier: string, tenantId: string): Promise<ToggleResolutionResult> {
     const key = getIsEnabledCacheKey(identifier, tenantId)
 
-    const cached = await this.cache.get(key)
-    if (cached) {
-      const parsed = toCachedResolution(cached)
-      if (parsed) return parsed
+    if (!this.cacheDisabled) {
+      const cached = await runWithCacheTenant(tenantId, () => this.cache.get(key))
+      if (cached) {
+        const parsed = toCachedResolution(cached)
+        if (parsed) return parsed
+      }
     }
 
     let toggle: FeatureToggle | null = null
@@ -122,7 +138,7 @@ export class FeatureTogglesService {
   }
 
   public async invalidateIsEnabledCacheByKey(identifier: string, tenantId: string) {
-    await this.cache.delete(getIsEnabledCacheKey(identifier, tenantId))
+    await runWithCacheTenant(tenantId, () => this.cache.delete(getIsEnabledCacheKey(identifier, tenantId)))
   }
 
   public async getFeatureToggleValue<T>(
@@ -132,7 +148,7 @@ export class FeatureTogglesService {
     const resolution = await this.resolveToggle(identifier, ctx.tenantId)
 
     if (resolution.source === "missing") {
-      console.warn(`[feature_toggles] Toggle "${identifier}" not found (missing).`)
+      logger.warn('Toggle not found', { identifier })
       return {
         ok: false,
         error: {
@@ -150,10 +166,7 @@ export class FeatureTogglesService {
 
 
     if (resolution.valueType !== ctx.valueType) {
-      console.error(
-        `[feature_toggles] Toggle "${identifier}" has type "${resolution.valueType}" but "${ctx.valueType}" was requested.`,
-        { resolution }
-      )
+      logger.error('Toggle type mismatch', { identifier, expectedType: ctx.valueType, actualType: resolution.valueType, resolution })
       return {
         ok: false,
         error: {
@@ -175,10 +188,7 @@ export class FeatureTogglesService {
       (ctx.valueType === "json")
 
     if (!isValueValid) {
-      console.error(
-        `[feature_toggles] Toggle "${identifier}" has invalid value for type "${resolution.valueType}".`,
-        { resolution }
-      )
+      logger.error('Toggle has invalid value for type', { identifier, valueType: resolution.valueType, resolution })
       return {
         ok: false,
         error: {

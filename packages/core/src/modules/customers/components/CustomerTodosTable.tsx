@@ -4,18 +4,17 @@ import * as React from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import type { ColumnDef } from '@tanstack/react-table'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, keepPreviousData } from '@tanstack/react-query'
 import { DataTable, type DataTableExportFormat } from '@open-mercato/ui/backend/DataTable'
 import type { PreparedExport } from '@open-mercato/shared/lib/crud/exporters'
 import { RowActions } from '@open-mercato/ui/backend/RowActions'
-import type { FilterDef, FilterValues } from '@open-mercato/ui/backend/FilterBar'
 import { BooleanIcon } from '@open-mercato/ui/backend/ValueIcons'
 import { flash } from '@open-mercato/ui/backend/FlashMessages'
 import { readApiResultOrThrow } from '@open-mercato/ui/backend/utils/apiCall'
-import { buildCrudExportUrl } from '@open-mercato/ui/backend/utils/crud'
 import { Button } from '@open-mercato/ui/primitives/button'
 import { useOrganizationScopeVersion } from '@open-mercato/shared/lib/frontend/useOrganizationScope'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
+import { resolveTodoHref } from './detail/utils'
 
 type CustomerTodoItem = {
   id: string
@@ -32,6 +31,8 @@ type CustomerTodoItem = {
   organizationId: string
   tenantId: string
   createdAt: string
+  externalHref?: string | null
+  _integrations?: Record<string, unknown>
   customer: {
     id: string | null
     displayName: string | null
@@ -48,6 +49,7 @@ type CustomerTodosResponse = {
 }
 
 const TASKS_TAB_QUERY = 'tab=tasks'
+const CUSTOMER_TASKS_API_PATH = '/api/customers/interactions/tasks'
 
 function buildCustomerHref(item: CustomerTodoItem): string | null {
   const customerId = item.customer?.id
@@ -55,9 +57,34 @@ function buildCustomerHref(item: CustomerTodoItem): string | null {
   const kind = (item.customer?.kind ?? '').toLowerCase()
   const base =
     kind === 'company'
-      ? `/backend/customers/companies/${customerId}`
-      : `/backend/customers/people/${customerId}`
+      ? `/backend/customers/companies-v2/${customerId}`
+      : `/backend/customers/people-v2/${customerId}`
   return `${base}?${TASKS_TAB_QUERY}`
+}
+
+function buildCustomerTasksQueryString(input: {
+  page: number
+  pageSize: number
+  search: string
+  all?: boolean
+}): string {
+  const usp = new URLSearchParams({
+    page: String(input.page),
+    pageSize: String(input.pageSize),
+  })
+  if (input.search.trim().length > 0) usp.set('search', input.search.trim())
+  if (input.all) usp.set('all', 'true')
+  return usp.toString()
+}
+
+function readValueAtPath(record: Record<string, unknown>, path: string): unknown {
+  const segments = path.split('.').filter((segment) => segment.length > 0)
+  let current: unknown = record
+  for (const segment of segments) {
+    if (!current || typeof current !== 'object') return null
+    current = (current as Record<string, unknown>)[segment]
+  }
+  return current ?? null
 }
 
 export function CustomerTodosTable(): React.JSX.Element {
@@ -68,18 +95,12 @@ export function CustomerTodosTable(): React.JSX.Element {
   const [search, setSearch] = React.useState('')
   const [page, setPage] = React.useState(1)
   const [pageSize] = React.useState(50)
-  const [filters, setFilters] = React.useState<FilterValues>({})
 
-  const params = React.useMemo(() => {
-    const usp = new URLSearchParams({
-      page: String(page),
-      pageSize: String(pageSize),
-    })
-    if (search.trim().length > 0) usp.set('search', search.trim())
-    const doneValue = filters.is_done
-    if (doneValue === 'true' || doneValue === 'false') usp.set('isDone', doneValue)
-    return usp.toString()
-  }, [page, pageSize, search, filters])
+  const params = React.useMemo(() => buildCustomerTasksQueryString({
+    page,
+    pageSize,
+    search,
+  }), [page, pageSize, search])
 
   const columns = React.useMemo<ColumnDef<CustomerTodoItem>[]>(() => [
     {
@@ -103,10 +124,10 @@ export function CustomerTodosTable(): React.JSX.Element {
       header: t('customers.workPlan.customerTodos.table.column.todo'),
       cell: ({ row }) => {
         const title = row.original.todoTitle ?? t('customers.workPlan.customerTodos.table.column.todo.unnamed')
-        const todoId = row.original.todoId
-        if (!todoId) return <span className="text-muted-foreground">{title}</span>
+        const todoHref = row.original.externalHref ?? resolveTodoHref(row.original.todoSource, row.original.todoId)
+        if (!todoHref) return <span className="text-muted-foreground">{title}</span>
         return (
-          <Link href={`/backend/todos/${todoId}/edit`} className="underline-offset-2 hover:underline">
+          <Link href={todoHref} className="underline-offset-2 hover:underline">
             {title}
           </Link>
         )
@@ -135,15 +156,31 @@ export function CustomerTodosTable(): React.JSX.Element {
       .filter((col): col is { field: string; header: string } => !!col)
   }, [columns])
 
-  const { data, isLoading, error, refetch, isFetching } = useQuery<CustomerTodosResponse>({
-    queryKey: ['customers-todos', params, scopeVersion],
-    queryFn: async () => {
-      return readApiResultOrThrow<CustomerTodosResponse>(
-        `/api/customers/todos?${params}`,
-        undefined,
-        { errorMessage: t('customers.workPlan.customerTodos.table.error.load') },
+  const buildPreparedExport = React.useCallback((
+    exportRows: CustomerTodoItem[],
+    exportColumns: Array<{ field: string; header: string }>,
+  ): PreparedExport => ({
+    columns: exportColumns.map((col) => ({ field: col.field, header: col.header })),
+    rows: exportRows.map((row) => {
+      const record = row as Record<string, unknown>
+      return Object.fromEntries(
+        exportColumns.map((col) => [col.field, readValueAtPath(record, col.field)]),
       )
-    },
+    }),
+  }), [])
+
+  const fetchTasks = React.useCallback(async (queryString: string): Promise<CustomerTodosResponse> => {
+    return readApiResultOrThrow<CustomerTodosResponse>(
+      `${CUSTOMER_TASKS_API_PATH}?${queryString}`,
+      undefined,
+      { errorMessage: t('customers.workPlan.customerTodos.table.error.load') },
+    )
+  }, [t])
+
+  const { data, isLoading, error, refetch, isFetching } = useQuery<CustomerTodosResponse>({
+    queryKey: ['customers-interactions-tasks', params, scopeVersion],
+    queryFn: async () => fetchTasks(params),
+    placeholderData: keepPreviousData,
   })
 
   const rows = data?.items ?? []
@@ -152,54 +189,28 @@ export function CustomerTodosTable(): React.JSX.Element {
     view: {
       description: t('customers.workPlan.customerTodos.table.export.view'),
       prepare: async (): Promise<{ prepared: PreparedExport; filename: string }> => {
-        const rowsForExport = rows.map((row) => {
-          const out: Record<string, unknown> = {}
-          for (const col of viewExportColumns) {
-            out[col.field] = (row as Record<string, unknown>)[col.field]
-          }
-          return out
-        })
-        const prepared: PreparedExport = {
-          columns: viewExportColumns.map((col) => ({ field: col.field, header: col.header })),
-          rows: rowsForExport,
+        return {
+          prepared: buildPreparedExport(rows, viewExportColumns),
+          filename: 'customer_todos_view',
         }
-        return { prepared, filename: 'customer_todos_view' }
       },
     },
     full: {
       description: t('customers.workPlan.customerTodos.table.export.full'),
-      getUrl: (format: DataTableExportFormat) =>
-        buildCrudExportUrl('customers/todos', { exportScope: 'full', all: 'true' }, format),
-      filename: () => 'customer_todos_full',
+      prepare: async (_format: DataTableExportFormat): Promise<{ prepared: PreparedExport; filename: string }> => {
+        const fullData = await fetchTasks(buildCustomerTasksQueryString({
+          page: 1,
+          pageSize,
+          search,
+          all: true,
+        }))
+        return {
+          prepared: buildPreparedExport(fullData.items, viewExportColumns),
+          filename: 'customer_todos_full',
+        }
+      },
     },
-  }), [rows, t, viewExportColumns])
-
-  const filterDefs = React.useMemo<FilterDef[]>(() => [
-    {
-      id: 'is_done',
-      label: t('customers.workPlan.customerTodos.table.filters.done'),
-      type: 'select',
-      options: [
-        { label: t('customers.workPlan.customerTodos.table.filters.doneOption.any'), value: '' },
-        { label: t('customers.workPlan.customerTodos.table.filters.doneOption.open'), value: 'false' },
-        { label: t('customers.workPlan.customerTodos.table.filters.doneOption.completed'), value: 'true' },
-      ],
-    },
-  ], [t])
-
-  const onFiltersApply = React.useCallback((next: FilterValues) => {
-    const nextValue = next?.is_done
-    setFilters((prev) => {
-      if (prev.is_done === nextValue) return prev
-      return { is_done: nextValue }
-    })
-    setPage(1)
-  }, [])
-
-  const onFiltersClear = React.useCallback(() => {
-    setFilters({})
-    setPage(1)
-  }, [])
+  }), [buildPreparedExport, fetchTasks, pageSize, rows, search, t, viewExportColumns])
 
   const handleRefresh = React.useCallback(async () => {
     try {
@@ -218,16 +229,17 @@ export function CustomerTodosTable(): React.JSX.Element {
   }, [router])
 
   const errorMessage = error ? (error instanceof Error ? error.message : t('customers.workPlan.customerTodos.table.error.load')) : null
-  const isEmpty = !isLoading && !errorMessage && rows.length === 0
+  const emptyStateMessage = !isLoading && !errorMessage && rows.length === 0
+    ? (search ? t('customers.workPlan.customerTodos.table.state.noMatches') : t('customers.workPlan.customerTodos.table.state.empty'))
+    : undefined
 
   return (
-    <div className="space-y-4">
-      <DataTable
-        title={t('customers.workPlan.customerTodos.table.title')}
-        actions={(
-          <Button
-            variant="outline"
-            onClick={() => { void handleRefresh() }}
+    <DataTable
+      title={t('customers.workPlan.customerTodos.table.title')}
+      actions={(
+        <Button
+          variant="outline"
+          onClick={() => { void handleRefresh() }}
           disabled={isFetching}
         >
           {t('customers.workPlan.customerTodos.table.actions.refresh')}
@@ -242,24 +254,23 @@ export function CustomerTodosTable(): React.JSX.Element {
         setPage(1)
       }}
       perspective={{ tableId: 'customers.todos.list' }}
-      filters={filterDefs}
-      filterValues={filters}
-      onFiltersApply={onFiltersApply}
-      onFiltersClear={onFiltersClear}
       rowActions={(row) => {
         const customerLink = buildCustomerHref(row)
-        if (!customerLink) return null
-        return (
-          <RowActions
-            items={[
-              {
-                id: 'open-customer',
-                label: t('customers.workPlan.customerTodos.table.actions.openCustomer'),
-                href: customerLink,
-              },
-            ]}
-          />
-        )
+        const todoHref = row.externalHref ?? resolveTodoHref(row.todoSource, row.todoId)
+        const items = [
+          customerLink ? {
+            id: 'open-customer',
+            label: t('customers.workPlan.customerTodos.table.actions.openCustomer'),
+            href: customerLink,
+          } : null,
+          todoHref ? {
+            id: 'open-task',
+            label: t('customers.workPlan.customerTodos.table.actions.openTask'),
+            href: todoHref,
+          } : null,
+        ].filter((item): item is { id: string; label: string; href: string } => !!item)
+        if (!items.length) return null
+        return <RowActions items={items} />
       }}
       onRowClick={handleNavigate}
       pagination={{
@@ -270,20 +281,9 @@ export function CustomerTodosTable(): React.JSX.Element {
         onPageChange: setPage,
       }}
       isLoading={isLoading}
-      />
-      {errorMessage ? (
-        <div className="rounded-md border border-destructive/40 bg-destructive/10 px-4 py-2 text-sm text-destructive">
-          {errorMessage}
-        </div>
-      ) : null}
-      {isEmpty ? (
-        <div className="py-8 text-sm text-muted-foreground">
-          {search || filters.is_done
-            ? t('customers.workPlan.customerTodos.table.state.noMatches')
-            : t('customers.workPlan.customerTodos.table.state.empty')}
-        </div>
-      ) : null}
-    </div>
+      error={errorMessage}
+      emptyState={emptyStateMessage}
+    />
   )
 }
 

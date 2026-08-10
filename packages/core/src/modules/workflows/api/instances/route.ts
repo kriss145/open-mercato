@@ -11,13 +11,22 @@ import { z } from 'zod'
 import { createRequestContainer } from '@open-mercato/shared/lib/di/container'
 import { getAuthFromRequest } from '@open-mercato/shared/lib/auth/server'
 import { resolveOrganizationScopeForRequest } from '@open-mercato/core/modules/directory/utils/organizationScope'
+import { resolveOrganizationScopeFilter } from '@open-mercato/core/modules/directory/utils/organizationScopeFilter'
 import { WorkflowInstance } from '../../data/entities'
 import {
   startWorkflowInputSchema,
   type StartWorkflowApiInput,
   workflowInstanceStatusSchema,
 } from '../../data/validators'
+import {
+  workflowInstanceResponseSchema,
+  workflowBackgroundStartSchema,
+  paginationSchema,
+} from '../openapi'
 import * as workflowExecutor from '../../lib/workflow-executor'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('workflows')
 
 export const metadata = {
   requireAuth: true,
@@ -41,11 +50,11 @@ export async function GET(request: NextRequest) {
 
     const scope = await resolveOrganizationScopeForRequest({ container, auth, request })
     const tenantId = auth.tenantId
-    const organizationId = scope?.selectedId ?? auth.orgId
+    const orgFilter = resolveOrganizationScopeFilter(scope, auth)
 
-    if (!tenantId || !organizationId) {
+    if (!tenantId) {
       return NextResponse.json(
-        { error: 'Missing tenant or organization context' },
+        { error: 'Missing tenant context' },
         { status: 400 }
       )
     }
@@ -62,7 +71,7 @@ export async function GET(request: NextRequest) {
     // Build where clause with tenant scoping
     const where: any = {
       tenantId,
-      organizationId,
+      ...orgFilter.where,
     }
 
     if (workflowId) {
@@ -119,7 +128,7 @@ export async function GET(request: NextRequest) {
       },
     })
   } catch (error) {
-    console.error('Error listing workflow instances:', error)
+    logger.error('Error listing workflow instances', { err: error })
     return NextResponse.json(
       { error: 'Failed to list workflow instances' },
       { status: 500 }
@@ -187,10 +196,10 @@ export async function POST(request: NextRequest) {
 
     const input: StartWorkflowApiInput = validation.data
 
-    // Inject metadata.initiatedBy if not provided
+    // Server-authoritative actor; do not trust client-supplied metadata.initiatedBy.
     const metadata = {
       ...input.metadata,
-      initiatedBy: input.metadata?.initiatedBy || auth.sub,
+      initiatedBy: auth.sub,
     }
 
     // Start workflow
@@ -211,9 +220,11 @@ export async function POST(request: NextRequest) {
         // Create new container and EM for background execution
         const bgContainer = await createRequestContainer()
         const bgEm = bgContainer.resolve('em')
-        await workflowExecutor.executeWorkflow(bgEm, bgContainer, instance.id)
+        await workflowExecutor.executeWorkflow(bgEm, bgContainer, instance.id, {
+          userId: auth.sub,
+        })
       } catch (error) {
-        console.error('Background workflow execution error:', error)
+        logger.error('Background workflow execution error', { err: error })
       }
     })
 
@@ -232,7 +243,7 @@ export async function POST(request: NextRequest) {
       { status: 201 }
     )
   } catch (error) {
-    console.error('Error starting workflow:', error)
+    logger.error('Error starting workflow', { err: error })
 
     // Handle specific errors
     if (error instanceof workflowExecutor.WorkflowExecutionError) {
@@ -293,13 +304,8 @@ export const openApi = {
           status: 200,
           description: 'List of workflow instances',
           schema: z.object({
-            data: z.array(z.any()),
-            pagination: z.object({
-              total: z.number(),
-              limit: z.number(),
-              offset: z.number(),
-              hasMore: z.boolean(),
-            }),
+            data: z.array(workflowInstanceResponseSchema),
+            pagination: paginationSchema,
           }),
         },
         {
@@ -329,8 +335,8 @@ export const openApi = {
           description: 'Workflow started successfully',
           schema: z.object({
             data: z.object({
-              instance: z.any(),
-              execution: z.any(),
+              instance: workflowInstanceResponseSchema,
+              execution: workflowBackgroundStartSchema,
             }),
             message: z.string(),
           }),

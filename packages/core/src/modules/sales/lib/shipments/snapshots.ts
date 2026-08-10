@@ -26,7 +26,7 @@ const extractOrderLineId = (entry: SalesShipmentItem): string | null => {
   return typeof raw === 'string' ? raw : null
 }
 
-const ensureLineMap = async (
+const ensureLineMap = async ( // NOSONAR — returns same Map ref but populated from DB between early return and final return
   em: EntityManager,
   items: SalesShipmentItem[],
   lineMap?: Map<string, SalesOrderLine>
@@ -134,6 +134,36 @@ export const refreshShipmentItemsSnapshot = async (
   const snapshot = buildShipmentItemSnapshots(items, { lineMap: map })
   shipment.itemsSnapshot = snapshot.length ? snapshot : null
   return snapshot
+}
+
+export const loadShippedQuantityByLine = async (
+  em: EntityManager,
+  orderId: string,
+  scope: { tenantId: string; organizationId: string },
+): Promise<Map<string, number>> => {
+  const shipments = await findWithDecryption(
+    em,
+    SalesShipment,
+    { order: orderId, deletedAt: null },
+    {},
+    scope,
+  )
+  const shippedByLine = new Map<string, number>()
+  if (!shipments.length) return shippedByLine
+  const items = await findWithDecryption(
+    em,
+    SalesShipmentItem,
+    { shipment: { $in: shipments.map((shipment) => shipment.id) } },
+    {},
+    scope,
+  )
+  items.forEach((item) => {
+    const orderLineId = typeof item.orderLine === 'string' ? item.orderLine : (item.orderLine?.id ?? null)
+    if (!orderLineId) return
+    const next = (shippedByLine.get(orderLineId) ?? 0) + coerceShipmentQuantity(item.quantity)
+    shippedByLine.set(orderLineId, next)
+  })
+  return shippedByLine
 }
 
 export type { ShipmentItemSnapshot } from './types'

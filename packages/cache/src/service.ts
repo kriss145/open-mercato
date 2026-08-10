@@ -6,6 +6,7 @@ import { createJsonFileStrategy } from './strategies/jsonfile'
 import { getCurrentCacheTenant } from './tenantContext'
 import { createHash } from 'node:crypto'
 import { CacheDependencyUnavailableError } from './errors'
+import { matchCacheKeyPattern } from './patterns'
 
 function normalizeTenantKey(raw: string | null | undefined): string {
   const value = typeof raw === 'string' ? raw.trim() : ''
@@ -40,10 +41,23 @@ function isCacheMetadata(value: CacheValue | null): value is CacheMetadata {
 
 type CacheStrategyName = NonNullable<CacheServiceOptions['strategy']>
 const KNOWN_STRATEGIES: CacheStrategyName[] = ['memory', 'redis', 'sqlite', 'jsonfile']
+const TENANT_META_KEY_PATTERN = 'tenant:*:key:meta:*'
+const TENANT_META_KEY_MARKER = ':key:meta:'
+
+type TenantAwareCacheStrategy = CacheStrategy & {
+  deleteByPatternsAcrossScopes(patterns: string[]): Promise<number>
+}
 
 function isCacheStrategyName(value: string | undefined): value is CacheStrategyName {
   if (!value) return false
   return KNOWN_STRATEGIES.includes(value as CacheStrategyName)
+}
+
+function resolveConfiguredStrategyType(options?: CacheServiceOptions): CacheStrategyName {
+  const envStrategy = isCacheStrategyName(process.env.CACHE_STRATEGY)
+    ? process.env.CACHE_STRATEGY
+    : undefined
+  return options?.strategy ?? envStrategy ?? 'memory'
 }
 
 function resolveTenantPrefixes(): TenantPrefixes {
@@ -83,16 +97,7 @@ function buildTagSet(tags: string[] | undefined, prefixes: TenantPrefixes, inclu
   return Array.from(scoped)
 }
 
-function matchPattern(value: string, pattern: string): boolean {
-  const regexPattern = pattern
-    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
-    .replace(/\*/g, '.*')
-    .replace(/\?/g, '.')
-  const regex = new RegExp(`^${regexPattern}$`)
-  return regex.test(value)
-}
-
-function createTenantAwareWrapper(base: CacheStrategy): CacheStrategy {
+function createTenantAwareWrapper(base: CacheStrategy, reportsBoundedCounters: boolean): TenantAwareCacheStrategy {
   function normalizeDeletionCount(raw: number): number {
     if (!raw) return raw
     if (!Number.isFinite(raw)) return raw
@@ -156,10 +161,36 @@ function createTenantAwareWrapper(base: CacheStrategy): CacheStrategy {
       const metadata = typeof metaValue === 'string' ? null : (isCacheMetadata(metaValue) ? metaValue : null)
       const original = typeof metaValue === 'string' ? metaValue : metadata?.key
       if (!original) continue
-      if (pattern && !matchPattern(original, pattern)) continue
+      if (pattern && !matchCacheKeyPattern(original, pattern)) continue
       originals.push(original)
     }
     return originals
+  }
+
+  const deleteByPatternsAcrossScopes = async (patterns: string[]) => {
+    const normalizedPatterns = Array.from(new Set(patterns.map((pattern) => pattern.trim()).filter(Boolean)))
+    if (normalizedPatterns.length === 0) return 0
+
+    const metaKeys = await base.keys(TENANT_META_KEY_PATTERN)
+    let deleted = 0
+    for (const metadataKey of metaKeys) {
+      const metadataValue = await base.get(metadataKey, { returnExpired: true })
+      if (!metadataValue) continue
+      const metadata = typeof metadataValue === 'string'
+        ? null
+        : (isCacheMetadata(metadataValue) ? metadataValue : null)
+      const originalKey = typeof metadataValue === 'string' ? metadataValue : metadata?.key
+      if (!originalKey || !normalizedPatterns.some((pattern) => matchCacheKeyPattern(originalKey, pattern))) {
+        continue
+      }
+
+      const markerIndex = metadataKey.lastIndexOf(TENANT_META_KEY_MARKER)
+      if (markerIndex < 0) continue
+      const primaryKey = `${metadataKey.slice(0, markerIndex)}:key:k:${metadataKey.slice(markerIndex + TENANT_META_KEY_MARKER.length)}`
+      if (await base.delete(primaryKey)) deleted += 1
+      await base.delete(metadataKey)
+    }
+    return deleted
   }
 
   const stats = async () => {
@@ -178,7 +209,17 @@ function createTenantAwareWrapper(base: CacheStrategy): CacheStrategy {
       const expiresAt = metadata?.expiresAt ?? null
       if (expiresAt !== null && expiresAt <= now) expired++
     }
-    return { size, expired }
+    // size/expired stay tenant-scoped (derived from this tenant's meta keys).
+    // Only memory-backed strategies track the process-global bound counters, so
+    // skip the extra base.stats() round-trip for redis/sqlite/jsonfile and omit
+    // the optional fields (the stats() contract marks them optional). Keyed off
+    // the configured strategy: a backend degraded to the memory fallback
+    // intentionally does not surface these diagnostics.
+    if (!reportsBoundedCounters) {
+      return { size, expired }
+    }
+    const { evictions, sweeps, lastSweepReclaimed } = await base.stats()
+    return { size, expired, evictions, sweeps, lastSweepReclaimed }
   }
 
   const cleanup = base.cleanup
@@ -187,6 +228,9 @@ function createTenantAwareWrapper(base: CacheStrategy): CacheStrategy {
 
   const close = base.close
     ? async () => base.close!()
+    : undefined
+  const healthcheck = base.healthcheck
+    ? async () => base.healthcheck!()
     : undefined
 
   return {
@@ -198,21 +242,41 @@ function createTenantAwareWrapper(base: CacheStrategy): CacheStrategy {
     clear,
     keys,
     stats,
+    healthcheck,
     cleanup,
     close,
+    deleteByPatternsAcrossScopes,
   }
+}
+
+function createConfiguredTenantAwareStrategy(options?: CacheServiceOptions): TenantAwareCacheStrategy {
+  const strategyType = resolveConfiguredStrategyType(options)
+
+  const envTtl = process.env.CACHE_TTL
+  const parsedEnvTtl = envTtl ? Number.parseInt(envTtl, 10) : undefined
+  const defaultTtl = options?.defaultTtl ?? (typeof parsedEnvTtl === 'number' && Number.isFinite(parsedEnvTtl) ? parsedEnvTtl : undefined)
+
+  const envMaxEntries = process.env.CACHE_MEMORY_MAX_ENTRIES
+  const parsedEnvMaxEntries = envMaxEntries ? Number.parseInt(envMaxEntries, 10) : undefined
+  const maxEntries = options?.maxEntries ?? (typeof parsedEnvMaxEntries === 'number' && Number.isFinite(parsedEnvMaxEntries) ? parsedEnvMaxEntries : undefined)
+
+  const baseStrategy = createStrategyForType(strategyType, options, defaultTtl, maxEntries)
+  const resilientStrategy = withDependencyFallback(baseStrategy, strategyType, defaultTtl, maxEntries)
+  const reportsBoundedCounters = strategyType === 'memory'
+
+  return createTenantAwareWrapper(resilientStrategy, reportsBoundedCounters)
 }
 
 /**
  * Cache service that provides a unified interface to different cache strategies
- * 
+ *
  * Configuration via environment variables:
  * - CACHE_STRATEGY: 'memory' | 'redis' | 'sqlite' | 'jsonfile' (default: 'memory')
  * - CACHE_TTL: Default TTL in milliseconds (optional)
  * - CACHE_REDIS_URL: Redis connection URL (for redis strategy)
  * - CACHE_SQLITE_PATH: SQLite database file path (for sqlite strategy)
  * - CACHE_JSON_FILE_PATH: JSON file path (for jsonfile strategy)
- * 
+ *
  * @example
  * const cache = createCacheService({ strategy: 'memory', defaultTtl: 60000 })
  * await cache.set('user:123', { name: 'John' }, { tags: ['users', 'user:123'] })
@@ -220,19 +284,30 @@ function createTenantAwareWrapper(base: CacheStrategy): CacheStrategy {
  * await cache.deleteByTags(['users']) // Invalidate all user-related cache
  */
 export function createCacheService(options?: CacheServiceOptions): CacheStrategy {
-  const envStrategy = isCacheStrategyName(process.env.CACHE_STRATEGY)
-    ? process.env.CACHE_STRATEGY
-    : undefined
-  const strategyType: CacheStrategyName = options?.strategy ?? envStrategy ?? 'memory'
+  return createConfiguredTenantAwareStrategy(options)
+}
 
-  const envTtl = process.env.CACHE_TTL
-  const parsedEnvTtl = envTtl ? Number.parseInt(envTtl, 10) : undefined
-  const defaultTtl = options?.defaultTtl ?? (typeof parsedEnvTtl === 'number' && Number.isFinite(parsedEnvTtl) ? parsedEnvTtl : undefined)
+/**
+ * Delete matching logical keys across every tenant scope in the configured
+ * stock cache backend without bootstrapping application DI or querying the
+ * tenant database. Intended for maintenance tasks that already operate on all
+ * scopes, such as post-generation structural invalidation.
+ */
+export async function purgeConfiguredCachePatternsAcrossTenantScopes(
+  patterns: string[],
+  options?: CacheServiceOptions,
+): Promise<number> {
+  // A newly-created memory strategy cannot reach the running app's process-local
+  // cache, so constructing one here would only allocate and immediately discard
+  // an empty store. Persistent stock backends remain cross-process maintainable.
+  if (resolveConfiguredStrategyType(options) === 'memory') return 0
 
-  const baseStrategy = createStrategyForType(strategyType, options, defaultTtl)
-  const resilientStrategy = withDependencyFallback(baseStrategy, strategyType, defaultTtl)
-
-  return createTenantAwareWrapper(resilientStrategy)
+  const cache = createConfiguredTenantAwareStrategy(options)
+  try {
+    return await cache.deleteByPatternsAcrossScopes(patterns)
+  } finally {
+    await cache.close?.()
+  }
 }
 
 /**
@@ -274,7 +349,13 @@ export class CacheService implements CacheStrategy {
     return this.strategy.keys(pattern)
   }
 
-  async stats(): Promise<{ size: number; expired: number }> {
+  async stats(): Promise<{
+    size: number
+    expired: number
+    evictions?: number
+    sweeps?: number
+    lastSweepReclaimed?: number
+  }> {
     return this.strategy.stats()
   }
 
@@ -292,7 +373,7 @@ export class CacheService implements CacheStrategy {
   }
 }
 
-function createStrategyForType(strategyType: CacheStrategyName, options?: CacheServiceOptions, defaultTtl?: number): CacheStrategy {
+function createStrategyForType(strategyType: CacheStrategyName, options?: CacheServiceOptions, defaultTtl?: number, maxEntries?: number): CacheStrategy {
   switch (strategyType) {
     case 'redis':
       return createRedisStrategy(options?.redisUrl, { defaultTtl })
@@ -302,11 +383,33 @@ function createStrategyForType(strategyType: CacheStrategyName, options?: CacheS
       return createJsonFileStrategy(options?.jsonFilePath, { defaultTtl })
     case 'memory':
     default:
-      return createMemoryStrategy({ defaultTtl })
+      return createMemoryStrategy({ defaultTtl, maxEntries })
   }
 }
 
-function withDependencyFallback(strategy: CacheStrategy, strategyType: CacheStrategyName, defaultTtl?: number): CacheStrategy {
+function describeDependencyFailure(error: CacheDependencyUnavailableError): string {
+  const originalError = error.originalError
+  if (!(originalError instanceof Error)) {
+    return `missing dependency: ${error.dependency}`
+  }
+
+  const message = originalError.message.trim()
+  if (message.length === 0) {
+    return `missing dependency: ${error.dependency}`
+  }
+
+  if (message.includes('compiled against a different Node.js version') || message.includes('NODE_MODULE_VERSION')) {
+    return `${error.dependency} native module needs rebuild for the current Node.js version`
+  }
+
+  if (message.includes('Cannot find module')) {
+    return `missing dependency: ${error.dependency}`
+  }
+
+  return `${error.dependency} failed to load`
+}
+
+function withDependencyFallback(strategy: CacheStrategy, strategyType: CacheStrategyName, defaultTtl?: number, maxEntries?: number): CacheStrategy {
   if (strategyType === 'memory') return strategy
 
   let activeStrategy = strategy
@@ -315,11 +418,11 @@ function withDependencyFallback(strategy: CacheStrategy, strategyType: CacheStra
 
   const ensureFallback = (error: CacheDependencyUnavailableError) => {
     if (!fallbackStrategy) {
-      fallbackStrategy = createMemoryStrategy({ defaultTtl })
+      fallbackStrategy = createMemoryStrategy({ defaultTtl, maxEntries })
     }
     if (!warned) {
       const dependencyMessage = error.dependency
-        ? ` (missing dependency: ${error.dependency})`
+        ? ` (${describeDependencyFailure(error)})`
         : ''
       console.warn(`[cache] ${error.strategy} strategy unavailable${dependencyMessage}. Falling back to memory strategy.`)
       warned = true
@@ -361,6 +464,9 @@ function withDependencyFallback(strategy: CacheStrategy, strategyType: CacheStra
     clear: wrapMethod('clear'),
     keys: wrapMethod('keys'),
     stats: wrapMethod('stats'),
+    healthcheck: typeof strategy.healthcheck === 'function'
+      ? async () => strategy.healthcheck!()
+      : undefined,
     cleanup: typeof strategy.cleanup === 'function' ? wrapMethod('cleanup') : undefined,
     close: typeof strategy.close === 'function' ? wrapMethod('close') : undefined,
   }

@@ -1,6 +1,9 @@
 import type { AwilixContainer } from 'awilix'
-import type { CacheStrategy } from '@open-mercato/cache'
+import { runWithCacheTenant, type CacheStrategy } from '@open-mercato/cache'
 import { parseBooleanToken } from '../boolean'
+import { createLogger } from '../logger'
+
+const logger = createLogger('shared').child({ component: 'crud-cache' })
 
 export type CrudCacheIdentifiers = {
   id?: string | null
@@ -25,7 +28,7 @@ export function isCrudCacheDebugEnabled(): boolean {
 export function debugCrudCache(event: string, context: Record<string, unknown>) {
   if (!isCrudCacheDebugEnabled()) return
   try {
-    console.debug('[crud][cache]', event, context)
+    logger.debug(event, context)
   } catch {}
 }
 
@@ -55,7 +58,7 @@ export function canonicalizeResourceTag(value: string | null | undefined): strin
     .replace(/_/g, '.')
     .replace(/-+/g, '.')
   const withCamelBreaks = withSeparators.replace(/([a-z0-9])([A-Z])/g, '$1.$2')
-  const collapsed = withCamelBreaks.replace(/\.{2,}/g, '.').replace(/^\.+|\.+$/g, '')
+  const collapsed = withCamelBreaks.replace(/\.{2,}/g, '.').replace(/(?:^\.+|\.+$)/g, '')
   const lowered = collapsed.toLowerCase()
   return lowered.length ? lowered : null
 }
@@ -110,8 +113,22 @@ export function pickFirstIdentifier(...values: Array<unknown>): string | null {
   return null
 }
 
+const IRREGULAR_PLURALS: Record<string, string> = {
+  people: 'person',
+  children: 'child',
+  mice: 'mouse',
+  men: 'man',
+  women: 'woman',
+  geese: 'goose',
+  feet: 'foot',
+  teeth: 'tooth',
+  oxen: 'ox',
+}
+
 function singularizeSegment(segment: string): string {
   const lower = segment.toLowerCase()
+  const irregular = IRREGULAR_PLURALS[lower]
+  if (irregular) return irregular
   if (lower.endsWith('ies') && lower.length > 3) return lower.slice(0, -3) + 'y'
   if (lower.endsWith('ses') && lower.length > 3) return lower.slice(0, -2)
   if (
@@ -174,11 +191,14 @@ export async function invalidateCrudCache(
     if (recordId) {
       tags.add(buildRecordTag(key, tenantId, recordId))
     }
-    const organizationIds: Array<string | null> = []
-    if (identifiers.organizationId !== undefined) {
-      organizationIds.push(identifiers.organizationId ?? null)
-    }
-    if (!organizationIds.length) organizationIds.push(null)
+    // Always flush the tenant-level (org:null) collection tag alongside the
+    // write's own org. Tenant-scoped entities (orgField: null — e.g. auth roles)
+    // cache their collections under org:null, but the command bus resolves a
+    // write's organizationId from the actor's auth context, so the org-specific
+    // tag alone never matches those entries and they only expire on TTL (#2919).
+    const organizationIds: Array<string | null> = [null]
+    const recordOrganizationId = identifiers.organizationId ?? null
+    if (recordOrganizationId) organizationIds.push(recordOrganizationId)
     for (const tag of buildCollectionTags(key, tenantId, organizationIds)) {
       tags.add(tag)
     }
@@ -193,7 +213,7 @@ export async function invalidateCrudCache(
     tags: tagList,
     action: 'clearing',
   })
-  const deleted = await cache.deleteByTags(tagList)
+  const deleted = await runWithCacheTenant(tenantId, () => cache.deleteByTags(tagList))
   debugCrudCache('invalidate', {
     resource,
     reason,

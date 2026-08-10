@@ -1,4 +1,7 @@
-import type { Knex } from 'knex'
+import { type Kysely, sql } from 'kysely'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('translations').child({ component: 'cleanup' })
 
 export const metadata = { event: 'query_index.delete_one', persistent: false }
 
@@ -14,17 +17,16 @@ export default async function handle(
   const tenantId = payload?.tenantId ?? null
 
   try {
-    const em = ctx.resolve<{ getConnection(): { getKnex(): Knex } }>('em')
-    const knex = em.getConnection().getKnex()
-    await knex('entity_translations')
-      .where({
-        entity_type: entityType,
-        entity_id: recordId,
-      })
-      .andWhereRaw('tenant_id is not distinct from ?', [tenantId])
-      .andWhereRaw('organization_id is not distinct from ?', [organizationId])
-      .del()
+    const em = ctx.resolve<{ getKysely<T = any>(): Kysely<T> }>('em')
+    const db = em.getKysely<any>() as any
+    await db
+      .deleteFrom('entity_translations')
+      .where('entity_type', '=', entityType)
+      .where('entity_id', '=', recordId)
+      .where(sql<boolean>`tenant_id is not distinct from ${tenantId}`)
+      .where(sql<boolean>`organization_id is not distinct from ${organizationId}`)
+      .execute()
   } catch (err) {
-    console.warn('[translations/cleanup] Failed to delete translations:', err instanceof Error ? err.message : 'unknown')
+    logger.warn('Failed to delete translations', { err })
   }
 }

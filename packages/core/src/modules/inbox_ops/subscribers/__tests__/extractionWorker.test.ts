@@ -3,6 +3,26 @@
 import handle from '../extractionWorker'
 import { InboxEmail, InboxProposal, InboxProposalAction, InboxDiscrepancy, InboxSettings } from '../../data/entities'
 
+jest.mock('@open-mercato/shared/lib/logger', () => {
+  const mocked = {
+    debug: jest.fn(),
+    info: jest.fn(),
+    warn: jest.fn(),
+    error: jest.fn(),
+    child: jest.fn(),
+  }
+  mocked.child.mockImplementation(() => mocked)
+  return { createLogger: jest.fn(() => mocked) }
+})
+
+const mockLogger = jest.requireMock('@open-mercato/shared/lib/logger').createLogger('test') as {
+  debug: jest.Mock
+  info: jest.Mock
+  warn: jest.Mock
+  error: jest.Mock
+}
+
+
 const mockRunExtraction = jest.fn()
 jest.mock('@open-mercato/core/modules/inbox_ops/lib/llmProvider', () => ({
   runExtractionWithConfiguredProvider: (...args: unknown[]) => mockRunExtraction(...args),
@@ -50,6 +70,11 @@ jest.mock('@open-mercato/core/modules/inbox_ops/lib/constants', () => ({
 const mockEmitInboxOpsEvent = jest.fn()
 jest.mock('@open-mercato/core/modules/inbox_ops/events', () => ({
   emitInboxOpsEvent: (...args: unknown[]) => mockEmitInboxOpsEvent(...args),
+}))
+
+const mockCreateMessageRecordForEmail = jest.fn()
+jest.mock('@open-mercato/core/modules/inbox_ops/lib/messagesIntegration', () => ({
+  createMessageRecordForEmail: (...args: unknown[]) => mockCreateMessageRecordForEmail(...args),
 }))
 
 const mockNativeUpdate = jest.fn()
@@ -160,6 +185,7 @@ describe('extractionWorker', () => {
     mockEm.fork.mockReturnValue(mockEm)
     mockFlush.mockResolvedValue(undefined)
     mockEmitInboxOpsEvent.mockResolvedValue(undefined)
+    mockCreateMessageRecordForEmail.mockResolvedValue(null)
     mockCreate.mockImplementation((_entity: unknown, data: Record<string, unknown>) => ({ ...data }))
     mockMatchContacts.mockResolvedValue([])
     mockFetchCatalog.mockResolvedValue([])
@@ -214,7 +240,8 @@ describe('extractionWorker', () => {
       mockNativeUpdate.mockResolvedValue(1)
       mockFindOneWithDecryption.mockResolvedValueOnce(null)
 
-      const consoleSpy = jest.spyOn(console, 'error').mockImplementation()
+      mockLogger.error.mockClear()
+      const consoleSpy = mockLogger.error
 
       await handle(
         { ...basePayload, emailId: 'email-missing' },
@@ -222,7 +249,8 @@ describe('extractionWorker', () => {
       )
 
       expect(consoleSpy).toHaveBeenCalledWith(
-        expect.stringContaining('Email not found: email-missing'),
+        'Email not found',
+        { emailId: 'email-missing' },
       )
       consoleSpy.mockRestore()
     })
@@ -802,6 +830,79 @@ describe('extractionWorker', () => {
         undefined,
         { organizationId: 'org-1', tenantId: 'tenant-1' },
       )
+    })
+  })
+
+  describe('messages integration', () => {
+    it('calls createMessageRecordForEmail with correct data after successful extraction', async () => {
+      mockNativeUpdate.mockResolvedValue(1)
+      const email = makeEmail()
+      mockFindOneWithDecryption.mockResolvedValueOnce(email)
+
+      mockMatchContacts.mockResolvedValueOnce([])
+      mockRunExtraction.mockResolvedValueOnce({
+        object: makeExtractionResult(),
+        totalTokens: 100,
+        modelWithProvider: 'anthropic:test-model',
+      })
+
+      await handle(basePayload, mockCtx as any)
+
+      expect(mockCreateMessageRecordForEmail).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: 'email-1',
+          subject: 'Order request',
+          cleanedText: 'Hello, I would like to order 10 widgets.',
+          forwardedByAddress: 'john@example.com',
+          forwardedByName: 'John Doe',
+        }),
+        expect.objectContaining({
+          scope: expect.objectContaining({
+            tenantId: 'tenant-1',
+            organizationId: 'org-1',
+          }),
+        }),
+      )
+    })
+
+    it('does not call createMessageRecordForEmail when extraction fails', async () => {
+      mockNativeUpdate.mockResolvedValue(1)
+      const email = makeEmail()
+      mockFindOneWithDecryption.mockResolvedValueOnce(email)
+
+      mockRunExtraction.mockRejectedValueOnce(new Error('LLM timeout'))
+
+      await handle(basePayload, mockCtx as any)
+
+      expect(mockCreateMessageRecordForEmail).not.toHaveBeenCalled()
+    })
+
+    it('continues processing when messages integration fails', async () => {
+      mockNativeUpdate.mockResolvedValue(1)
+      const email = makeEmail()
+      mockFindOneWithDecryption.mockResolvedValueOnce(email)
+
+      mockMatchContacts.mockResolvedValueOnce([])
+      mockRunExtraction.mockResolvedValueOnce({
+        object: makeExtractionResult(),
+        totalTokens: 100,
+        modelWithProvider: 'anthropic:test-model',
+      })
+
+      mockCreateMessageRecordForEmail.mockRejectedValueOnce(new Error('Command bus unavailable'))
+
+      mockLogger.error.mockClear()
+      const consoleSpy = mockLogger.error
+
+      await handle(basePayload, mockCtx as any)
+
+      expect(email.status).toBe('processed')
+      expect(mockEmitInboxOpsEvent).toHaveBeenCalledWith(
+        'inbox_ops.email.processed',
+        expect.objectContaining({ emailId: 'email-1' }),
+      )
+
+      consoleSpy.mockRestore()
     })
   })
 })

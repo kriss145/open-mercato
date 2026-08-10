@@ -1,20 +1,29 @@
 import { NextRequest, NextResponse } from 'next/server'
-import sharp from 'sharp'
+import sharp, { type ResizeOptions } from 'sharp'
 import { z } from 'zod'
 import type { OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
 import { getAuthFromRequest } from '@open-mercato/shared/lib/auth/server'
 import { createRequestContainer } from '@open-mercato/shared/lib/di/container'
 import { Attachment, AttachmentPartition } from '@open-mercato/core/modules/attachments/data/entities'
-import { resolveAttachmentAbsolutePath } from '@open-mercato/core/modules/attachments/lib/storage'
 import {
   buildThumbnailCacheKey,
   readThumbnailCache,
   writeThumbnailCache,
 } from '@open-mercato/core/modules/attachments/lib/thumbnailCache'
-import { checkAttachmentAccess } from '@open-mercato/core/modules/attachments/lib/access'
+import { canRenderInlineAttachment } from '@open-mercato/core/modules/attachments/lib/security'
+import { checkAttachmentAccess, isSuperAdminAuth } from '@open-mercato/core/modules/attachments/lib/access'
 import type { EntityManager } from '@mikro-orm/postgresql'
-import { promises as fs } from 'fs'
 import { attachmentsTag, imageQuerySchema, attachmentErrorSchema } from '../../../openapi'
+import {
+  MAX_IMAGE_SOURCE_PIXELS,
+  validateImageDimensions,
+  validateImageMagicBytes,
+} from '@open-mercato/core/modules/attachments/lib/imageSafety'
+import { StorageDriverFactory } from '../../../../lib/drivers'
+import { resolveAttachmentOrganizationId } from '@open-mercato/core/modules/attachments/lib/requestScope'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('attachments').child({ component: 'image' })
 
 const querySchema = z.object({
   width: z.coerce.number().int().min(1).max(4000).optional(),
@@ -43,33 +52,40 @@ export async function GET(
   }
   const { width, height, cropType } = parsedQuery.data
 
-  const { resolve } = await createRequestContainer()
-  const em = resolve('em') as EntityManager
+  const container = await createRequestContainer()
+  const em = container.resolve('em') as EntityManager
+  const storageDriverFactory =
+    (container.resolve('storageDriverFactory') as StorageDriverFactory | null) ?? new StorageDriverFactory(em)
 
-  const attachment = await em.findOne(Attachment, {
-    id,
-  })
+  const scopedAuth = auth
+    ? { ...auth, orgId: await resolveAttachmentOrganizationId(container, auth, req) }
+    : auth
+  const findFilter: Record<string, unknown> = { id }
+  if (scopedAuth && !isSuperAdminAuth(scopedAuth)) {
+    if (scopedAuth.tenantId) findFilter.tenantId = scopedAuth.tenantId
+    if (scopedAuth.orgId) findFilter.organizationId = scopedAuth.orgId
+  }
+  const attachment = await em.findOne(Attachment, findFilter)
   if (!attachment) {
     return NextResponse.json({ error: 'Not found' }, { status: 404 })
   }
-  if (typeof attachment.mimeType !== 'string' || !attachment.mimeType.startsWith('image/')) {
+  if (!canRenderInlineAttachment(attachment.mimeType)) {
     return NextResponse.json({ error: 'Unsupported media type' }, { status: 400 })
   }
   const partition = await em.findOne(AttachmentPartition, { code: attachment.partitionCode })
   if (!partition) {
     return NextResponse.json({ error: 'Partition misconfigured' }, { status: 500 })
   }
-  const access = checkAttachmentAccess(auth, attachment, partition)
+  const access = checkAttachmentAccess(scopedAuth, attachment, partition)
   if (!access.ok) {
     const message = access.status === 401 ? 'Unauthorized' : 'Forbidden'
     return NextResponse.json({ error: message }, { status: access.status })
   }
 
-  const filePath = resolveAttachmentAbsolutePath(
-    attachment.partitionCode,
-    attachment.storagePath,
-    attachment.storageDriver
-  )
+  const driver = await storageDriverFactory.resolveForPartition(attachment.partitionCode, {
+    tenantId: attachment.tenantId ?? '',
+    organizationId: attachment.organizationId ?? '',
+  })
   const cacheKey = buildThumbnailCacheKey(width, height, cropType)
   try {
     let buffer: Buffer | null = null
@@ -77,10 +93,23 @@ export async function GET(
       buffer = await readThumbnailCache(attachment.partitionCode, attachment.id, cacheKey)
     }
     if (!buffer) {
-      const input = await fs.readFile(filePath)
-      let transformer = sharp(input)
+      const { buffer: input } = await driver.read(attachment.partitionCode, attachment.storagePath)
+      const magicBytesValidation = validateImageMagicBytes(input, attachment.mimeType)
+      if (!magicBytesValidation.ok) {
+        return NextResponse.json({ error: magicBytesValidation.error }, { status: magicBytesValidation.status })
+      }
+
+      const dimensionsValidation = await validateImageDimensions(input)
+      if (!dimensionsValidation.ok) {
+        return NextResponse.json({ error: dimensionsValidation.error }, { status: dimensionsValidation.status })
+      }
+
+      let transformer = sharp(input, {
+        failOn: 'error',
+        limitInputPixels: MAX_IMAGE_SOURCE_PIXELS,
+      })
       if (width || height) {
-        const resizeOptions: sharp.ResizeOptions = {
+        const resizeOptions: ResizeOptions = {
           width: width || undefined,
           height: height || undefined,
           fit: cropType === 'contain' ? 'contain' : 'cover',
@@ -93,7 +122,7 @@ export async function GET(
       buffer = await transformer.toBuffer()
       if (cacheKey) {
         void writeThumbnailCache(attachment.partitionCode, attachment.id, cacheKey, buffer).catch((cacheError) => {
-          console.error('attachments.image.cache.write failed', cacheError)
+          logger.error('Thumbnail cache write failed', { err: cacheError })
         })
       }
     }
@@ -106,10 +135,11 @@ export async function GET(
       headers: {
         'Content-Type': attachment.mimeType || 'image/jpeg',
         'Cache-Control': partition.isPublic ? 'public, max-age=3600' : 'private, max-age=60',
+        'X-Content-Type-Options': 'nosniff',
       },
     })
   } catch (error) {
-    console.error('attachments.image.read failed', error)
+    logger.error('Image read failed', { err: error })
     return NextResponse.json({ error: 'Failed to render image' }, { status: 500 })
   }
 }

@@ -213,14 +213,14 @@ export default function WorkflowInstancesListPage() {
       header: t('workflows.instances.fields.workflowId'),
       accessorKey: 'workflowId',
       cell: ({ row }) => (
-        <div>
+        <Link href={`/backend/instances/${row.original.id}`} className="block hover:underline">
           <div className="font-mono text-sm font-medium">{row.original.workflowId}</div>
           {row.original.correlationKey && (
             <div className="text-xs text-muted-foreground">
               {t('workflows.instances.fields.correlationKey')}: {row.original.correlationKey}
             </div>
           )}
-        </div>
+        </Link>
       ),
     },
     {
@@ -288,7 +288,7 @@ export default function WorkflowInstancesListPage() {
           items.push({
             id: 'cancel',
             label: t('workflows.instances.actions.cancel'),
-            onSelect: () => handleCancel(row.original.id, row.original.workflowId),
+            onSelect: () => void handleCancel(row.original.id, row.original.workflowId),
           })
         }
 
@@ -296,7 +296,7 @@ export default function WorkflowInstancesListPage() {
           items.push({
             id: 'retry',
             label: t('workflows.instances.actions.retry'),
-            onSelect: () => handleRetry(row.original.id, row.original.workflowId),
+            onSelect: () => void handleRetry(row.original.id, row.original.workflowId),
           })
         }
 

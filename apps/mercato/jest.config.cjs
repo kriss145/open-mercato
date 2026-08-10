@@ -1,6 +1,8 @@
 /** @type {import('jest').Config} */
+const base = require('../../jest.config.base.cjs')
+
 module.exports = {
-  preset: 'ts-jest',
+  ...base,
   testEnvironment: 'node',
   watchman: false,
   rootDir: '.',
@@ -14,6 +16,8 @@ module.exports = {
     '^@open-mercato/core/(.*)$': '<rootDir>/../../packages/core/src/$1',
     '^@open-mercato/shared/(.*)$': '<rootDir>/../../packages/shared/src/$1',
     '^@open-mercato/ui/(.*)$': '<rootDir>/../../packages/ui/src/$1',
+    '^@open-mercato/enterprise$': '<rootDir>/../../packages/enterprise/src/index.ts',
+    '^@open-mercato/enterprise/(.*)$': '<rootDir>/../../packages/enterprise/src/$1',
     '^@open-mercato/cache$': '<rootDir>/../../packages/cache/src/index.ts',
     '^@open-mercato/cache/(.*)$': '<rootDir>/../../packages/cache/src/$1',
     '^@open-mercato/queue$': '<rootDir>/../../packages/queue/src/index.ts',
@@ -26,16 +30,22 @@ module.exports = {
   },
   transform: {
     '^.+\\.(t|j)sx?$': [
-      'ts-jest',
+      '<rootDir>/../../scripts/jest-mikroorm-transformer.cjs',
       {
         tsconfig: {
           jsx: 'react-jsx',
+          rootDir: '.',
+          ignoreDeprecations: '6.0',
         },
       },
     ],
   },
   setupFiles: ['<rootDir>/../../jest.setup.ts'],
   setupFilesAfterEnv: ['<rootDir>/../../jest.dom.setup.ts'],
+  transformIgnorePatterns: [
+    '/node_modules/(?!(@mikro-orm|kysely|meilisearch|ai|@ai-sdk|ai-sdk-ollama|@workflow|@standard-schema)/)',
+    '\\.pnp\\.[^\\/]+$',
+  ],
   testMatch: ['<rootDir>/src/**/__tests__/**/*.test.(ts|tsx)'],
   passWithNoTests: true,
 }

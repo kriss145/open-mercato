@@ -1,14 +1,23 @@
 import { NextResponse } from 'next/server'
 import { z } from 'zod'
 import { resolveTranslations } from '@open-mercato/shared/lib/i18n/server'
-import { CrudHttpError } from '@open-mercato/shared/lib/crud/errors'
+import { CrudHttpError, isCrudHttpError, notFound } from '@open-mercato/shared/lib/crud/errors'
 import type { CommandBus } from '@open-mercato/shared/lib/commands'
 import { serializeOperationMetadata } from '@open-mercato/shared/lib/commands/operationMetadata'
 import type { CommandExecuteResult } from '@open-mercato/shared/lib/commands/types'
 import { CustomerDictionaryEntry } from '../../../../data/entities'
-import { mapDictionaryKind, resolveDictionaryRouteContext } from '../../context'
+import { mapDictionaryKind, resolveDictionaryActorId, resolveDictionaryRouteContext } from '../../context'
 import { invalidateDictionaryCache } from '../../cache'
 import type { OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
+import { readJsonSafe } from '@open-mercato/shared/lib/http/readJsonSafe'
+import { findOneWithDecryption } from '@open-mercato/shared/lib/encryption/find'
+import {
+  runCrudMutationGuardAfterSuccess,
+  validateCrudMutationGuard,
+} from '@open-mercato/shared/lib/crud/mutation-guard'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('customers')
 
 const paramsSchema = z.object({
   id: z.string().uuid(),
@@ -30,6 +39,10 @@ export const metadata = {
   DELETE: { requireAuth: true, requireFeatures: ['customers.settings.manage'] },
 }
 
+function formatCountMessage(template: string, count: number) {
+  return template.replace('{{count}}', String(count))
+}
+
 export async function PATCH(req: Request, ctx: { params?: { kind?: string; id?: string } }) {
   try {
     const routeContext = await resolveDictionaryRouteContext(req)
@@ -38,7 +51,22 @@ export async function PATCH(req: Request, ctx: { params?: { kind?: string; id?: 
     }
     const { mappedKind } = mapDictionaryKind(ctx.params?.kind)
     const { id } = paramsSchema.parse({ id: ctx.params?.id })
-    const payload = patchSchema.parse(await req.json().catch(() => ({})))
+    const payload = patchSchema.parse(await readJsonSafe(req, {}))
+    const guardUserId = resolveDictionaryActorId(routeContext.auth)
+    const guardResult = await validateCrudMutationGuard(routeContext.container, {
+      tenantId: routeContext.tenantId,
+      organizationId: routeContext.organizationId,
+      userId: guardUserId,
+      resourceKind: 'customers.dictionary_entry',
+      resourceId: id,
+      operation: 'update',
+      requestMethod: req.method,
+      requestHeaders: req.headers,
+      mutationPayload: payload,
+    })
+    if (guardResult && !guardResult.ok) {
+      return NextResponse.json(guardResult.body, { status: guardResult.status })
+    }
     const commandBus = (routeContext.container.resolve('commandBus') as CommandBus)
     let commandResult: CommandExecuteResult<{ entryId: string; changed: boolean }>
     try {
@@ -56,11 +84,24 @@ export async function PATCH(req: Request, ctx: { params?: { kind?: string; id?: 
         ctx: routeContext.ctx,
       })) as CommandExecuteResult<{ entryId: string; changed: boolean }>
     } catch (err) {
-      if (err instanceof CrudHttpError) {
+      if (isCrudHttpError(err)) {
         if (err.status === 404) {
-          throw new CrudHttpError(404, { error: routeContext.translate('customers.errors.lookup_failed', 'Dictionary entry not found') })
+          throw notFound(routeContext.translate('customers.errors.lookup_failed', 'Dictionary entry not found'))
         }
         if (err.status === 409) {
+          if ((err.body as Record<string, unknown> | undefined)?.code === 'role_type_in_use') {
+            const usageCount = Number((err.body as Record<string, unknown> | undefined)?.usageCount ?? 0)
+            throw new CrudHttpError(409, {
+              ...(err.body as Record<string, unknown> | undefined),
+              error: formatCountMessage(
+                routeContext.translate(
+                  'customers.config.dictionaries.errors.roleTypeValueInUse',
+                  'This role type is assigned to {{count}} records. Remove or replace those assignments before changing its value.',
+                ),
+                usageCount,
+              ),
+            })
+          }
           throw new CrudHttpError(409, { error: routeContext.translate('customers.config.dictionaries.errors.duplicate', 'An entry with this value already exists') })
         }
         if (err.status === 400) {
@@ -71,9 +112,18 @@ export async function PATCH(req: Request, ctx: { params?: { kind?: string; id?: 
     }
     const { result, logEntry } = commandResult
 
-    const entry = await routeContext.em.fork().findOne(CustomerDictionaryEntry, id)
+    const entry = await findOneWithDecryption(
+      routeContext.em.fork(),
+      CustomerDictionaryEntry,
+      { id },
+      {},
+      {
+        tenantId: routeContext.tenantId,
+        organizationId: routeContext.organizationId,
+      },
+    )
     if (!entry) {
-      throw new CrudHttpError(404, { error: routeContext.translate('customers.errors.lookup_failed', 'Dictionary entry not found') })
+      throw notFound(routeContext.translate('customers.errors.lookup_failed', 'Dictionary entry not found'))
     }
 
     if (result.changed) {
@@ -107,13 +157,26 @@ export async function PATCH(req: Request, ctx: { params?: { kind?: string; id?: 
         })
       )
     }
+    if (guardResult?.ok && guardResult.shouldRunAfterSuccess) {
+      await runCrudMutationGuardAfterSuccess(routeContext.container, {
+        tenantId: routeContext.tenantId,
+        organizationId: routeContext.organizationId,
+        userId: guardUserId,
+        resourceKind: 'customers.dictionary_entry',
+        resourceId: entry.id,
+        operation: 'update',
+        requestMethod: req.method,
+        requestHeaders: req.headers,
+        metadata: guardResult.metadata ?? null,
+      })
+    }
     return response
   } catch (err) {
-    if (err instanceof CrudHttpError) {
+    if (isCrudHttpError(err)) {
       return NextResponse.json(err.body, { status: err.status })
     }
     const { translate } = await resolveTranslations()
-    console.error('customers.dictionaries.update failed', err)
+    logger.error('customers.dictionaries.update failed', { err })
     return NextResponse.json({ error: translate('customers.errors.lookup_failed', 'Failed to save dictionary entry') }, { status: 400 })
   }
 }
@@ -126,6 +189,21 @@ export async function DELETE(req: Request, ctx: { params?: { kind?: string; id?:
     }
     const { mappedKind } = mapDictionaryKind(ctx.params?.kind)
     const { id } = paramsSchema.parse({ id: ctx.params?.id })
+    const guardUserId = resolveDictionaryActorId(routeContext.auth)
+    const guardResult = await validateCrudMutationGuard(routeContext.container, {
+      tenantId: routeContext.tenantId,
+      organizationId: routeContext.organizationId,
+      userId: guardUserId,
+      resourceKind: 'customers.dictionary_entry',
+      resourceId: id,
+      operation: 'delete',
+      requestMethod: req.method,
+      requestHeaders: req.headers,
+      mutationPayload: null,
+    })
+    if (guardResult && !guardResult.ok) {
+      return NextResponse.json(guardResult.body, { status: guardResult.status })
+    }
     const commandBus = (routeContext.container.resolve('commandBus') as CommandBus)
     let deleteResult: CommandExecuteResult<{ entryId: string }>
     try {
@@ -139,8 +217,21 @@ export async function DELETE(req: Request, ctx: { params?: { kind?: string; id?:
         ctx: routeContext.ctx,
       })) as CommandExecuteResult<{ entryId: string }>
     } catch (err) {
-      if (err instanceof CrudHttpError && err.status === 404) {
-        throw new CrudHttpError(404, { error: routeContext.translate('customers.errors.lookup_failed', 'Dictionary entry not found') })
+      if (isCrudHttpError(err) && err.status === 404) {
+        throw notFound(routeContext.translate('customers.errors.lookup_failed', 'Dictionary entry not found'))
+      }
+      if (isCrudHttpError(err) && err.status === 409 && (err.body as Record<string, unknown> | undefined)?.code === 'role_type_in_use') {
+        const usageCount = Number((err.body as Record<string, unknown> | undefined)?.usageCount ?? 0)
+        throw new CrudHttpError(409, {
+          ...(err.body as Record<string, unknown> | undefined),
+          error: formatCountMessage(
+            routeContext.translate(
+              'customers.config.dictionaries.errors.roleTypeDeleteInUse',
+              'This role type is assigned to {{count}} records. Remove or replace those assignments before deleting it.',
+            ),
+            usageCount,
+          ),
+        })
       }
       throw err
     }
@@ -167,13 +258,26 @@ export async function DELETE(req: Request, ctx: { params?: { kind?: string; id?:
         })
       )
     }
+    if (guardResult?.ok && guardResult.shouldRunAfterSuccess) {
+      await runCrudMutationGuardAfterSuccess(routeContext.container, {
+        tenantId: routeContext.tenantId,
+        organizationId: routeContext.organizationId,
+        userId: guardUserId,
+        resourceKind: 'customers.dictionary_entry',
+        resourceId: id,
+        operation: 'delete',
+        requestMethod: req.method,
+        requestHeaders: req.headers,
+        metadata: guardResult.metadata ?? null,
+      })
+    }
     return response
   } catch (err) {
-    if (err instanceof CrudHttpError) {
+    if (isCrudHttpError(err)) {
       return NextResponse.json(err.body, { status: err.status })
     }
     const { translate } = await resolveTranslations()
-    console.error('customers.dictionaries.delete failed', err)
+    logger.error('customers.dictionaries.delete failed', { err })
     return NextResponse.json({ error: translate('customers.errors.lookup_failed', 'Failed to delete dictionary entry') }, { status: 400 })
   }
 }
@@ -226,6 +330,7 @@ export const openApi: OpenApiRouteDoc = {
       errors: [
         { status: 401, description: 'Unauthorized', schema: dictionaryErrorSchema },
         { status: 404, description: 'Entry not found', schema: dictionaryErrorSchema },
+        { status: 409, description: 'Entry is in use and cannot be deleted', schema: dictionaryErrorSchema },
       ],
     },
   },

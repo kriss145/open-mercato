@@ -14,6 +14,11 @@ import { createAmazonBedrock } from '@ai-sdk/amazon-bedrock'
 import { createOllama } from 'ai-sdk-ollama'
 import type { EmbeddingProviderId, EmbeddingProviderConfig } from '../types'
 import { EMBEDDING_PROVIDERS, DEFAULT_EMBEDDING_CONFIG } from '../types'
+import {
+  assertSafeOllamaBaseUrl,
+  safeOllamaFetch,
+  UnsafeOllamaBaseUrlError,
+} from '../lib/ollama-url-safety'
 
 export type EmbeddingServiceOptions = {
   apiKey?: string
@@ -29,6 +34,25 @@ type ProviderClient = ReturnType<typeof createOpenAI>
   | ReturnType<typeof createCohere>
   | ReturnType<typeof createAmazonBedrock>
   | OllamaClient
+
+const DEFAULT_EMBEDDING_TIMEOUT_MS = 3_000
+
+function resolveEmbeddingTimeoutMs(): number {
+  const rawValue = process.env.VECTOR_EMBEDDING_TIMEOUT_MS
+  if (!rawValue) return DEFAULT_EMBEDDING_TIMEOUT_MS
+  const parsed = Number.parseInt(rawValue, 10)
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return DEFAULT_EMBEDDING_TIMEOUT_MS
+  }
+  return parsed
+}
+
+function timeoutError(providerId: EmbeddingProviderId, timeoutMs: number): Error {
+  const providerInfo = EMBEDDING_PROVIDERS[providerId]
+  return new Error(
+    `${providerInfo.name} request timed out after ${timeoutMs}ms. Check ${providerInfo.envKeyRequired}.`,
+  )
+}
 
 export class EmbeddingService {
   private config: EmbeddingProviderConfig
@@ -48,6 +72,15 @@ export class EmbeddingService {
   }
 
   updateConfig(config: EmbeddingProviderConfig): void {
+    if (
+      config.providerId === this.config.providerId &&
+      config.model === this.config.model &&
+      config.dimension === this.config.dimension &&
+      config.outputDimensionality === this.config.outputDimensionality &&
+      config.baseUrl === this.config.baseUrl
+    ) {
+      return
+    }
     this.config = config
     this.clientCache.clear()
   }
@@ -138,7 +171,17 @@ export class EmbeddingService {
       }
       case 'ollama': {
         const baseURL = this.config.baseUrl ?? process.env.OLLAMA_BASE_URL ?? 'http://localhost:11434'
-        client = createOllama({ baseURL })
+        try {
+          assertSafeOllamaBaseUrl(baseURL)
+        } catch (err) {
+          if (err instanceof UnsafeOllamaBaseUrlError) {
+            throw new Error(
+              `[vector.embedding] Ollama base URL rejected (${err.reason}). Set OLLAMA_BASE_URL or OM_SEARCH_OLLAMA_BASE_URL_ALLOWLIST.`,
+            )
+          }
+          throw err
+        }
+        client = createOllama({ baseURL, fetch: safeOllamaFetch })
         break
       }
       default:
@@ -213,13 +256,32 @@ export class EmbeddingService {
 
     const model = this.getEmbeddingModel() as EmbeddingModel
     const providerOptions = this.getProviderOptions()
+    const timeoutMs = resolveEmbeddingTimeoutMs()
 
+    const abortController = new AbortController()
+    let timeoutHandle: ReturnType<typeof setTimeout> | null = null
     try {
-      const result = await embed({
-        model,
-        value: merged,
-        ...(providerOptions && { providerOptions }),
-      })
+      const result = await Promise.race([
+        embed({
+          model,
+          value: merged,
+          abortSignal: abortController.signal,
+          ...(providerOptions && { providerOptions }),
+        }),
+        new Promise<never>((_, reject) => {
+          timeoutHandle = setTimeout(
+            () => {
+              // Abort the in-flight request so a dead/unreachable provider releases
+              // its socket — and, in a worker, the per-job DB connection held while
+              // this awaits — promptly, instead of lingering until the platform's
+              // default network timeout and pinning pool capacity under a storm.
+              abortController.abort()
+              reject(timeoutError(this.config.providerId, timeoutMs))
+            },
+            timeoutMs,
+          )
+        }),
+      ])
       const emb = Array.isArray(result.embedding)
         ? result.embedding
         : Array.from(result.embedding as ArrayLike<number>)
@@ -254,9 +316,13 @@ export class EmbeddingService {
           guidance = `${providerInfo.name} account is disabled. Contact support or provide a different key.`
           break
         default:
-          guidance = rawMessage.includes('https://')
+          guidance = rawMessage.startsWith('[vector.embedding] ')
+            ? rawMessage.slice('[vector.embedding] '.length)
+            : rawMessage.includes('https://')
             ? rawMessage
-            : `${rawMessage}. Check ${providerInfo.envKeyRequired}.`
+            : rawMessage.includes(providerInfo.envKeyRequired)
+              ? rawMessage
+              : `${rawMessage}. Check ${providerInfo.envKeyRequired}.`
       }
       const wrapped = new Error(`[vector.embedding] ${guidance}`) as Error & { status?: number; code?: string; cause?: unknown }
       if (typeof status === 'number' && Number.isFinite(status)) {
@@ -270,6 +336,10 @@ export class EmbeddingService {
       }
       wrapped.cause = err
       throw wrapped
+    } finally {
+      if (timeoutHandle !== null) {
+        clearTimeout(timeoutHandle)
+      }
     }
   }
 }

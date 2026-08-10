@@ -3,7 +3,8 @@ import { z } from 'zod'
 import type { CacheStrategy } from '@open-mercato/cache'
 import { createRequestContainer } from '@open-mercato/shared/lib/di/container'
 import { getAuthFromRequest } from '@open-mercato/shared/lib/auth/server'
-import { CustomFieldDef } from '@open-mercato/core/modules/entities/data/entities'
+import type { RbacService } from '@open-mercato/core/modules/auth/services/rbacService'
+import { CustomEntity, CustomFieldDef } from '@open-mercato/core/modules/entities/data/entities'
 import { upsertCustomFieldDefSchema, fieldsetCodeRegex } from '@open-mercato/core/modules/entities/data/validators'
 import {
   createDefinitionsCacheKey,
@@ -15,8 +16,133 @@ import type { OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
 import { filterSelectableSystemEntityIds, isSystemEntitySelectable } from '@open-mercato/shared/lib/entities/system-entities'
 import { resolveOrganizationScopeForRequest } from '@open-mercato/core/modules/directory/utils/organizationScope'
 import { loadEntityFieldsetConfigs, CustomFieldsetDefinition } from '../lib/fieldsets'
+import { installCustomEntitiesFromModules } from '../lib/install-from-ce'
 import { normalizeCustomFieldOptions } from '@open-mercato/shared/modules/entities/options'
 import { CURRENCY_OPTIONS_URL } from '@open-mercato/shared/modules/entities/kinds'
+import type { EntityManager } from '@mikro-orm/postgresql'
+import {
+  beginEntitiesMutationGuard,
+  FIELD_DEFINITION_RESOURCE_KIND,
+} from './definitions.mutation-guard'
+import {
+  createExactDefinitionWhere,
+  createScopedDefinitionTombstone,
+  createVisibleDefinitionWhere,
+  markDefinitionTombstoned,
+  resolveDefinitionScopeFromOrganizationScope,
+  resolveDefinitionMutationScope,
+  selectVisibleDefinitionWinner,
+} from '../lib/definition-scope'
+import { resolveEntityDefinitionsVersion } from '../lib/definitions-version'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('entities').child({ component: 'definitions' })
+
+/**
+ * Validate defaultValue against the field kind. Returns an error message string
+ * if invalid, or null if valid. For dictionary and currency kinds, queries the
+ * database to verify the token exists.
+ */
+async function validateDefaultValueByKind(
+  value: unknown,
+  kind: string,
+  cfg: Record<string, unknown>,
+  em: EntityManager,
+  tenantContext: { tenantId: string | null; organizationId: string | null },
+): Promise<string | null> {
+  switch (kind) {
+    case 'boolean':
+      if (typeof value !== 'boolean') return 'defaultValue for boolean fields must be true or false'
+      return null
+    case 'integer':
+      if (typeof value !== 'number' || !Number.isInteger(value))
+        return 'defaultValue for integer fields must be a whole number'
+      return null
+    case 'float':
+      if (typeof value !== 'number' || !isFinite(value))
+        return 'defaultValue for float fields must be a finite number'
+      return null
+    case 'text':
+    case 'multiline':
+    case 'date':
+    case 'datetime':
+      if (typeof value !== 'string')
+        return `defaultValue for ${kind} fields must be a string`
+      return null
+    case 'dictionary': {
+      if (typeof value !== 'string')
+        return 'defaultValue for dictionary fields must be a string'
+      const dictionaryId = typeof cfg.dictionaryId === 'string' ? cfg.dictionaryId.trim() : ''
+      if (dictionaryId) {
+        try {
+          const { DictionaryEntry } = await import('@open-mercato/core/modules/dictionaries/data/entities')
+          const entry = await em.findOne(DictionaryEntry, {
+            dictionary: dictionaryId,
+            value: value,
+            ...(tenantContext.organizationId ? { organizationId: tenantContext.organizationId } : {}),
+            ...(tenantContext.tenantId ? { tenantId: tenantContext.tenantId } : {}),
+          })
+          if (!entry) return `defaultValue "${value}" does not match any entry in the configured dictionary`
+        } catch (err) {
+          // If the dictionaries module is not available, skip entry validation
+          logger.debug('Dictionary validation skipped — module not available', { err })
+        }
+      }
+      return null
+    }
+    case 'currency': {
+      if (typeof value !== 'string')
+        return 'defaultValue for currency fields must be a string'
+      try {
+        const { Currency } = await import('@open-mercato/core/modules/currencies/data/entities')
+        const where: Record<string, string> = { code: value as string }
+        if (tenantContext.tenantId) where.tenantId = tenantContext.tenantId
+        if (tenantContext.organizationId) where.organizationId = tenantContext.organizationId
+        const currency = await em.findOne(Currency, where)
+        if (!currency) return `defaultValue "${value}" does not match any available currency`
+      } catch (err) {
+        // If the currencies module is not available, skip currency validation
+        logger.debug('Currency validation skipped — module not available', { err })
+      }
+      return null
+    }
+    case 'select': {
+      if (typeof value !== 'string' && typeof value !== 'number')
+        return 'defaultValue for select fields must be a string or number'
+      const options = normalizeCustomFieldOptions(
+        Array.isArray(cfg.options) ? cfg.options : [],
+      )
+      if (options.length > 0) {
+        const match = options.some(
+          (o) => o.value === value || String(o.value) === String(value),
+        )
+        if (!match) return 'defaultValue does not match any of the configured options'
+      }
+      return null
+    }
+    case 'relation':
+    case 'attachment':
+      return `defaultValue is not supported for ${kind} fields`
+    default:
+      return null
+  }
+}
+
+/**
+ * Normalize defaultValue to the canonical storage shape for the given kind.
+ */
+function normalizeDefaultValueByKind(value: unknown, kind: string): unknown {
+  switch (kind) {
+    case 'boolean':
+      return value === true
+    case 'integer':
+      return Math.round(Number(value))
+    case 'float':
+      return Number(value)
+    default:
+      return value
+  }
+}
 
 export const metadata = {
   // Reading definitions is needed by record forms; keep it auth-protected but accessible to all authenticated users
@@ -48,7 +174,7 @@ function parseEntityIds(url: URL): string[] {
 
 async function resolveEntityDefaultEditor(em: any, entityId: string, tenantId: string | null | undefined): Promise<string | undefined> {
   try {
-    const ent = await em.findOne('@open-mercato/core/modules/entities/data/entities:CustomEntity' as any, {
+    const ent = await em.findOne(CustomEntity, {
       entityId,
       $and: [
         { $or: [ { tenantId: tenantId ?? undefined as any }, { tenantId: null } ] },
@@ -75,6 +201,19 @@ function normalizeFieldGroup(raw: unknown): { code: string; title?: string; hint
   return group
 }
 
+function definitionMatchesReadScope(
+  definition: { tenantId?: string | null; organizationId?: string | null },
+  scope: { tenantId: string | null; organizationId: string | null },
+) {
+  const definitionTenantId = definition.tenantId ?? null
+  const definitionOrganizationId = definition.organizationId ?? null
+  const tenantMatches = definitionTenantId === null || definitionTenantId === scope.tenantId
+  const organizationMatches =
+    definitionOrganizationId === null ||
+    (scope.organizationId !== null && definitionOrganizationId === scope.organizationId)
+  return tenantMatches && organizationMatches
+}
+
 export async function GET(req: Request) {
   const url = new URL(req.url)
   const requestedEntityIds = parseEntityIds(url)
@@ -94,17 +233,48 @@ export async function GET(req: Request) {
 
   const container = await createRequestContainer()
   const scope = await resolveOrganizationScopeForRequest({ container, auth, request: req })
-  const tenantId = scope.tenantId ?? auth.tenantId ?? null
+  const definitionScope = resolveDefinitionScopeFromOrganizationScope(auth, scope)
+  const tenantId = definitionScope.tenantId
   if (!tenantId) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
-  const organizationId = scope.selectedId ?? auth.orgId ?? null
+  const organizationId = definitionScope.organizationId
   const { resolve } = container
   const em = resolve('em') as any
   let cache: CacheStrategy | undefined
   try {
     cache = resolve('cache') as CacheStrategy
   } catch {}
+
+  let canManageDefinitions = false
+  if (typeof auth.sub === 'string' && auth.sub.length > 0) {
+    try {
+      const rbac = resolve('rbacService') as RbacService
+      canManageDefinitions = await rbac.userHasAllFeatures(auth.sub, ['entities.definitions.manage'], {
+        tenantId,
+        organizationId,
+      })
+    } catch {
+      // RBAC service unavailable — fall back to read-only (no definition sync)
+    }
+  }
+
+  if (canManageDefinitions) {
+    try {
+      await installCustomEntitiesFromModules(em, cache, {
+        tenantIds: [tenantId],
+        entityIds,
+        includeGlobal: true,
+        createOnly: true,
+      })
+    } catch (err) {
+      logger.warn('Failed to synchronize module-backed definitions', {
+        tenantId,
+        entityIds,
+        err,
+      })
+    }
+  }
 
   let cacheKey: string | null = null
   if (cache && !fieldsetFilter) {
@@ -119,7 +289,7 @@ export async function GET(req: Request) {
         return NextResponse.json(cached)
       }
     } catch (err) {
-      console.warn('[entities.definitions.cache] Failed to read cache', err)
+      logger.warn('Failed to read cache', { err })
     }
   }
 
@@ -130,22 +300,29 @@ export async function GET(req: Request) {
     mode: 'public',
   })
 
-  // Tenant-only scoping: allow global (null) or exact tenant match; do not scope by organization here
+  const tenantCandidates = [{ tenantId }, { tenantId: null as string | null }]
+  const organizationCandidates = [{ organizationId: null as string | null }]
+  if (organizationId) organizationCandidates.unshift({ organizationId })
+  const readScope = { tenantId, organizationId }
+
   const whereActive = {
     entityId: { $in: entityIds as any },
     deletedAt: null,
     $and: [
-      { $or: [ { tenantId: tenantId ?? undefined as any }, { tenantId: null } ] },
+      { $or: tenantCandidates },
+      { $or: organizationCandidates },
     ],
   } as any
-  const defs = await em.find(CustomFieldDef, whereActive as any)
-  const tombstones = await em.find(CustomFieldDef, {
+  const defs = (await em.find(CustomFieldDef, whereActive as any))
+    .filter((definition: any) => definitionMatchesReadScope(definition, readScope))
+  const tombstones = (await em.find(CustomFieldDef, {
     entityId: { $in: entityIds as any },
     deletedAt: { $ne: null } as any,
     $and: [
-      { $or: [ { tenantId: tenantId ?? undefined as any }, { tenantId: null } ] },
+      { $or: tenantCandidates },
+      { $or: organizationCandidates },
     ],
-  } as any)
+  } as any)).filter((definition: any) => definitionMatchesReadScope(definition, readScope))
 
   const tombstonedByEntity = new Map<string, Set<string>>()
   for (const entry of tombstones as any[]) {
@@ -198,7 +375,16 @@ export async function GET(req: Request) {
     for (const d of winning) {
       const rawFieldset = typeof d.configJson?.fieldset === 'string' ? d.configJson.fieldset.trim() : ''
       const normalizedFieldset = rawFieldset.length > 0 ? rawFieldset : undefined
-      if (fieldsetFilter && normalizedFieldset !== fieldsetFilter) continue
+      const normalizedFieldsets = Array.isArray(d.configJson?.fieldsets)
+        ? d.configJson.fieldsets
+            .filter((entry: unknown): entry is string => typeof entry === 'string')
+            .map((entry: string) => entry.trim())
+            .filter((entry: string) => entry.length > 0)
+        : []
+      const effectiveFieldsets = normalizedFieldsets.length > 0
+        ? normalizedFieldsets
+        : (normalizedFieldset ? [normalizedFieldset] : [])
+      if (fieldsetFilter && !effectiveFieldsets.includes(fieldsetFilter)) continue
       const groupInfo = normalizeFieldGroup(d.configJson?.group)
       const keyLower = String(d.key).toLowerCase()
       const candidateBase = {
@@ -231,11 +417,15 @@ export async function GET(req: Request) {
           : undefined,
         priority: typeof d.configJson?.priority === 'number' ? d.configJson.priority : 0,
         validation: Array.isArray(d.configJson?.validation) ? d.configJson.validation : undefined,
+        defaultValue: d.configJson?.defaultValue !== undefined ? d.configJson.defaultValue : undefined,
         // attachments config passthrough
         maxAttachmentSizeMb: typeof d.configJson?.maxAttachmentSizeMb === 'number' ? d.configJson.maxAttachmentSizeMb : undefined,
         acceptExtensions: Array.isArray(d.configJson?.acceptExtensions) ? d.configJson.acceptExtensions : undefined,
+        // phone config passthrough
+        defaultCountryIso2: typeof d.configJson?.defaultCountryIso2 === 'string' ? d.configJson.defaultCountryIso2 : undefined,
         entityId,
-        fieldset: normalizedFieldset,
+        fieldset: normalizedFieldset ?? effectiveFieldsets[0],
+        fieldsets: effectiveFieldsets.length > 0 ? effectiveFieldsets : undefined,
         group: groupInfo,
       } as any
       const metrics = computeDefinitionScore(d, candidateBase, entityOrder.get(entityId) ?? Number.MAX_SAFE_INTEGER)
@@ -286,7 +476,7 @@ export async function GET(req: Request) {
         tags,
       })
     } catch (err) {
-      console.warn('[entities.definitions.cache] Failed to store cache entry', err)
+      logger.warn('Failed to store cache entry', { err })
     }
   }
 
@@ -314,6 +504,7 @@ export async function POST(req: Request) {
   }
 
   const container = await createRequestContainer()
+  const scope = await resolveDefinitionMutationScope({ auth, container, request: req })
   const { resolve } = container
   const em = resolve('em') as any
   let cache: CacheStrategy | undefined
@@ -321,8 +512,20 @@ export async function POST(req: Request) {
     cache = resolve('cache') as CacheStrategy
   } catch {}
 
-  const where: any = { entityId: input.entityId, key: input.key, organizationId: auth.orgId ?? null, tenantId: auth.tenantId ?? null }
+  const where: any = createExactDefinitionWhere(input.entityId, input.key, scope)
   let def = await em.findOne(CustomFieldDef, where)
+
+  const guard = await beginEntitiesMutationGuard({
+    container,
+    auth,
+    req,
+    resourceKind: FIELD_DEFINITION_RESOURCE_KIND,
+    resourceId: def ? def.id : `${input.entityId}:${input.key}`,
+    operation: def ? 'update' : 'create',
+    mutationPayload: input as unknown as Record<string, unknown>,
+  })
+  if (guard.blockedResponse) return guard.blockedResponse
+
   if (!def) def = em.create(CustomFieldDef, { ...where, createdAt: new Date() })
   def.kind = input.kind
   const inCfg = (input as any).configJson ?? {}
@@ -342,14 +545,27 @@ export async function POST(req: Request) {
   if (input.kind === 'multiline' && (cfg.editor == null || String(cfg.editor).trim() === '')) {
     cfg.editor = 'markdown'
   }
+  // Validate and normalize defaultValue by kind before persisting
+  if (cfg.defaultValue !== undefined && cfg.defaultValue !== null) {
+    const validationError = await validateDefaultValueByKind(
+      cfg.defaultValue, input.kind, cfg, em,
+      { tenantId: scope.tenantId, organizationId: scope.organizationId },
+    )
+    if (validationError) {
+      return NextResponse.json({ error: validationError }, { status: 400 })
+    }
+    cfg.defaultValue = normalizeDefaultValueByKind(cfg.defaultValue, input.kind)
+  }
   def.configJson = cfg
   def.isActive = input.isActive ?? true
+  def.deletedAt = def.isActive === false ? (def.deletedAt ?? new Date()) : null
   def.updatedAt = new Date()
   em.persist(def)
   await em.flush()
+  await guard.runAfterSuccess()
   await invalidateDefinitionsCache(cache, {
-    tenantId: auth.tenantId ?? null,
-    organizationId: auth.orgId ?? null,
+    tenantId: scope.tenantId,
+    organizationId: scope.organizationId,
     entityIds: [input.entityId],
   })
   // Changing field definitions may impact forms but not sidebar items; no nav cache touch
@@ -365,27 +581,59 @@ export async function DELETE(req: Request) {
   if (!entityId || !key) return NextResponse.json({ error: 'entityId and key are required' }, { status: 400 })
 
   const container = await createRequestContainer()
+  const scope = await resolveDefinitionMutationScope({ auth, container, request: req })
   const { resolve } = container
   const em = resolve('em') as any
   let cache: CacheStrategy | undefined
   try {
     cache = resolve('cache') as CacheStrategy
   } catch {}
-  const where: any = { entityId, key, organizationId: auth.orgId ?? null, tenantId: auth.tenantId ?? null }
-  const def = await em.findOne(CustomFieldDef, where)
-  if (!def) return NextResponse.json({ error: 'Not found' }, { status: 404 })
-  def.isActive = false
-  def.updatedAt = new Date()
-  def.deletedAt = def.deletedAt ?? new Date()
+  const where: any = createExactDefinitionWhere(entityId, key, scope)
+  let def = await em.findOne(CustomFieldDef, where)
+  let inherited: any | null = null
+  if (!def) {
+    inherited = selectVisibleDefinitionWinner(await em.find(CustomFieldDef, createVisibleDefinitionWhere(
+      entityId,
+      key,
+      scope,
+      { deletedAt: null, isActive: true },
+    )))
+    if (!inherited) return NextResponse.json({ error: 'Not found' }, { status: 404 })
+  }
+
+  const guard = await beginEntitiesMutationGuard({
+    container,
+    auth,
+    req,
+    resourceKind: FIELD_DEFINITION_RESOURCE_KIND,
+    resourceId: def?.id ?? inherited?.id ?? `${entityId}:${key}`,
+    operation: 'delete',
+    mutationPayload: { entityId, key },
+  })
+  if (guard.blockedResponse) return guard.blockedResponse
+
+  if (!def) {
+    def = createScopedDefinitionTombstone(em, inherited, scope)
+  } else {
+    markDefinitionTombstoned(def)
+  }
   em.persist(def)
   await em.flush()
+  await guard.runAfterSuccess()
   await invalidateDefinitionsCache(cache, {
-    tenantId: auth.tenantId ?? null,
-    organizationId: auth.orgId ?? null,
+    tenantId: scope.tenantId,
+    organizationId: scope.organizationId,
     entityIds: [entityId],
   })
   // Changing field definitions may impact forms but not sidebar items; no nav cache touch
-  return NextResponse.json({ ok: true })
+  // Return the post-delete aggregate version so the edit form keeps its optimistic-lock
+  // token in sync after removing a field out-of-band (issue #3152).
+  const version = await resolveEntityDefinitionsVersion(em, {
+    entityId,
+    tenantId: scope.tenantId,
+    organizationId: scope.organizationId,
+  })
+  return NextResponse.json({ ok: true, version })
 }
 
 const definitionsQuerySchema = z
@@ -422,6 +670,7 @@ const customFieldDefinitionSchema = z.object({
   dictionaryInlineCreate: z.boolean().optional(),
   priority: z.number().optional(),
   validation: z.array(z.any()).optional(),
+  defaultValue: z.union([z.string(), z.number(), z.boolean(), z.null()]).optional(),
   maxAttachmentSizeMb: z.number().optional(),
   acceptExtensions: z.array(z.any()).optional(),
   entityId: z.string(),
@@ -480,6 +729,7 @@ const deleteDefinitionRequestSchema = z.object({
 
 const deleteDefinitionResponseSchema = z.object({
   ok: z.literal(true),
+  version: z.string().nullable().optional(),
 })
 
 export const openApi: OpenApiRouteDoc = {

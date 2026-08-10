@@ -1,12 +1,16 @@
 import type { QueuedJob, JobContext, WorkerMeta } from '@open-mercato/queue'
 import { createQueue } from '@open-mercato/queue'
-import { getRedisUrl } from '@open-mercato/shared/lib/redis/connection'
+import { getRedisUrlOrThrow } from '@open-mercato/shared/lib/redis/connection'
 import type { EntityManager } from '@mikro-orm/core'
 import { ScheduledJob } from '../data/entities.js'
 import { CommandBus } from '@open-mercato/shared/lib/commands'
-import type { CommandRuntimeContext } from '@open-mercato/shared/lib/commands'
 import type { AppContainer } from '@open-mercato/shared/lib/di/container'
 import { emitSchedulerEvent } from '../events.js'
+import { buildScheduledCommandContext } from '../lib/commandContext.js'
+import { buildQueueTargetPayload, buildSchedulerIdempotencyKey } from '../lib/queueTargetPayload.js'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('scheduler').child({ component: 'worker' })
 
 // Worker metadata for auto-discovery
 export const metadata: WorkerMeta = {
@@ -24,6 +28,13 @@ export type ExecuteSchedulePayload = {
 }
 
 type HandlerContext = { resolve: <T = unknown>(name: string) => T }
+type RbacServiceLike = {
+  tenantHasFeature(
+    tenantId: string | null | undefined,
+    feature: string,
+    opts?: { organizationId?: string | null },
+  ): Promise<boolean>
+}
 
 /**
  * Worker that executes scheduled jobs.
@@ -48,7 +59,7 @@ export default async function executeScheduleWorker(
   job: QueuedJob<ExecuteSchedulePayload>,
   ctx: JobContext & HandlerContext,
 ): Promise<void> {
-  console.debug('[scheduler:execute] Processing job:', {
+  logger.debug('Processing job', {
     jobId: ctx.jobId,
     attemptNumber: ctx.attemptNumber,
   })
@@ -57,17 +68,14 @@ export default async function executeScheduleWorker(
   const payload = (job.payload || (job as unknown as { data?: ExecuteSchedulePayload }).data) as ExecuteSchedulePayload | undefined
   
   if (!payload || !payload.scheduleId) {
-    console.error('[scheduler:execute] Invalid job payload:', {
-      jobId: ctx.jobId,
-      payload: job.payload,
-    })
+    logger.error('Invalid job payload: scheduleId missing', { jobId: ctx.jobId })
     throw new Error('scheduleId is required in job payload')
   }
 
   const { scheduleId } = payload
 
   const em = ctx.resolve<EntityManager>('em')
-  const rbacService = ctx.resolve<{ tenantHasFeature(tenantId: string | null | undefined, feature: string): Promise<boolean> }>('rbacService')
+  const rbacService = ctx.resolve<RbacServiceLike>('rbacService')
 
   // Load fresh schedule from database
   const schedule = await em.findOne(ScheduledJob, { 
@@ -76,14 +84,15 @@ export default async function executeScheduleWorker(
   })
 
   if (!schedule) {
-    console.log(`[scheduler:worker] Schedule not found or deleted: ${scheduleId}`)
+    logger.info('Schedule not found or deleted', { scheduleId })
     return
   }
 
   // CRITICAL: Verify scope integrity - ensure payload scope matches database
   // This prevents scope tampering and ensures proper multi-tenant isolation
   if (payload.scopeType !== schedule.scopeType) {
-    console.error(`[scheduler:worker] Scope type mismatch for schedule ${scheduleId}:`, {
+    logger.error('Scope type mismatch for schedule', {
+      scheduleId,
       payloadScope: payload.scopeType,
       dbScope: schedule.scopeType,
     })
@@ -91,7 +100,8 @@ export default async function executeScheduleWorker(
   }
 
   if (payload.tenantId !== schedule.tenantId) {
-    console.error(`[scheduler:worker] Tenant ID mismatch for schedule ${scheduleId}:`, {
+    logger.error('Tenant ID mismatch for schedule', {
+      scheduleId,
       payloadTenant: payload.tenantId,
       dbTenant: schedule.tenantId,
     })
@@ -99,7 +109,8 @@ export default async function executeScheduleWorker(
   }
 
   if (payload.organizationId !== schedule.organizationId) {
-    console.error(`[scheduler:worker] Organization ID mismatch for schedule ${scheduleId}:`, {
+    logger.error('Organization ID mismatch for schedule', {
+      scheduleId,
       payloadOrg: payload.organizationId,
       dbOrg: schedule.organizationId,
     })
@@ -108,7 +119,7 @@ export default async function executeScheduleWorker(
 
   // Check if schedule is still enabled
   if (!schedule.isEnabled) {
-    console.debug(`[scheduler:worker] Schedule is disabled: ${scheduleId}`)
+    logger.debug('Schedule is disabled', { scheduleId })
     await emitSchedulerEvent('scheduler.job.skipped', {
       id: schedule.id,
       tenantId: schedule.tenantId,
@@ -129,9 +140,10 @@ export default async function executeScheduleWorker(
 
   // Check feature flag if required
   if (schedule.requireFeature) {
-      const hasFeature = await rbacService.tenantHasFeature(
+    const hasFeature = await rbacService.tenantHasFeature(
       schedule.tenantId,
-      schedule.requireFeature
+      schedule.requireFeature,
+      { organizationId: schedule.organizationId },
     )
     
     if (!hasFeature) {
@@ -142,7 +154,7 @@ export default async function executeScheduleWorker(
         reason: `Feature not enabled: ${schedule.requireFeature}`,
       })
 
-      console.debug(`[scheduler:worker] Schedule skipped - feature not enabled: ${schedule.requireFeature}`)
+      logger.debug('Schedule skipped: feature not enabled', { scheduleId, requireFeature: schedule.requireFeature })
       return
     }
   }
@@ -152,25 +164,22 @@ export default async function executeScheduleWorker(
     // Determine queue strategy from environment
     const queueStrategy = (process.env.QUEUE_STRATEGY || 'local') as 'local' | 'async'
     const targetQueue = createQueue(schedule.targetQueue, queueStrategy, {
-      connection: { url: getRedisUrl('QUEUE') },
+      connection: { url: getRedisUrlOrThrow('QUEUE') },
     })
     
     let targetJobId: string | undefined
     try {
-      // Generate a deterministic idempotency key so that if BullMQ retries
-      // this worker after a crash between enqueue and DB flush, downstream
-      // workers can deduplicate using this key.
-      const executionTimestamp = Date.now()
-      const idempotencyKey = `scheduler-${schedule.id}-${executionTimestamp}`
+      // The execute-schedule job id is stable across BullMQ retries, so if
+      // this worker crashes between enqueue and DB flush the retried attempt
+      // reuses the same idempotency key and downstream workers can dedupe.
+      const idempotencyKey = buildSchedulerIdempotencyKey(schedule.id, ctx.jobId ?? Date.now())
 
-      const queuePayload = {
-        ...((schedule.targetPayload as Record<string, unknown>) || {}),
+      targetJobId = await targetQueue.enqueue(buildQueueTargetPayload({
+        targetPayload: schedule.targetPayload,
         tenantId: schedule.tenantId,
         organizationId: schedule.organizationId,
-        _idempotencyKey: idempotencyKey,
-      }
-
-      targetJobId = await targetQueue.enqueue(queuePayload)
+        idempotencyKey,
+      }))
     } finally {
       // Always close the queue instance to free Redis connections
       await targetQueue.close()
@@ -188,7 +197,7 @@ export default async function executeScheduleWorker(
       queueName: schedule.targetQueue,
     })
 
-    console.debug(`[scheduler:worker] Successfully enqueued job`, {
+    logger.debug('Successfully enqueued job', {
       scheduleId: schedule.id,
       targetQueue: schedule.targetQueue,
       queueJobId: targetJobId,
@@ -203,16 +212,7 @@ export default async function executeScheduleWorker(
       organizationId: schedule.organizationId,
     }
     
-    // Build command runtime context
-    // Scheduled commands run without user auth but with proper tenant/org scope
-    const commandCtx: CommandRuntimeContext = {
-      container: ctx as unknown as AppContainer,
-      auth: null, // Scheduled commands run without user authentication
-      organizationScope: null, // No organization scope filtering for scheduled commands
-      selectedOrganizationId: schedule.organizationId || null,
-      organizationIds: schedule.organizationId ? [schedule.organizationId] : null,
-      request: undefined,
-    }
+    const commandCtx = buildScheduledCommandContext(schedule, ctx as unknown as AppContainer)
     
     const commandResult = await commandBus.execute(schedule.targetCommand, {
       input: commandInput,
@@ -231,10 +231,9 @@ export default async function executeScheduleWorker(
       commandResult: commandResult.result,
     })
     
-    console.debug(`[scheduler:worker] Successfully executed command`, {
+    logger.debug('Successfully executed command', {
       scheduleId: schedule.id,
       commandId: schedule.targetCommand,
-      result: commandResult.result,
     })
 
   } else {

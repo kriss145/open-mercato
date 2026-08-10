@@ -67,7 +67,7 @@ function collectStructureEntries(target: string, base: string, acc: string[]): v
 }
 
 export function calculateStructureChecksum(paths: string[]): string {
-  const normalized = Array.from(new Set(paths.map((p) => path.resolve(p)))).sort()
+  const normalized = Array.from(new Set(paths.map((p) => path.resolve(p)))).sort((a, b) => a.localeCompare(b))
   const entries: string[] = []
   for (const target of normalized) {
     if (!fs.existsSync(target)) {
@@ -173,14 +173,33 @@ export function toSnake(s: string): string {
     .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
     .replace(/\W+/g, '_')
     .replace(/_{2,}/g, '_')
-    .replace(/^_+|_+$/g, '')
+    .replace(/(?:^_+|_+$)/g, '')
     .toLowerCase()
 }
 
-export async function moduleHasExport(filePath: string, exportName: string): Promise<boolean> {
+export function sourceFileHasNamedExport(filePath: string, exportName: string): boolean {
+  let source: string
   try {
-    // On Windows, absolute paths must be file:// URLs for ESM imports
-    // But package imports (starting with @ or not starting with . or /) should be used as-is
+    source = fs.readFileSync(filePath, 'utf8')
+  } catch {
+    return false
+  }
+
+  const escaped = exportName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  if (new RegExp(`export\\s+(?:const|let|var|function|class|async\\s+function)\\s+${escaped}\\b`).test(source)) {
+    return true
+  }
+  if (new RegExp(`export\\s+\\{[^}]*\\b${escaped}\\b[^}]*\\}`).test(source)) {
+    return true
+  }
+  return false
+}
+
+export async function moduleHasExport(filePath: string, exportName: string): Promise<boolean> {
+  if (sourceFileHasNamedExport(filePath, exportName)) {
+    return true
+  }
+  try {
     const isAbsolutePath = path.isAbsolute(filePath)
     const importUrl = isAbsolutePath ? pathToFileURL(filePath).href : filePath
     const mod = await import(importUrl)
@@ -216,6 +235,7 @@ export function writeGeneratedFile(options: {
   const checksum = { content: calculateChecksum(content), structure: structureChecksum }
   const existing = readChecksumRecord(checksumFile)
   const shouldWrite =
+    !fs.existsSync(outFile) ||
     !existing ||
     existing.content !== checksum.content ||
     existing.structure !== checksum.structure

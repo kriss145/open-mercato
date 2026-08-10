@@ -7,6 +7,7 @@ export { normalizeCustomFieldValues } from '../custom-fields/normalize'
 import type { CrudEventsConfig, CrudIndexerConfig, CrudEmitContext } from '@open-mercato/shared/lib/crud/types'
 import type { CommandRuntimeContext } from '@open-mercato/shared/lib/commands'
 import type { CommandLogMetadata } from '@open-mercato/shared/lib/commands'
+import type { BulkImportSuppression } from '@open-mercato/shared/lib/commands'
 
 export type ParsedPayload<TSchema extends z.ZodTypeAny> = {
   parsed: z.infer<TSchema>
@@ -50,14 +51,18 @@ export async function emitCrudSideEffects<TEntity>(opts: {
   action: 'created' | 'updated' | 'deleted'
   entity: TEntity
   identifiers: CrudEmitContext<TEntity>['identifiers']
-  events?: CrudEventsConfig<TEntity>
-  indexer?: CrudIndexerConfig<TEntity>
+  syncOrigin?: string | null
+  actorUserId?: string | null
+  events?: CrudEventsConfig<any>
+  indexer?: CrudIndexerConfig<any>
 }) {
-  const { dataEngine, action, entity, identifiers, events, indexer } = opts
+  const { dataEngine, action, entity, identifiers, syncOrigin, actorUserId, events, indexer } = opts
   dataEngine.markOrmEntityChange({
     action,
     entity,
     identifiers,
+    syncOrigin,
+    actorUserId,
     events,
     indexer,
   })
@@ -68,22 +73,29 @@ export async function emitCrudUndoSideEffects<TEntity>(opts: {
   action: 'created' | 'updated' | 'deleted'
   entity: TEntity | null | undefined
   identifiers: CrudEmitContext<TEntity>['identifiers']
-  events?: CrudEventsConfig<TEntity>
-  indexer?: CrudIndexerConfig<TEntity>
+  syncOrigin?: string | null
+  actorUserId?: string | null
+  events?: CrudEventsConfig<any>
+  indexer?: CrudIndexerConfig<any>
 }) {
-  const { dataEngine, action, entity, identifiers, events, indexer } = opts
+  const { dataEngine, action, entity, identifiers, syncOrigin, actorUserId, events, indexer } = opts
   if (!entity) return
   dataEngine.markOrmEntityChange({
     action,
     entity,
     identifiers,
+    syncOrigin,
+    actorUserId,
     events,
     indexer,
   })
 }
 
-export async function flushCrudSideEffects(dataEngine: DataEngine): Promise<void> {
-  await dataEngine.flushOrmEntityChanges()
+export async function flushCrudSideEffects(dataEngine: DataEngine, suppress?: BulkImportSuppression): Promise<void> {
+  // Direct-write bulk paths (those that flush here instead of going through the command bus) can
+  // pass the same `bulkImport` suppression so a bulk run defers per-record events/reindex on this
+  // path too. Omitted for normal writes → unchanged behavior. Mirrors the command bus's own flush.
+  await dataEngine.flushOrmEntityChanges(suppress)
 }
 
 export function buildChanges(
@@ -143,3 +155,40 @@ export type LogBuilderArgs<TInput, TResult> = {
 }
 
 export type LogBuilder<TInput, TResult> = (args: LogBuilderArgs<TInput, TResult>) => CommandLogMetadata | null | Promise<CommandLogMetadata | null>
+
+export function snapshotsEqual(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true
+  if (a == null || b == null) return a === b
+  if (typeof a !== typeof b) return false
+  if (typeof a !== 'object') return false
+  if (Array.isArray(a) !== Array.isArray(b)) return false
+  if (Array.isArray(a) && Array.isArray(b)) {
+    if (a.length !== b.length) return false
+    return a.every((value, index) => snapshotsEqual(value, b[index]))
+  }
+  const keysA = Object.keys(a as Record<string, unknown>)
+  const keysB = Object.keys(b as Record<string, unknown>)
+  if (keysA.length !== keysB.length) return false
+  return keysA.every((key) =>
+    snapshotsEqual((a as Record<string, unknown>)[key], (b as Record<string, unknown>)[key])
+  )
+}
+
+const AUTHOR_UUID_REGEX = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/
+
+export function normalizeAuthorUserId(
+  explicitAuthorUserId: string | undefined | null,
+  auth: { isApiKey?: boolean; isSuperAdmin?: boolean; sub?: string | null } | undefined | null
+): string | null {
+  if (
+    explicitAuthorUserId &&
+    auth?.isSuperAdmin === true &&
+    auth.isApiKey !== true &&
+    AUTHOR_UUID_REGEX.test(explicitAuthorUserId)
+  ) {
+    return explicitAuthorUserId
+  }
+  const authSub = auth?.isApiKey ? null : auth?.sub ?? null
+  if (!authSub) return null
+  return AUTHOR_UUID_REGEX.test(authSub) ? authSub : null
+}

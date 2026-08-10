@@ -3,20 +3,66 @@ import { z } from 'zod'
 import type { OpenApiMethodDoc, OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
 import { getAuthFromRequest } from '@open-mercato/shared/lib/auth/server'
 import { getModules } from '@open-mercato/shared/lib/i18n/server'
+import { createRequestContainer } from '@open-mercato/shared/lib/di/container'
+import { synthesizeRestrictedEntityFeatures } from '@open-mercato/core/modules/entities/lib/restrictedEntityFeatures'
 
 export const metadata = {
   GET: { requireAuth: true, requireFeatures: ['auth.acl.manage'] },
+}
+
+type FeatureItem = {
+  id: string
+  title: string
+  module: string
+  dependsOn?: string[]
+}
+
+function normalizeDependsOn(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const out: string[] = []
+  for (const entry of value) {
+    if (typeof entry !== 'string') continue
+    const trimmed = entry.trim()
+    if (!trimmed) continue
+    out.push(trimmed)
+  }
+  if (out.length === 0) return undefined
+  return Array.from(new Set(out))
 }
 
 export async function GET(req: Request) {
   const auth = await getAuthFromRequest(req)
   if (!auth) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   const modules = getModules()
-  const items = (modules || []).flatMap((m: any) =>
-    (m.features || []).map((f: any) => ({ id: String(f.id), title: String(f.title || f.id), module: String(f.module || m.id) }))
+  const items: FeatureItem[] = (modules || []).flatMap((m: any) =>
+    (m.features || []).map((f: any) => {
+      const deps = normalizeDependsOn(f?.dependsOn)
+      const base: FeatureItem = {
+        id: String(f.id),
+        title: String(f.title || f.id),
+        module: String(f.module || m.id),
+      }
+      if (deps) base.dependsOn = deps
+      return base
+    })
   )
-  // Deduplicate by id
-  const byId = new Map<string, { id: string; title: string; module: string }>()
+  // Append synthesized per-entity features for the tenant's restricted custom
+  // entities so they can be granted in the ACL editor. Tenant-scoped; never
+  // throws (falls back to the static catalog on any failure).
+  try {
+    const { resolve } = await createRequestContainer()
+    const em = resolve('em') as any
+    const synthesized = await synthesizeRestrictedEntityFeatures(em, auth.tenantId ?? null)
+    for (const item of synthesized) {
+      const deps = normalizeDependsOn(item.dependsOn)
+      const base: FeatureItem = { id: item.id, title: item.title, module: item.module }
+      if (deps) base.dependsOn = deps
+      items.push(base)
+    }
+  } catch {}
+
+  // Deduplicate by id (keep first occurrence)
+  const byId = new Map<string, FeatureItem>()
   for (const it of items) if (!byId.has(it.id)) byId.set(it.id, it)
   const list = Array.from(byId.values()).sort((a, b) => a.module.localeCompare(b.module) || a.id.localeCompare(b.id))
 
@@ -35,6 +81,7 @@ const featureItemSchema = z.object({
   id: z.string(),
   title: z.string(),
   module: z.string(),
+  dependsOn: z.array(z.string()).optional(),
 })
 
 const featureModuleSchema = z.object({

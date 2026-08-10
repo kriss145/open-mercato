@@ -9,7 +9,7 @@
  */
 
 import type { QueuedJob, JobContext, WorkerMeta } from '@open-mercato/queue'
-import { WORKFLOW_ACTIVITIES_QUEUE_NAME, type WorkflowActivityJob } from '../lib/activity-queue-types'
+import type { WorkflowActivityJob } from '../lib/activity-queue-types'
 import type { EntityManager } from '@mikro-orm/core'
 import type { AwilixContainer } from 'awilix'
 import { WorkflowInstance } from '../data/entities'
@@ -22,13 +22,22 @@ import {
   executeCallWebhook,
   executeFunction,
 } from '../lib/activity-executor'
+import { createLogger } from '@open-mercato/shared/lib/logger'
 
-// Worker metadata for auto-discovery
+const logger = createLogger('workflows').child({ component: 'activity-worker' })
+
+// Worker metadata for auto-discovery.
+// NOTE: `queue` MUST be a string literal (or locally-declared const) so the
+// generator's AST-based extractor can resolve it when Node cannot import the
+// .ts source file directly. Importing `WORKFLOW_ACTIVITIES_QUEUE_NAME` from
+// another module breaks auto-discovery and silently drops the worker from
+// `modules.generated.ts`.
+const WORKFLOW_ACTIVITIES_QUEUE = 'workflow-activities'
 const DEFAULT_CONCURRENCY = 1
 const envConcurrency = process.env.WORKERS_WORKFLOW_ACTIVITIES_CONCURRENCY
 
 export const metadata: WorkerMeta = {
-  queue: WORKFLOW_ACTIVITIES_QUEUE_NAME,
+  queue: WORKFLOW_ACTIVITIES_QUEUE,
   id: 'workflows:workflow-activities',
   concurrency: envConcurrency ? parseInt(envConcurrency, 10) : DEFAULT_CONCURRENCY,
 }
@@ -54,16 +63,36 @@ export default async function handle(
   const { payload } = job
   const startTime = Date.now()
 
-  console.log(
-    `[workflows:activity-worker] Processing activity ${payload.activityId} (job ${ctx.jobId}, attempt ${ctx.attemptNumber})`
-  )
-
   // Resolve services from DI container
   const em = ctx.resolve<EntityManager>('em')
 
   // Create a container-like object from ctx.resolve for activity executors
   // The ctx already has the resolve method we need, we just need to cast it
   const container = ctx as unknown as AwilixContainer
+
+  // Timer jobs (kind: 'timer') are a distinct flow — they resume a paused
+  // workflow at a WAIT_FOR_TIMER step rather than running an activity.
+  if (payload.kind === 'timer') {
+    logger.debug('Firing timer for instance', { instanceId: payload.workflowInstanceId, jobId: ctx.jobId })
+    const { fireTimer } = await import('../lib/timer-handler')
+    await fireTimer(em, container, {
+      instanceId: payload.workflowInstanceId,
+      stepInstanceId: payload.stepInstanceId,
+      branchInstanceId: payload.branchInstanceId,
+      tenantId: payload.tenantId,
+      organizationId: payload.organizationId,
+      userId: payload.userId,
+    })
+    return
+  }
+
+  logger.debug('Processing activity', {
+    activityId: payload.activityId,
+    activityType: payload.activityType,
+    instanceId: payload.workflowInstanceId,
+    jobId: ctx.jobId,
+    attemptNumber: ctx.attemptNumber,
+  })
 
   try {
     // Fetch workflow instance with tenant/org scoping
@@ -85,11 +114,12 @@ export default async function handle(
       workflowContext: payload.workflowContext,
       stepContext: payload.stepContext,
       stepInstanceId: payload.stepInstanceId,
+      branchInstanceId: payload.branchInstanceId,
       userId: payload.userId,
     }
 
     // Execute activity by type
-    const executeActivityByType = async () => {
+    const executeActivityByType = async (signal?: AbortSignal) => {
       switch (payload.activityType) {
         case 'SEND_EMAIL':
           return await executeSendEmail(payload.activityConfig, activityContext, container)
@@ -98,7 +128,8 @@ export default async function handle(
             em,
             payload.activityConfig,
             activityContext,
-            container
+            container,
+            signal
           )
         case 'EMIT_EVENT':
           return await executeEmitEvent(payload.activityConfig, activityContext, container)
@@ -110,26 +141,39 @@ export default async function handle(
             container
           )
         case 'CALL_WEBHOOK':
-          return await executeCallWebhook(payload.activityConfig, activityContext)
+          return await executeCallWebhook(payload.activityConfig, activityContext, { signal })
         case 'EXECUTE_FUNCTION':
           return await executeFunction(payload.activityConfig, activityContext, container)
+        case 'WAIT':
+          // Delay already handled by queue's delayMs — return success immediately
+          return { waited: true }
         default:
           throw new Error(`Unsupported activity type: ${payload.activityType}`)
       }
     }
 
-    // Execute with optional timeout
+    // Execute with optional timeout. AbortController aborts in-flight fetches
+    // when the timeout wins the race, preventing phantom executions.
     let result: any
     if (payload.timeoutMs && payload.timeoutMs > 0) {
-      result = await Promise.race([
-        executeActivityByType(),
-        new Promise((_, reject) =>
-          setTimeout(
-            () => reject(new Error(`Activity timeout after ${payload.timeoutMs}ms`)),
-            payload.timeoutMs
-          )
-        ),
-      ])
+      const abortController = new AbortController()
+      const timeoutId = setTimeout(() => {
+        abortController.abort()
+      }, payload.timeoutMs)
+
+      try {
+        result = await Promise.race([
+          executeActivityByType(abortController.signal),
+          new Promise((_, reject) =>
+            setTimeout(
+              () => reject(new Error(`Activity timeout after ${payload.timeoutMs}ms`)),
+              payload.timeoutMs
+            )
+          ),
+        ])
+      } finally {
+        clearTimeout(timeoutId)
+      }
     } else {
       result = await executeActivityByType()
     }
@@ -140,6 +184,7 @@ export default async function handle(
     await logWorkflowEvent(em, {
       workflowInstanceId: payload.workflowInstanceId,
       stepInstanceId: payload.stepInstanceId,
+      branchInstanceId: payload.branchInstanceId,
       eventType: 'ACTIVITY_COMPLETED',
       eventData: {
         activityId: payload.activityId,
@@ -156,24 +201,31 @@ export default async function handle(
       organizationId: payload.organizationId,
     })
 
-    console.log(
-      `[workflows:activity-worker] Activity ${payload.activityId} completed successfully in ${executionTimeMs}ms`
-    )
+    logger.debug('Activity completed', {
+      activityId: payload.activityId,
+      activityType: payload.activityType,
+      instanceId: payload.workflowInstanceId,
+      executionTimeMs,
+    })
 
     // Attempt to resume workflow if all activities complete
-    await checkAndResumeWorkflow(em, ctx, payload.workflowInstanceId)
+    await checkAndResumeWorkflow(em, ctx, payload.workflowInstanceId, payload.branchInstanceId)
   } catch (error: any) {
     const executionTimeMs = Date.now() - startTime
 
-    console.error(
-      `[workflows:activity-worker] Activity ${payload.activityId} failed (attempt ${ctx.attemptNumber}):`,
-      error.message
-    )
+    logger.error('Activity failed', {
+      activityId: payload.activityId,
+      activityType: payload.activityType,
+      instanceId: payload.workflowInstanceId,
+      attemptNumber: ctx.attemptNumber,
+      err: error,
+    })
 
     // Log failure event to workflow event log
     await logWorkflowEvent(em, {
       workflowInstanceId: payload.workflowInstanceId,
       stepInstanceId: payload.stepInstanceId,
+      branchInstanceId: payload.branchInstanceId,
       eventType: 'ACTIVITY_FAILED',
       eventData: {
         activityId: payload.activityId,
@@ -194,11 +246,14 @@ export default async function handle(
     // Check if this was final attempt (BullMQ handles retries automatically)
     const maxAttempts = payload.retryPolicy?.maxAttempts || 1
     if (ctx.attemptNumber >= maxAttempts) {
-      console.error(
-        `[workflows:activity-worker] Activity ${payload.activityId} failed after ${maxAttempts} attempts - triggering workflow failure handling`
-      )
+      logger.error('Activity failed after all attempts - triggering workflow failure handling', {
+        activityId: payload.activityId,
+        activityType: payload.activityType,
+        maxAttempts,
+        instanceId: payload.workflowInstanceId,
+      })
       // Final failure - attempt to resume workflow (may transition to FAILED state)
-      await checkAndResumeWorkflow(em, ctx, payload.workflowInstanceId)
+      await checkAndResumeWorkflow(em, ctx, payload.workflowInstanceId, payload.branchInstanceId)
     }
 
     // Re-throw to let BullMQ handle retry logic
@@ -219,7 +274,8 @@ export default async function handle(
 async function checkAndResumeWorkflow(
   em: EntityManager,
   ctx: HandlerContext,
-  workflowInstanceId: string
+  workflowInstanceId: string,
+  branchInstanceId?: string | null
 ): Promise<void> {
   // Import here to avoid circular dependency
   const { resumeWorkflowAfterActivities } = await import('../lib/workflow-executor')
@@ -228,14 +284,11 @@ async function checkAndResumeWorkflow(
   const container = ctx as unknown as AwilixContainer
 
   try {
-    await resumeWorkflowAfterActivities(em, container, workflowInstanceId)
+    await resumeWorkflowAfterActivities(em, container, workflowInstanceId, branchInstanceId)
   } catch (error: any) {
     // Ignore error if workflow not ready to resume yet (activities still pending)
     if (!error.message?.includes('Activities still pending')) {
-      console.error(
-        `[workflows:activity-worker] Failed to resume workflow ${workflowInstanceId}:`,
-        error.message
-      )
+      logger.error('Failed to resume workflow instance', { instanceId: workflowInstanceId, err: error })
     }
   }
 }

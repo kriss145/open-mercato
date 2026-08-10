@@ -5,6 +5,7 @@ import Link from 'next/link'
 import type { DashboardWidgetComponentProps } from '@open-mercato/shared/modules/dashboard/widgets'
 import { apiCall } from '@open-mercato/ui/backend/utils/apiCall'
 import { formatRelativeTime } from '@open-mercato/shared/lib/time'
+import { Input } from '@open-mercato/ui/primitives/input'
 import { Spinner } from '@open-mercato/ui/primitives/spinner'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
 import {
@@ -13,6 +14,9 @@ import {
   type CustomerNextInteractionsSettings,
 } from './config'
 import { renderDictionaryColor, renderDictionaryIcon } from '../../../lib/dictionaries'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('customers')
 
 type NextInteractionItem = {
   id: string
@@ -30,6 +34,9 @@ type ApiResponse = {
   now?: string
 }
 
+// NOTE(SPEC-046b): This widget reads from next_interaction_* projection fields
+// on CustomerEntity. These fields are now maintained by the interaction
+// projection recompute service (lib/interactionProjection.ts).
 async function loadNextInteractions(settings: CustomerNextInteractionsSettings): Promise<ApiResponse> {
   const params = new URLSearchParams({
     limit: String(settings.pageSize),
@@ -71,8 +78,8 @@ async function loadNextInteractions(settings: CustomerNextInteractionsSettings):
 
 function resolveDetailHref(item: NextInteractionItem): string | null {
   if (!item.id || !item.kind) return null
-  if (item.kind === 'company') return `/backend/customers/companies/${encodeURIComponent(item.id)}`
-  if (item.kind === 'person') return `/backend/customers/people/${encodeURIComponent(item.id)}`
+  if (item.kind === 'company') return `/backend/customers/companies-v2/${encodeURIComponent(item.id)}`
+  if (item.kind === 'person') return `/backend/customers/people-v2/${encodeURIComponent(item.id)}`
   return null
 }
 
@@ -114,7 +121,7 @@ const CustomerNextInteractionsWidget: React.FC<DashboardWidgetComponentProps<Cus
       const response = await loadNextInteractions(hydrated)
       setData(response.items)
     } catch (err) {
-      console.error('Failed to load next interactions widget data', err)
+      logger.error('Failed to load next interactions widget data', { err })
       setError(t('customers.widgets.nextInteractions.error'))
     } finally {
       setLoading(false)
@@ -133,12 +140,12 @@ const CustomerNextInteractionsWidget: React.FC<DashboardWidgetComponentProps<Cus
           <label htmlFor="customer-next-interactions-page-size" className="text-xs font-semibold uppercase text-muted-foreground">
             {t('customers.widgets.nextInteractions.settings.pageSize')}
           </label>
-          <input
+          <Input
             id="customer-next-interactions-page-size"
             type="number"
             min={1}
             max={20}
-            className="w-24 rounded-md border px-2 py-1 text-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+            className="w-24"
             value={hydrated.pageSize}
             onChange={(event) => {
               const next = Number(event.target.value)

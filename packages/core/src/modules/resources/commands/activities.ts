@@ -20,6 +20,7 @@ import {
   buildCustomFieldResetMap,
   type CustomFieldChangeSet,
 } from '@open-mercato/shared/lib/commands/customFieldSnapshots'
+import { resolveRedoSnapshot } from '@open-mercato/shared/lib/commands/redo'
 import { ResourcesResourceActivity } from '../data/entities'
 import {
   resourcesResourceActivityCreateSchema,
@@ -27,7 +28,8 @@ import {
   type ResourcesResourceActivityCreateInput,
   type ResourcesResourceActivityUpdateInput,
 } from '../data/validators'
-import { ensureOrganizationScope, ensureTenantScope, extractUndoPayload, requireResource } from './shared'
+import { resourcesResourceActivityCrudEvents } from '../lib/crud'
+import { ensureOrganizationScope, ensureTenantScope, extractUndoPayload, requireResource, resolveResourceAuthorUserId } from './shared'
 import { E } from '#generated/entities.ids.generated'
 
 const ACTIVITY_ENTITY_ID = E.resources.resources_resource_activity
@@ -114,18 +116,15 @@ const createActivityCommand: CommandHandler<ResourcesResourceActivityCreateInput
     const { parsed, custom } = parseWithCustomFields(resourcesResourceActivityCreateSchema, rawInput)
     ensureTenantScope(ctx, parsed.tenantId)
     ensureOrganizationScope(ctx, parsed.organizationId)
-    const authSub = ctx.auth?.isApiKey ? null : ctx.auth?.sub ?? null
-    const normalizedAuthor = (() => {
-      if (parsed.authorUserId) return parsed.authorUserId
-      if (!authSub) return null
-      const uuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/
-      return uuidRegex.test(authSub) ? authSub : null
-    })()
 
     const em = (ctx.container.resolve('em') as EntityManager).fork()
     const resource = await requireResource(em, parsed.entityId, 'Resource not found')
     ensureTenantScope(ctx, resource.tenantId)
     ensureOrganizationScope(ctx, resource.organizationId)
+    const normalizedAuthor = await resolveResourceAuthorUserId(em, parsed.authorUserId, ctx, {
+      tenantId: resource.tenantId,
+      organizationId: resource.organizationId,
+    })
 
     const activity = em.create(ResourcesResourceActivity, {
       organizationId: parsed.organizationId,
@@ -156,6 +155,7 @@ const createActivityCommand: CommandHandler<ResourcesResourceActivityCreateInput
         organizationId: activity.organizationId,
         tenantId: activity.tenantId,
       },
+      events: resourcesResourceActivityCrudEvents,
       indexer: activityCrudIndexer,
     })
 
@@ -195,6 +195,72 @@ const createActivityCommand: CommandHandler<ResourcesResourceActivityCreateInput
       await em.flush()
     }
   },
+  redo: async ({ logEntry, ctx }) => {
+    const after = resolveRedoSnapshot<ActivitySnapshot>(logEntry)
+    if (!after) {
+      throw new CrudHttpError(400, { error: '[internal] redo snapshot unavailable for activity create' })
+    }
+    const em = (ctx.container.resolve('em') as EntityManager).fork()
+    const resource = await requireResource(em, after.activity.resourceId, 'Resource not found')
+    let activity = await em.findOne(ResourcesResourceActivity, { id: after.activity.id })
+    if (!activity) {
+      activity = em.create(ResourcesResourceActivity, {
+        id: after.activity.id,
+        organizationId: after.activity.organizationId,
+        tenantId: after.activity.tenantId,
+        resource,
+        activityType: after.activity.activityType,
+        subject: after.activity.subject,
+        body: after.activity.body,
+        occurredAt: after.activity.occurredAt,
+        authorUserId: after.activity.authorUserId,
+        appearanceIcon: after.activity.appearanceIcon,
+        appearanceColor: after.activity.appearanceColor,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      })
+      em.persist(activity)
+    } else {
+      activity.resource = resource
+      activity.activityType = after.activity.activityType
+      activity.subject = after.activity.subject
+      activity.body = after.activity.body
+      activity.occurredAt = after.activity.occurredAt
+      activity.authorUserId = after.activity.authorUserId
+      activity.appearanceIcon = after.activity.appearanceIcon
+      activity.appearanceColor = after.activity.appearanceColor
+    }
+    await em.flush()
+
+    const de = (ctx.container.resolve('dataEngine') as DataEngine)
+    await emitCrudSideEffects({
+      dataEngine: de,
+      action: 'created',
+      entity: activity,
+      identifiers: {
+        id: activity.id,
+        organizationId: activity.organizationId,
+        tenantId: activity.tenantId,
+      },
+      events: resourcesResourceActivityCrudEvents,
+      indexer: activityCrudIndexer,
+    })
+
+    const resetValues = buildCustomFieldResetMap(after.custom, undefined)
+    if (Object.keys(resetValues).length) {
+      await setCustomFieldsIfAny({
+        dataEngine: de,
+        entityId: ACTIVITY_ENTITY_ID,
+        recordId: activity.id,
+        organizationId: activity.organizationId,
+        tenantId: activity.tenantId,
+        values: resetValues,
+        notify: false,
+      })
+    }
+
+    return { activityId: activity.id, authorUserId: activity.authorUserId ?? null }
+  },
 }
 
 const updateActivityCommand: CommandHandler<ResourcesResourceActivityUpdateInput, { activityId: string }> = {
@@ -223,7 +289,6 @@ const updateActivityCommand: CommandHandler<ResourcesResourceActivityUpdateInput
     if (parsed.subject !== undefined) activity.subject = parsed.subject ?? null
     if (parsed.body !== undefined) activity.body = parsed.body ?? null
     if (parsed.occurredAt !== undefined) activity.occurredAt = parsed.occurredAt ?? null
-    if (parsed.authorUserId !== undefined) activity.authorUserId = parsed.authorUserId ?? null
     if (parsed.appearanceIcon !== undefined) activity.appearanceIcon = parsed.appearanceIcon ?? null
     if (parsed.appearanceColor !== undefined) activity.appearanceColor = parsed.appearanceColor ?? null
 
@@ -241,6 +306,7 @@ const updateActivityCommand: CommandHandler<ResourcesResourceActivityUpdateInput
         organizationId: activity.organizationId,
         tenantId: activity.tenantId,
       },
+      events: resourcesResourceActivityCrudEvents,
       indexer: activityCrudIndexer,
     })
 
@@ -329,6 +395,7 @@ const updateActivityCommand: CommandHandler<ResourcesResourceActivityUpdateInput
         organizationId: activity.organizationId,
         tenantId: activity.tenantId,
       },
+      events: resourcesResourceActivityCrudEvents,
       indexer: activityCrudIndexer,
     })
 
@@ -375,6 +442,7 @@ const deleteActivityCommand: CommandHandler<{ body?: Record<string, unknown>; qu
         organizationId: activity.organizationId,
         tenantId: activity.tenantId,
       },
+      events: resourcesResourceActivityCrudEvents,
       indexer: activityCrudIndexer,
     })
     return { activityId: activity.id }
@@ -445,6 +513,7 @@ const deleteActivityCommand: CommandHandler<{ body?: Record<string, unknown>; qu
         organizationId: activity.organizationId,
         tenantId: activity.tenantId,
       },
+      events: resourcesResourceActivityCrudEvents,
       indexer: activityCrudIndexer,
     })
 

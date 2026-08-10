@@ -24,6 +24,20 @@ export interface EnricherContext {
 }
 
 /**
+ * Query-engine opt-in configuration for response enrichers.
+ * When set, the enricher can also run inside query-engine pipelines
+ * (BasicQueryEngine / HybridQueryEngine), not only during API response shaping.
+ */
+export interface EnricherQueryEngineConfig {
+  /** When true, this enricher participates in query-engine pipelines. */
+  enabled: boolean
+  /** Which engines this enricher applies to. Default: both. */
+  engines?: Array<'basic' | 'hybrid'>
+  /** Which query shapes to enrich. Default: ['list', 'detail']. */
+  applyOn?: Array<'list' | 'detail'>
+}
+
+/**
  * Response enricher definition.
  *
  * @template TRecord - The shape of the record being enriched
@@ -57,6 +71,23 @@ export interface ResponseEnricher<TRecord = any, TEnriched = any> {
   /** If true, enricher errors propagate as HTTP errors. Default: false */
   critical?: boolean
 
+  /**
+   * When true, this enricher's output for a record is a pure function of that
+   * record's own cached state and is invalidated together with it, so the
+   * enriched value is safe to embed in the CRUD list cache and serve back on a
+   * cache hit WITHOUT re-running the enricher (the #2222 cache-hit optimization).
+   *
+   * Leave this false (the default) for any enricher whose output depends on data
+   * the list cache does not invalidate on: cross-module / cross-entity reads
+   * (e.g. a product image fetched for a sales line), wall-clock-relative values
+   * (e.g. "days in stage"), or aggregates over other tables. Such enrichers MUST
+   * re-run on every request so the response reflects current data — embedding
+   * their output in the shared cache entry would serve stale values.
+   *
+   * Default: false (fail-closed — always re-run on a list cache hit).
+   */
+  cacheableOnListHit?: boolean
+
   /** Tenant IDs where this enricher should be disabled. */
   disabledTenantIds?: string[]
 
@@ -67,6 +98,13 @@ export interface ResponseEnricher<TRecord = any, TEnriched = any> {
     tags?: string[]
     invalidateOn?: string[]
   }
+
+  /**
+   * Query-engine opt-in. When provided and `enabled: true`, this enricher
+   * also runs inside query-engine pipelines (BasicQueryEngine / HybridQueryEngine).
+   * Omit to keep API-only behavior (backward compatible default).
+   */
+  queryEngine?: EnricherQueryEngineConfig
 
   /** Enrich a single record. Used for detail endpoints. */
   enrichOne(record: TRecord, context: EnricherContext): Promise<TRecord & TEnriched>

@@ -17,6 +17,7 @@ import { collectCustomFieldValues } from '@open-mercato/ui/backend/utils/customF
 import { apiCall } from '@open-mercato/ui/backend/utils/apiCall'
 import { flash } from '@open-mercato/ui/backend/FlashMessages'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
+import { hasFeature } from '@open-mercato/shared/security/features'
 import { z } from 'zod'
 import { E } from '#generated/entities.ids.generated'
 import type { LucideIcon } from 'lucide-react'
@@ -73,7 +74,7 @@ function humanDate(value: string, locale?: string): string {
 }
 
 function buildFilterSignature(values: FilterValues): string {
-  return JSON.stringify(values, Object.keys(values).sort())
+  return JSON.stringify(values, Object.keys(values).sort((a, b) => a.localeCompare(b)))
 }
 
 function resolveAbsoluteUrl(path: string): string {
@@ -198,7 +199,7 @@ type AssignmentsEditorProps = {
   disabled?: boolean
 }
 
-function AttachmentAssignmentsEditor({ value, onChange, labels, disabled }: AssignmentsEditorProps) {
+export function AttachmentAssignmentsEditor({ value, onChange, labels, disabled }: AssignmentsEditorProps) {
   const handleChange = React.useCallback(
     (index: number, patch: Partial<AssignmentDraft>) => {
       onChange(value.map((entry, idx) => (idx === index ? { ...entry, ...patch } : entry)))
@@ -228,7 +229,7 @@ function AttachmentAssignmentsEditor({ value, onChange, labels, disabled }: Assi
           <div className="text-xs text-muted-foreground">No assignments yet.</div>
         ) : (
           value.map((entry, index) => (
-            <div key={`${index}-${entry.type}-${entry.id}`} className="rounded border p-3 space-y-2">
+            <div key={index} className="rounded border p-3 space-y-2">
               <div className="grid gap-2 sm:grid-cols-2">
                 <div className="space-y-1">
                   <label className="text-xs font-medium">{labels.type}</label>
@@ -310,7 +311,6 @@ function AttachmentFilesField({
   value,
   setValue,
   disabled,
-  error,
   labels,
   uploading,
 }: AttachmentFilesFieldProps) {
@@ -428,7 +428,6 @@ function AttachmentFilesField({
         />
       </div>
       {renderFileList()}
-      {error ? <p className="text-xs font-medium text-red-600">{error}</p> : null}
     </div>
   )
 }
@@ -662,8 +661,8 @@ function AttachmentUploadForm({ partitions, availableTags, onUploaded, onCancel 
         onSubmit={handleSubmit}
       />
       {isUploading ? (
-        <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center bg-background/90 px-6 text-center backdrop-blur">
-          <div className="flex w-full max-w-sm flex-col items-center gap-4 rounded-xl border border-border/50 bg-card/95 px-6 py-8 shadow-2xl">
+        <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center bg-background/80 px-6 text-center backdrop-blur">
+          <div className="flex w-full max-w-sm flex-col items-center gap-4 rounded-xl border border-border/70 bg-card/95 px-6 py-8 shadow-2xl">
             <Spinner size="lg" className="border-primary/50 border-t-primary" />
             <div className="w-full space-y-3">
               <p className="text-base font-semibold">
@@ -753,6 +752,20 @@ export function AttachmentLibrary() {
   const [deleteDialogOpen, setDeleteDialogOpen] = React.useState(false)
   const [deleteTarget, setDeleteTarget] = React.useState<AttachmentRow | null>(null)
   const [deletePending, setDeletePending] = React.useState(false)
+
+  const { data: featureCheckData } = useQuery({
+    queryKey: ['attachments-feature-check'],
+    queryFn: async () => {
+      const call = await apiCall<{ granted?: string[] }>('/api/auth/feature-check', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ features: ['attachments.manage'] }),
+      })
+      return call.result ?? {}
+    },
+    staleTime: 60_000,
+  })
+  const canManage = hasFeature(featureCheckData?.granted, 'attachments.manage')
   const filterSignature = React.useMemo(() => buildFilterSignature(filterValues), [filterValues])
   const sortingSignature = React.useMemo(() => JSON.stringify(sorting), [sorting])
 
@@ -831,7 +844,7 @@ export function AttachmentLibrary() {
           const placeholder = resolveAttachmentPlaceholder(value.mimeType, value.fileName)
           const PlaceholderIcon = placeholder.icon
           return (
-            <div className="flex h-16 w-16 flex-col items-center justify-center rounded border bg-muted text-[10px] font-semibold uppercase text-muted-foreground">
+            <div className="flex h-16 w-16 flex-col items-center justify-center rounded border bg-muted text-overline font-semibold uppercase text-muted-foreground">
               <PlaceholderIcon className="mb-1 h-5 w-5 text-muted-foreground" aria-hidden />
               {placeholder.label}
             </div>
@@ -903,6 +916,7 @@ export function AttachmentLibrary() {
                     className="text-sm text-blue-600 underline"
                     target="_blank"
                     rel="noreferrer"
+                    onClick={(event) => event.stopPropagation()}
                   >
                     {content}
                   </a>
@@ -948,7 +962,12 @@ export function AttachmentLibrary() {
           const absolute = resolveAbsoluteUrl(downloadPath)
           return (
             <Button variant="ghost" size="icon" asChild>
-              <a href={absolute} download aria-label={t('attachments.library.table.download', 'Download')}>
+              <a
+                href={absolute}
+                download
+                aria-label={t('attachments.library.table.download', 'Download')}
+                onClick={(event) => event.stopPropagation()}
+              >
                 <Download className="h-4 w-4" />
               </a>
             </Button>
@@ -1033,21 +1052,24 @@ export function AttachmentLibrary() {
   }, [deleteTarget, queryClient, selectedRow, t])
 
   const total = data?.total ?? 0
-  const totalPages = data?.totalPages ?? 1
+  const totalPages = data?.totalPages ?? 0
   return (
     <>
       <DataTable<AttachmentRow>
+        stickyActionsColumn
         title={t('attachments.library.title', 'Attachments')}
         refreshButton={{
           label: t('attachments.library.actions.refresh', 'Refresh'),
           onRefresh: () => { void refetch() },
           isRefreshing: isLoading,
         }}
-        actions={(
-          <Button onClick={() => setUploadDialogOpen(true)}>
-            {t('attachments.library.actions.upload', 'Upload')}
-          </Button>
-        )}
+        actions={
+          canManage ? (
+            <Button onClick={() => setUploadDialogOpen(true)}>
+              {t('attachments.library.actions.upload', 'Upload')}
+            </Button>
+          ) : undefined
+        }
         columns={columns}
         data={items}
         sorting={sorting}

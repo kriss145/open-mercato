@@ -2,14 +2,34 @@
 
 Use `@open-mercato/ui/backend` for all admin/backend page components. See `packages/ui/AGENTS.md` for full UI patterns.
 
-## MUST Rules
+## Always
 
 1. **MUST set stable `id` values on `RowActions` items** — use `edit`, `open`, `delete`, etc. DataTable resolves default row-click behavior from these ids
 2. **MUST use `apiCall`/`apiCallOrThrow`** from `@open-mercato/ui/backend/utils/apiCall` — never use raw `fetch`
 3. **MUST use `LoadingMessage`/`ErrorMessage`** from `@open-mercato/ui/backend/detail` for loading and error states
-4. **MUST NOT hard-code user-facing strings** — use `useT()` for all labels and messages
+4. **MUST use `useT()`** for all labels and messages
 5. **MUST use `useGuardedMutation` when not using `CrudForm`** — wrap every write operation (`POST`/`PUT`/`PATCH`/`DELETE`) in `runMutation({ operation, context, mutationPayload })` so global mutation injections (record locks, conflict UI, future guards) run consistently
-6. **MUST use `Button` or `IconButton`** for every interactive button — never use raw `<button>` elements. Use `IconButton` for icon-only buttons, `Button` for everything else. Always pass `type="button"` explicitly on non-submit buttons. See `packages/ui/AGENTS.md` → Button and IconButton Usage for full patterns and variant reference.
+6. **MUST use `Button` or `IconButton`** for every interactive button. Use `IconButton` for icon-only buttons, `Button` for everything else. Always pass `type="button"` explicitly on non-submit buttons. See `packages/ui/AGENTS.md` → Button and IconButton Usage for full patterns and variant reference.
+7. **MUST treat missing records as a dedicated page-level state** — distinguish `notFound` from generic `error`, return early, and render a shared `ErrorMessage`-based state with a clear recovery action (for example, back to the owning list page).
+
+## Ask First
+
+- Ask before changing DataTable row-click defaults, UMES host surface IDs, CrudForm event behavior, or replacement handles.
+- Ask before introducing backend-page write flows that do not fit `CrudForm` or `useGuardedMutation`.
+
+## Never
+
+- Never use raw `fetch` from backend UI components.
+- Never hard-code user-facing strings.
+- Never use raw `<button>` elements.
+- Never render `CrudForm`, detail sections, tabs, or record actions when the record is missing.
+
+## Validation Commands
+
+```bash
+yarn workspace @open-mercato/ui test
+yarn workspace @open-mercato/ui build
+```
 
 ## DataTable Row-Click Behavior
 
@@ -37,6 +57,7 @@ import { useGuardedMutation } from '@open-mercato/ui/backend/injection/useGuarde
 import { useInjectionDataWidgets } from '@open-mercato/ui/backend/injection/useInjectionDataWidgets'
 import { useInjectedMenuItems } from '@open-mercato/ui/backend/injection/useInjectedMenuItems'
 import { mergeMenuItems } from '@open-mercato/ui/backend/injection/mergeMenuItems'
+import { useRegisteredComponent } from '@open-mercato/ui/backend/injection/useRegisteredComponent'
 ```
 
 ## Widget Event Hooks
@@ -86,9 +107,16 @@ Action events fire independently; transformer events form a pipeline where each 
 
 CrudForm emits these extended handlers by default. Disable automatic emission with `NEXT_PUBLIC_OM_CRUDFORM_EXTENDED_EVENTS_ENABLED=false`.
 
+## UMES Host Surfaces (Phases F/G/H)
+
+- DataTable hosts should use stable `extensionTableId` values so injection spots (`columns`, `row-actions`, `bulk-actions`, `filters`) remain backward-compatible.
+- CrudForm hosts should use stable `entityId` and field/group IDs so `crud-form:<entityId>:fields` injections can target predictable surfaces.
+- For replacement-aware surfaces, resolve components by handle using `useRegisteredComponent(handle, Fallback)` and keep handle IDs stable.
+
 ## When Building Backend Pages
 
 - Use `CrudForm` for create/edit flows — see `packages/ui/AGENTS.md` → CrudForm Guidelines
 - Use `DataTable` for list views — see `packages/ui/AGENTS.md` → DataTable Guidelines
 - Use `FormHeader` with mode `edit` (compact) or `detail` (large title with status)
+- For record-backed `[id]` pages, prefer `loading -> notFound -> error -> ready` state flow over `if (error || !data)` shortcuts.
 - Follow the customers module as the reference implementation

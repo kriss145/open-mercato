@@ -1,16 +1,19 @@
 import path from 'node:path'
 import fs from 'node:fs'
 import { pathToFileURL } from 'node:url'
-import { MikroORM, type Logger } from '@mikro-orm/core'
+import ts from 'typescript-js'
+import { MikroORM, MetadataStorage, type Logger } from '@mikro-orm/core'
+import { ReflectMetadataProvider } from '@mikro-orm/decorators/legacy'
 import { Migrator } from '@mikro-orm/migrations'
 import { PostgreSqlDriver } from '@mikro-orm/postgresql'
 import { getSslConfig } from '@open-mercato/shared/lib/db/ssl'
 import type { PackageResolver, ModuleEntry } from '../resolver'
+import { quotePostgresIdentifier } from './identifiers'
 
 const QUIET_MODE = process.env.OM_CLI_QUIET === '1' || process.env.MERCATO_QUIET === '1'
 const PROGRESS_EMOJI = ''
 
-function formatResult(modId: string, message: string, emoji = '•') {
+function formatResult(modId: string, message: string, emoji = '\u2022') {
   return `${emoji} ${modId}: ${message}`
 }
 
@@ -27,13 +30,13 @@ function createProgressRenderer(total: number) {
 
 function createMinimalLogger(): Logger {
   return {
-    log: () => {},
+    log: () => { },
     error: (_namespace, message) => console.error(message),
     warn: (_namespace, message) => {
       if (!QUIET_MODE) console.warn(message)
     },
-    logQuery: () => {},
-    setDebugMode: () => {},
+    logQuery: () => { },
+    setDebugMode: () => { },
     isEnabled: () => false,
   }
 }
@@ -84,10 +87,80 @@ export function validateTableName(tableName: string): void {
   }
 }
 
+export function makeConstraintDropsIdempotent(sql: string): string {
+  return sql.replace(/alter table\s+("[^"]+"|\S+)\s+drop constraint\s+("[^"]+"|\S+);/gi, 'alter table $1 drop constraint if exists $2;')
+}
+
+export function getMigrationSnapshotName(resolver: Pick<PackageResolver, 'getRootDir'>): string {
+  void resolver
+  return '.snapshot-open-mercato'
+}
+
+export function shouldCreateInitialModuleMigration(migrationsPath: string, snapshotName: string): boolean {
+  const snapshotPath = path.join(migrationsPath, `${snapshotName}.json`)
+  if (fs.existsSync(snapshotPath)) return false
+  if (!fs.existsSync(migrationsPath)) return true
+
+  const migrationFiles = fs
+    .readdirSync(migrationsPath)
+    .filter((file) => /^Migration.*\.(ts|js)$/.test(file) && !file.endsWith('.d.ts'))
+
+  return migrationFiles.length === 0
+}
+
+export function resolveGeneratedMigrationPath(fileName: string, migrationsPath: string): string {
+  return path.isAbsolute(fileName) ? fileName : path.join(migrationsPath, fileName)
+}
+
+let tsxLoaderRegistered = false
+let temporaryModuleCounter = 0
+
+async function ensureTsxLoaderRegistered() {
+  if (tsxLoaderRegistered) return
+  try {
+    const { register } = await import('tsx/esm/api')
+    register()
+    tsxLoaderRegistered = true
+  } catch {
+    // Continue without the loader. Relative TypeScript imports may fail in this case.
+  }
+}
+
+async function importWithTypeScriptFile(filePath: string): Promise<any> {
+  await ensureTsxLoaderRegistered()
+  const source = fs.readFileSync(filePath, 'utf8')
+  const compiled = ts.transpileModule(source, {
+    fileName: filePath,
+    compilerOptions: {
+      module: ts.ModuleKind.ESNext,
+      target: ts.ScriptTarget.ES2022,
+      moduleResolution: ts.ModuleResolutionKind.Bundler,
+      esModuleInterop: true,
+      resolveJsonModule: true,
+      jsx: ts.JsxEmit.ReactJSX,
+      experimentalDecorators: true,
+      emitDecoratorMetadata: false,
+      useDefineForClassFields: false,
+    },
+  }).outputText
+  const tempPath = `${filePath}.mercato-db-generate-${process.pid}-${temporaryModuleCounter++}.mjs`
+  fs.writeFileSync(tempPath, compiled, 'utf8')
+  try {
+    return await import(pathToFileURL(tempPath).href)
+  } finally {
+    try {
+      fs.unlinkSync(tempPath)
+    } catch {
+      // Ignore cleanup failures for temporary compiled modules.
+    }
+  }
+}
+
 async function loadModuleEntities(entry: ModuleEntry, resolver: PackageResolver): Promise<any[]> {
   const roots = resolver.getModulePaths(entry)
   const imps = resolver.getModuleImportBase(entry)
   const isAppModule = entry.from === '@app'
+  const shouldImportFromSource = isAppModule || resolver.isMonorepo()
   const bases = [
     path.join(roots.appBase, 'data'),
     path.join(roots.pkgBase, 'data'),
@@ -102,18 +175,23 @@ async function loadModuleEntities(entry: ModuleEntry, resolver: PackageResolver)
       if (fs.existsSync(p)) {
         const sub = path.basename(base)
         const fromApp = base.startsWith(roots.appBase)
-        // For @app modules, use file:// URL since @/ alias doesn't work in Node.js runtime
-        const importPath = (isAppModule && fromApp)
-          ? pathToFileURL(p.replace(/\.ts$/, '.js')).href
-          : `${fromApp ? imps.appBase : imps.pkgBase}/${sub}/${f.replace(/\.ts$/, '')}`
+        const importPath = fromApp || shouldImportFromSource
+          ? pathToFileURL(p).href
+          : `${imps.pkgBase}/${sub}/${f.replace(/\.ts$/, '')}`
         try {
-          const mod = await import(importPath)
+          const mod = fromApp || shouldImportFromSource
+            ? await importWithTypeScriptFile(p)
+            : await import(importPath)
           const entities = Object.values(mod).filter((v) => typeof v === 'function')
           if (entities.length) return entities as any[]
         } catch (err) {
-          // For @app modules with TypeScript files, they can't be directly imported
-          // Skip and let MikroORM handle entities through discovery
-          if (isAppModule) continue
+          // For @app modules we try a TS loader fallback; otherwise propagate errors
+          if (isAppModule) {
+            if (process.env.MERCATO_CLI_DEBUG_IMPORTS === '1') {
+              console.warn(`[db] failed to load app module entities from ${p}: ${(err as Error)?.message || String(err)}`)
+            }
+            continue
+          }
           throw err
         }
       }
@@ -157,29 +235,46 @@ export async function dbGenerate(resolver: PackageResolver, options: DbOptions =
   const ordered = sortModules(modules)
   const results: string[] = []
 
+  const sslConfig = getSslConfig()
+  const usedFileNames = new Set<string>()
+
   for (const entry of ordered) {
+    // Clear the global @Entity() decorator registry before loading this module's
+    // entities. MikroORM's migrator reads MetadataStorage at createMigration()
+    // time, so without this clear, every module's migration would include every
+    // previously-loaded module's tables (see issue #1911).
+    MetadataStorage.clear()
+
     const modId = entry.id
     const sanitizedModId = sanitizeModuleId(modId)
     const entities = await loadModuleEntities(entry, resolver)
-    if (!entities.length) continue
+    if (!entities.length) {
+      if (entry.from === '@app') {
+        results.push(formatResult(modId, 'no entities discovered', ''))
+      }
+      continue
+    }
 
     const migrationsPath = getMigrationsPath(entry, resolver)
     fs.mkdirSync(migrationsPath, { recursive: true })
 
     const tableName = `mikro_orm_migrations_${sanitizedModId}`
     validateTableName(tableName)
+    const snapshotName = getMigrationSnapshotName(resolver)
+    const createInitialMigration = shouldCreateInitialModuleMigration(migrationsPath, snapshotName)
 
-    const sslConfig = getSslConfig()
     const orm = await MikroORM.init<PostgreSqlDriver>({
       driver: PostgreSqlDriver,
       clientUrl: getClientUrl(),
       loggerFactory: () => createMinimalLogger(),
       dynamicImportProvider,
       entities,
+      metadataProvider: ReflectMetadataProvider,
       migrations: {
         path: migrationsPath,
         glob: '!(*.d).{ts,js}',
         tableName,
+        snapshotName,
         dropTables: false,
       },
       schemaGenerator: {
@@ -189,45 +284,51 @@ export async function dbGenerate(resolver: PackageResolver, options: DbOptions =
         min: 1,
         max: 3,
         idleTimeoutMillis: 30000,
-        acquireTimeoutMillis: 60000,
-        destroyTimeoutMillis: 30000,
+        // acquireTimeoutMillis removed for v7 (pg.Pool doesn't support it; use connectionTimeoutMillis in driverOptions if needed)
       },
       driverOptions: sslConfig ? {
-        connection: {
-          ssl: sslConfig,
-        },
+        ssl: sslConfig,
       } : undefined,
     })
 
-    const migrator = orm.getMigrator() as Migrator
-    const diff = await migrator.createMigration()
-    if (diff && diff.fileName) {
-      try {
-        const orig = diff.fileName
-        const base = path.basename(orig)
-        const dir = path.dirname(orig)
-        const ext = path.extname(base)
-        const stem = base.replace(ext, '')
-        const suffix = `_${modId}`
-        const newBase = stem.endsWith(suffix) ? base : `${stem}${suffix}${ext}`
-        const newPath = path.join(dir, newBase)
-        let content = fs.readFileSync(orig, 'utf8')
-        // Rename class to ensure uniqueness as well
-        content = content.replace(
-          /export class (Migration\d+)/,
-          `export class $1_${modId.replace(/[^a-zA-Z0-9]/g, '_')}`
-        )
-        fs.writeFileSync(newPath, content, 'utf8')
-        if (newPath !== orig) fs.unlinkSync(orig)
-        results.push(formatResult(modId, `generated ${newBase}`, ''))
-      } catch {
-        results.push(formatResult(modId, `generated ${path.basename(diff.fileName)} (rename failed)`, ''))
-      }
-    } else {
-      results.push(formatResult(modId, 'no changes', ''))
-    }
+    try {
+      const diff = await orm.migrator.create(undefined, false, createInitialMigration)
+      if (diff && diff.fileName) {
+        try {
+          const orig = resolveGeneratedMigrationPath(diff.fileName, migrationsPath)
+          const base = path.basename(orig)
+          const dir = path.dirname(orig)
+          const ext = path.extname(base)
+          const stem = base.replace(ext, '')
+          const suffix = `_${modId}`
+          let candidate = stem.endsWith(suffix) ? base : `${stem}${suffix}${ext}`
+          let dedupe = 1
 
-    await orm.close(true)
+          while (usedFileNames.has(path.join(dir, candidate))) {
+            candidate = `${stem}${suffix}_${dedupe++}${ext}`
+          }
+
+          const newPath = path.join(dir, candidate)
+          let content = fs.readFileSync(orig, 'utf8')
+          content = makeConstraintDropsIdempotent(content)
+          content = content.replace(
+            /export class (Migration\d+)/,
+            `export class $1_${modId.replace(/[^a-zA-Z0-9]/g, '_')}`
+          )
+          fs.writeFileSync(newPath, content, 'utf8')
+          if (newPath !== orig) fs.unlinkSync(orig)
+          usedFileNames.add(newPath)
+          results.push(formatResult(modId, `generated ${path.basename(newPath)}`, ''))
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          results.push(formatResult(modId, `generated ${path.basename(diff.fileName)} (rename failed: ${message})`, ''))
+        }
+      } else {
+        results.push(formatResult(modId, 'no changes', ''))
+      }
+    } finally {
+      await orm.close(true)
+    }
   }
 
   console.log(results.join('\n'))
@@ -264,11 +365,13 @@ export async function dbMigrate(resolver: PackageResolver, options: DbOptions = 
       loggerFactory: () => createMinimalLogger(),
       dynamicImportProvider,
       entities: [],
+      metadataProvider: ReflectMetadataProvider,
       discovery: { warnWhenNoEntities: false },
       migrations: {
         path: migrationsPath,
         glob: '!(*.d).{ts,js}',
         tableName,
+        snapshot: false,
         dropTables: false,
       },
       schemaGenerator: {
@@ -278,18 +381,15 @@ export async function dbMigrate(resolver: PackageResolver, options: DbOptions = 
         min: 1,
         max: 3,
         idleTimeoutMillis: 30000,
-        acquireTimeoutMillis: 60000,
-        destroyTimeoutMillis: 30000,
+        // acquireTimeoutMillis removed for v7 (pg.Pool doesn't support it; use connectionTimeoutMillis in driverOptions if needed)
       },
       driverOptions: sslConfig ? {
-        connection: {
-          ssl: sslConfig,
-        },
+        ssl: sslConfig,
       } : undefined,
     })
 
-    const migrator = orm.getMigrator() as Migrator
-    const pending = await migrator.getPendingMigrations()
+    const migrator = orm.migrator as Migrator
+    const pending = await migrator.getPending()
     if (!pending.length) {
       results.push(formatResult(modId, 'no pending migrations', ''))
     } else {
@@ -408,7 +508,7 @@ export async function dbGreenfield(resolver: PackageResolver, options: Greenfiel
     } finally {
       try {
         await client.end()
-      } catch {}
+      } catch { }
     }
   } catch (e) {
     console.error('Failed to drop migration tables:', (e as any)?.message || e)
@@ -422,14 +522,14 @@ export async function dbGreenfield(resolver: PackageResolver, options: Greenfiel
     const client = new Client({ connectionString: getClientUrl(), ssl: getSslConfig() })
     await client.connect()
     try {
-      const res = await client.query(`SELECT tablename FROM pg_tables WHERE schemaname = 'public'`)
+      const res = await client.query(`SELECT tablename FROM pg_tables WHERE schemaname = current_schema()`)
       const tables: string[] = (res.rows || []).map((r: any) => String(r.tablename))
       if (tables.length) {
         await client.query('BEGIN')
         try {
           await client.query("SET session_replication_role = 'replica'")
           for (const t of tables) {
-            await client.query(`DROP TABLE IF EXISTS "${t}" CASCADE`)
+            await client.query(`DROP TABLE IF EXISTS ${quotePostgresIdentifier(t)} CASCADE`)
           }
           await client.query("SET session_replication_role = 'origin'")
           await client.query('COMMIT')
@@ -444,7 +544,7 @@ export async function dbGreenfield(resolver: PackageResolver, options: Greenfiel
     } finally {
       try {
         await client.end()
-      } catch {}
+      } catch { }
     }
   } catch (e) {
     console.error('Failed to drop public tables:', (e as any)?.message || e)

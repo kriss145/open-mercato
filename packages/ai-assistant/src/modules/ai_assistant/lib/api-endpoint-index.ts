@@ -1,21 +1,28 @@
 /**
  * API Endpoint Index
  *
- * Parses OpenAPI spec and indexes endpoints for discovery via hybrid search.
+ * Parses the OpenAPI spec into a cached, in-memory list of endpoints and
+ * exposes the raw OpenAPI document to Code Mode's `search` tool. The Code
+ * Mode rewrite (2026-02-22) made this the only consumer — the legacy
+ * `find_api` / `call_api` / `discover_schema` tools and their search-index
+ * fan-out have been removed.
  */
 
+import { createLogger } from '@open-mercato/shared/lib/logger'
 import type { OpenApiDocument } from '@open-mercato/shared/lib/openapi'
 import { buildOpenApiDocument } from '@open-mercato/shared/lib/openapi'
 import type { Module } from '@open-mercato/shared/modules/registry'
-import type { SearchService } from '@open-mercato/search/service'
-import type { IndexableRecord } from '@open-mercato/search/types'
-import {
-  API_ENDPOINT_ENTITY_ID,
-  GLOBAL_TENANT_ID,
-  API_ENDPOINT_SEARCH_CONFIG,
-  endpointToIndexableRecord,
-  computeEndpointsChecksum,
-} from './api-endpoint-index-config'
+import { fetchWithTimeout, resolveTimeoutMs } from '@open-mercato/shared/lib/http/fetchWithTimeout'
+
+const logger = createLogger('ai_assistant').child({ component: 'api-index' })
+
+const DEFAULT_OPENAPI_FETCH_TIMEOUT_MS = 10_000
+
+function resolveOpenapiFetchTimeoutMs(): number {
+  const raw = process.env.AI_OPENAPI_FETCH_TIMEOUT_MS
+  const parsed = raw ? Number.parseInt(raw, 10) : undefined
+  return resolveTimeoutMs(parsed, DEFAULT_OPENAPI_FETCH_TIMEOUT_MS)
+}
 
 /**
  * Indexed API endpoint structure
@@ -43,16 +50,15 @@ export interface ApiParameter {
 }
 
 /**
- * Entity type for API endpoints in search index
- * @deprecated Use API_ENDPOINT_ENTITY_ID from api-endpoint-index-config.ts
- */
-export const API_ENDPOINT_ENTITY = API_ENDPOINT_ENTITY_ID
-
-/**
  * In-memory cache of parsed endpoints (avoid re-parsing on each request)
  */
 let endpointsCache: ApiEndpoint[] | null = null
 let endpointsByOperationId: Map<string, ApiEndpoint> | null = null
+
+/**
+ * In-memory cache of the raw OpenAPI spec document (for Code Mode search tool)
+ */
+let rawSpecCache: OpenApiDocument | null = null
 
 /**
  * Get all parsed API endpoints (cached)
@@ -77,8 +83,150 @@ export async function getEndpointByOperationId(operationId: string): Promise<Api
 }
 
 /**
+ * Get the raw OpenAPI spec document (cached).
+ * Uses the same 3-tier loading strategy as parseApiEndpoints():
+ * generated JSON → module registry → HTTP fetch.
+ */
+export async function getRawOpenApiSpec(): Promise<OpenApiDocument | null> {
+  if (rawSpecCache) return rawSpecCache
+  rawSpecCache = await loadRawOpenApiSpec()
+  return rawSpecCache
+}
+
+/**
+ * Set the raw OpenAPI spec cache directly.
+ * Used by servers that want to inject a pre-built spec.
+ */
+export function setRawSpecCache(doc: OpenApiDocument): void {
+  rawSpecCache = doc
+}
+
+/**
+ * Clear the raw OpenAPI spec cache.
+ */
+export function clearRawSpecCache(): void {
+  rawSpecCache = null
+}
+
+/**
+ * Load the rich OpenAPI spec, skipping Tier 1 (static JSON) which lacks requestBody schemas.
+ * Prefers Tier 2 (runtime module registry) which has full Zod-converted schemas.
+ * Falls back to Tier 1 then Tier 3 if needed.
+ */
+export async function loadRichOpenApiSpec(): Promise<OpenApiDocument | null> {
+  if (rawSpecCache) return rawSpecCache
+
+  // Tier 2 first: Module registry (has full Zod-converted schemas)
+  try {
+    const { getModules } = await import('@open-mercato/shared/lib/modules/registry')
+    const modules: Module[] = getModules()
+    const modulesWithApis = modules.filter((m) => m.apis && m.apis.length > 0)
+
+    if (modulesWithApis.length > 0) {
+      const doc = buildOpenApiDocument(modules, {
+        title: 'Open Mercato API',
+        version: '1.0.0',
+        servers: [{ url: process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000' }],
+      })
+      if (!doc.paths || Object.keys(doc.paths).length === 0) {
+        return null
+      }
+      logger.debug('Rich OpenAPI spec built from module registry', { modules: modulesWithApis.length, tier: 2 })
+      rawSpecCache = doc
+      return doc
+    }
+  } catch {
+    // Registry not available — fall through
+  }
+
+  // Fall back to standard 3-tier loading (Tier 1 → Tier 3)
+  rawSpecCache = await loadRawOpenApiSpec()
+  return rawSpecCache
+}
+
+/**
+ * Load raw OpenAPI spec using the 3-tier strategy.
+ */
+async function loadRawOpenApiSpec(): Promise<OpenApiDocument | null> {
+  // Tier 1: Generated JSON file
+  try {
+    const fs = await import('node:fs')
+    const path = await import('node:path')
+    const { findAppRoot, findAllApps } = await import('@open-mercato/shared/lib/bootstrap/appResolver')
+
+    let appRoot = findAppRoot()
+    if (!appRoot) {
+      let current = process.cwd()
+      while (current !== path.dirname(current)) {
+        const appsDir = path.join(current, 'apps')
+        if (fs.existsSync(appsDir)) {
+          const apps = findAllApps(current)
+          if (apps.length > 0) {
+            appRoot = apps[0]
+            break
+          }
+        }
+        current = path.dirname(current)
+      }
+    }
+
+    if (appRoot) {
+      const jsonPath = path.join(appRoot.generatedDir, 'openapi.generated.json')
+      if (fs.existsSync(jsonPath)) {
+        const doc = JSON.parse(fs.readFileSync(jsonPath, 'utf-8')) as OpenApiDocument
+        logger.debug('Raw OpenAPI spec loaded from generated JSON', { jsonPath })
+        return doc
+      }
+    }
+  } catch (error) {
+    logger.warn('Raw spec from generated JSON failed', { err: error })
+  }
+
+  // Tier 2: Module registry
+  try {
+    const { getModules } = await import('@open-mercato/shared/lib/modules/registry')
+    const modules: Module[] = getModules()
+    const modulesWithApis = modules.filter((m) => m.apis && m.apis.length > 0)
+
+    if (modulesWithApis.length > 0) {
+      const doc = buildOpenApiDocument(modules, {
+        title: 'Open Mercato API',
+        version: '1.0.0',
+        servers: [{ url: process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000' }],
+      })
+      logger.debug('Raw OpenAPI spec built from module registry', { modules: modulesWithApis.length })
+      return doc
+    }
+  } catch {
+    // Registry not available
+  }
+
+  // Tier 3: HTTP fetch
+  const baseUrl =
+    process.env.NEXT_PUBLIC_API_BASE_URL ||
+    process.env.NEXT_PUBLIC_APP_URL ||
+    process.env.APP_URL ||
+    'http://localhost:3000'
+
+  try {
+    const response = await fetchWithTimeout(`${baseUrl}/api/docs/openapi`, {
+      timeoutMs: resolveOpenapiFetchTimeoutMs(),
+    })
+    if (response.ok) {
+      const doc = (await response.json()) as OpenApiDocument
+      logger.debug('Raw OpenAPI spec fetched via HTTP')
+      return doc
+    }
+  } catch (error) {
+    logger.warn('Raw spec HTTP fetch failed', { err: error })
+  }
+
+  return null
+}
+
+/**
  * Parse endpoints from generated OpenAPI JSON file (for CLI context).
- * This is generated by `yarn modules:prepare` or `yarn generate all`.
+ * This is generated by `yarn generate`.
  */
 async function parseApiEndpointsFromGeneratedJson(): Promise<ApiEndpoint[]> {
   try {
@@ -106,21 +254,21 @@ async function parseApiEndpointsFromGeneratedJson(): Promise<ApiEndpoint[]> {
     }
 
     if (!appRoot) {
-      console.error('[API Index] Could not find app root')
+      logger.warn('Could not find app root')
       return []
     }
 
     const jsonPath = path.join(appRoot.generatedDir, 'openapi.generated.json')
     if (!fs.existsSync(jsonPath)) {
-      console.error('[API Index] openapi.generated.json not found - run yarn modules:prepare')
+      logger.warn('openapi.generated.json not found - run yarn generate')
       return []
     }
 
     const doc = JSON.parse(fs.readFileSync(jsonPath, 'utf-8')) as OpenApiDocument
-    console.error(`[API Index] Loaded OpenAPI from ${jsonPath}`)
+    logger.debug('Loaded OpenAPI from generated JSON', { jsonPath })
     return extractEndpoints(doc)
   } catch (error) {
-    console.error('[API Index] Error reading generated JSON:', error instanceof Error ? error.message : error)
+    logger.error('Error reading generated OpenAPI JSON', { err: error })
     return []
   }
 }
@@ -137,9 +285,7 @@ async function parseApiEndpointsFromModules(): Promise<ApiEndpoint[]> {
     const modulesWithApis = modules.filter((m) => m.apis && m.apis.length > 0)
 
     if (modulesWithApis.length > 0) {
-      console.error(
-        `[API Index] Found ${modules.length} modules, ${modulesWithApis.length} with APIs`
-      )
+      logger.debug('Modules discovered for OpenAPI generation', { modules: modules.length, withApis: modulesWithApis.length })
 
       // Generate OpenAPI spec from modules
       const doc = buildOpenApiDocument(modules, {
@@ -147,6 +293,9 @@ async function parseApiEndpointsFromModules(): Promise<ApiEndpoint[]> {
         version: '1.0.0',
         servers: [{ url: process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000' }],
       })
+      if (!doc.paths || Object.keys(doc.paths).length === 0) {
+        return []
+      }
 
       return extractEndpoints(doc)
     }
@@ -171,20 +320,22 @@ async function parseApiEndpointsFromHttp(): Promise<ApiEndpoint[]> {
   const openApiUrl = `${baseUrl}/api/docs/openapi`
 
   try {
-    console.error(`[API Index] Fetching OpenAPI spec from ${openApiUrl}...`)
-    const response = await fetch(openApiUrl)
+    logger.debug('Fetching OpenAPI spec', { openApiUrl })
+    const response = await fetchWithTimeout(openApiUrl, {
+      timeoutMs: resolveOpenapiFetchTimeoutMs(),
+    })
 
     if (!response.ok) {
-      console.error(`[API Index] Failed to fetch OpenAPI spec: ${response.status} ${response.statusText}`)
+      logger.warn('Failed to fetch OpenAPI spec', { status: response.status, statusText: response.statusText })
       return []
     }
 
     const doc = (await response.json()) as OpenApiDocument
-    console.error(`[API Index] Successfully fetched OpenAPI spec`)
+    logger.debug('Successfully fetched OpenAPI spec')
     return extractEndpoints(doc)
   } catch (error) {
-    console.error('[API Index] Could not fetch OpenAPI spec:', error instanceof Error ? error.message : error)
-    console.error('[API Index] Make sure the app is running at', baseUrl)
+    logger.warn('Could not fetch OpenAPI spec', { err: error })
+    logger.warn('OpenAPI fetch fallback requires the app to be running', { baseUrl })
     return []
   }
 }
@@ -196,19 +347,19 @@ async function parseApiEndpoints(): Promise<ApiEndpoint[]> {
   // Try generated JSON first (works in CLI context without Next.js)
   const fromJson = await parseApiEndpointsFromGeneratedJson()
   if (fromJson.length > 0) {
-    console.error(`[API Index] Loaded ${fromJson.length} endpoints from generated JSON`)
+    logger.debug('Loaded endpoints from generated JSON', { count: fromJson.length })
     return fromJson
   }
 
   // Try loading from module registry (works in Next.js context)
   const fromModules = await parseApiEndpointsFromModules()
   if (fromModules.length > 0) {
-    console.error(`[API Index] Loaded ${fromModules.length} endpoints from modules registry`)
+    logger.debug('Loaded endpoints from modules registry', { count: fromModules.length })
     return fromModules
   }
 
   // Fall back to HTTP fetch (requires running Next.js app)
-  console.error('[API Index] Generated JSON and modules not available, falling back to HTTP fetch...')
+  logger.debug('Generated JSON and modules not available, falling back to HTTP fetch')
   return parseApiEndpointsFromHttp()
 }
 
@@ -253,7 +404,7 @@ function extractEndpoints(doc: OpenApiDocument): ApiEndpoint[] {
     }
   }
 
-  console.error(`[API Index] Parsed ${endpoints.length} endpoints from OpenAPI spec`)
+  logger.debug('Parsed endpoints from OpenAPI spec', { count: endpoints.length })
   return endpoints
 }
 
@@ -309,181 +460,12 @@ function extractRequestBodySchema(
 }
 
 /**
- * Checksum from last indexing operation
- */
-let lastIndexChecksum: string | null = null
-
-/**
- * Index endpoints for search discovery using hybrid search strategies.
- * Uses checksum-based change detection to avoid unnecessary re-indexing.
- *
- * @param searchService - The search service to use for indexing
- * @param force - Force re-indexing even if checksum hasn't changed
- * @returns Number of endpoints indexed
- */
-export async function indexApiEndpoints(
-  searchService: SearchService,
-  force = false
-): Promise<number> {
-  const endpoints = await getApiEndpoints()
-
-  if (endpoints.length === 0) {
-    console.error('[API Index] No endpoints to index')
-    return 0
-  }
-
-  // Compute checksum to detect changes
-  const checksum = computeEndpointsChecksum(
-    endpoints.map((e) => ({ operationId: e.operationId, method: e.method, path: e.path }))
-  )
-
-  // Skip if checksum matches and not forced
-  if (!force && lastIndexChecksum === checksum) {
-    console.error(`[API Index] Skipping indexing - ${endpoints.length} endpoints unchanged`)
-    return 0
-  }
-
-  // Convert to indexable records using the proper format
-  const records: IndexableRecord[] = endpoints.map((endpoint) =>
-    endpointToIndexableRecord(endpoint)
-  )
-
-  try {
-    console.error(`[API Index] Starting bulk index of ${records.length} endpoints...`)
-    // Bulk index using all available strategies (fulltext + vector)
-    // Use Promise.race with timeout to prevent hanging
-    const timeoutMs = 60000 // 60 second timeout
-    const indexPromise = searchService.bulkIndex(records)
-    const timeoutPromise = new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error(`Bulk index timed out after ${timeoutMs}ms`)), timeoutMs)
-    )
-
-    await Promise.race([indexPromise, timeoutPromise])
-    lastIndexChecksum = checksum
-    console.error(`[API Index] Indexed ${records.length} API endpoints for hybrid search`)
-    return records.length
-  } catch (error) {
-    console.error('[API Index] Failed to index endpoints:', error)
-    // Still return the count - some strategies may have succeeded
-    lastIndexChecksum = checksum
-    return records.length
-  }
-}
-
-/**
- * Build searchable content from endpoint
- */
-function buildSearchableContent(endpoint: ApiEndpoint): string {
-  const parts = [
-    endpoint.operationId,
-    endpoint.method,
-    endpoint.path,
-    endpoint.summary,
-    endpoint.description,
-    ...endpoint.tags,
-    ...endpoint.parameters.map((p) => `${p.name} ${p.description}`),
-  ]
-
-  return parts.filter(Boolean).join(' ')
-}
-
-/**
- * Search endpoints using hybrid search (fulltext + vector).
- * Falls back to in-memory search if search service is not available.
- */
-export async function searchEndpoints(
-  searchService: SearchService | null,
-  query: string,
-  options: { limit?: number; method?: string } = {}
-): Promise<ApiEndpoint[]> {
-  const { limit = API_ENDPOINT_SEARCH_CONFIG.defaultLimit, method } = options
-
-  // Ensure endpoints are loaded
-  await getApiEndpoints()
-
-  // Try hybrid search first if search service is available
-  if (searchService) {
-    try {
-      // Use hybrid search (fulltext + vector)
-      const results = await searchService.search(query, {
-        tenantId: GLOBAL_TENANT_ID,
-        organizationId: null,
-        entityTypes: [API_ENDPOINT_ENTITY_ID],
-        limit: limit * 2, // Get extra to account for filtering
-      })
-
-      // Map search results back to ApiEndpoint objects
-      const endpoints: ApiEndpoint[] = []
-      for (const result of results) {
-        if (endpoints.length >= limit) break
-
-        const endpoint = endpointsByOperationId?.get(result.recordId)
-        if (endpoint) {
-          // Apply method filter if not handled by search
-          if (method && endpoint.method !== method.toUpperCase()) continue
-          endpoints.push(endpoint)
-        }
-      }
-
-      if (endpoints.length > 0) {
-        return endpoints
-      }
-
-      // Fall through to fallback if no results from hybrid search
-      console.error('[API Index] No hybrid search results, falling back to in-memory search')
-    } catch (error) {
-      console.error('[API Index] Hybrid search failed, falling back to in-memory:', error)
-    }
-  }
-
-  // Fallback: Simple in-memory text matching
-  return searchEndpointsFallback(query, { limit, method })
-}
-
-/**
- * Fallback in-memory search when hybrid search is not available.
- */
-function searchEndpointsFallback(
-  query: string,
-  options: { limit?: number; method?: string } = {}
-): ApiEndpoint[] {
-  const { limit = API_ENDPOINT_SEARCH_CONFIG.defaultLimit, method } = options
-
-  if (!endpointsCache) {
-    return []
-  }
-
-  const queryLower = query.toLowerCase()
-  const queryTerms = queryLower.split(/\s+/).filter(Boolean)
-
-  let matches = endpointsCache.filter((endpoint) => {
-    const content = buildSearchableContent(endpoint).toLowerCase()
-    return queryTerms.some((term) => content.includes(term))
-  })
-
-  // Filter by method if specified
-  if (method) {
-    matches = matches.filter((e) => e.method === method.toUpperCase())
-  }
-
-  // Sort by relevance (number of matching terms)
-  matches.sort((a, b) => {
-    const aContent = buildSearchableContent(a).toLowerCase()
-    const bContent = buildSearchableContent(b).toLowerCase()
-    const aScore = queryTerms.filter((t) => aContent.includes(t)).length
-    const bScore = queryTerms.filter((t) => bContent.includes(t)).length
-    return bScore - aScore
-  })
-
-  return matches.slice(0, limit)
-}
-
-/**
  * Clear endpoint cache (for testing)
  */
 export function clearEndpointCache(): void {
   endpointsCache = null
   endpointsByOperationId = null
+  rawSpecCache = null
 }
 
 /**
@@ -518,4 +500,3 @@ export function simplifyRequestBodySchema(
 
   return { required, properties }
 }
-

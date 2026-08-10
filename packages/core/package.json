@@ -1,6 +1,7 @@
 {
   "name": "@open-mercato/core",
-  "version": "0.4.5",
+  "version": "0.6.7",
+  "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",
   "scripts": {
@@ -25,6 +26,14 @@
   },
   "exports": {
     ".": "./dist/index.js",
+    "./testing/integration": {
+      "types": "./src/testing/integration/index.ts",
+      "default": "./dist/testing/integration/index.js"
+    },
+    "./helpers/integration/*": {
+      "types": "./src/helpers/integration/*.ts",
+      "default": "./dist/helpers/integration/*.js"
+    },
     "./modules/customers": {
       "types": "./src/modules/customers/index.ts",
       "default": "./dist/modules/customers/index.js"
@@ -52,6 +61,14 @@
     "./modules/auth": {
       "types": "./src/modules/auth/index.ts",
       "default": "./dist/modules/auth/index.js"
+    },
+    "./modules/auth/lib/setup-app": {
+      "types": "./src/modules/auth/lib/setup-app.ts",
+      "default": "./dist/modules/auth/lib/setup-app.js"
+    },
+    "./modules/auth/emails/InviteUserEmail": {
+      "types": "./src/modules/auth/emails/InviteUserEmail.tsx",
+      "default": "./dist/modules/auth/emails/InviteUserEmail.js"
     },
     "./modules/directory": {
       "types": "./src/modules/directory/index.ts",
@@ -92,6 +109,10 @@
     "./modules/attachments": {
       "types": "./src/modules/attachments/index.ts",
       "default": "./dist/modules/attachments/index.js"
+    },
+    "./modules/attachments/lib/drivers": {
+      "types": "./src/modules/attachments/lib/drivers/index.ts",
+      "default": "./dist/modules/attachments/lib/drivers/index.js"
     },
     "./modules/dashboards": {
       "types": "./src/modules/dashboards/index.ts",
@@ -207,26 +228,63 @@
     }
   },
   "dependencies": {
-    "@open-mercato/shared": "workspace:*",
+    "@mikro-orm/core": "^7.1.5",
+    "@mikro-orm/decorators": "^7.1.5",
+    "@mikro-orm/postgresql": "^7.1.5",
     "@types/html-to-text": "^9.0.4",
+    "@types/leaflet": "^1.9.12",
+    "@types/leaflet.markercluster": "^1.5.5",
+    "@types/sanitize-html": "^2.13.0",
     "@types/semver": "^7.5.8",
-    "@xyflow/react": "^12.6.0",
-    "ai": "^6.0.0",
-    "date-fns": "^4.1.0",
+    "@xyflow/react": "^12.11.2",
+    "ai": "^7.0.4",
+    "date-fns": "4.4.0",
     "date-fns-tz": "^3.2.0",
-    "html-to-text": "^9.0.5",
-    "semver": "^7.6.3"
+    "html-to-text": "^10.0.0",
+    "leaflet": "^1.9.4",
+    "leaflet.markercluster": "^1.5.3",
+    "mammoth": "^1.9.0",
+    "pdfjs-dist": "^6.2.108",
+    "resend": "^6.17.2",
+    "sanitize-html": "^2.17.5",
+    "semver": "^7.8.5",
+    "sharp": "^0.35.3",
+    "svix": "^1.96.1",
+    "ts-pattern": "^5.0.0",
+    "zod": "^4.4.3"
+  },
+  "peerDependencies": {
+    "@open-mercato/ai-assistant": "workspace:*",
+    "@open-mercato/shared": "workspace:*",
+    "@open-mercato/ui": "workspace:*",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
   },
   "devDependencies": {
+    "@open-mercato/ai-assistant": "workspace:*",
+    "@open-mercato/shared": "workspace:*",
+    "@open-mercato/ui": "workspace:*",
     "@testing-library/dom": "^10.4.1",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.1",
+    "@types/chance": "^1.1.8",
     "@types/jest": "^30.0.0",
-    "jest": "^30.2.0",
-    "jest-environment-jsdom": "^30.2.0",
-    "ts-jest": "^29.4.6"
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "chance": "^1.1.13",
+    "jest": "^30.4.2",
+    "jest-environment-jsdom": "^30.4.1",
+    "react": "19.2.7",
+    "react-dom": "19.2.7",
+    "ts-jest": "^29.4.11",
+    "typescript": "7.0.2"
   },
   "publishConfig": {
     "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/open-mercato/open-mercato",
+    "directory": "packages/core"
   }
 }

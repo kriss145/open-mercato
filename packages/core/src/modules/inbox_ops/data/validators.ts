@@ -126,13 +126,47 @@ export const logActivityPayloadSchema = z.object({
 
 export const draftReplyPayloadSchema = z.object({
   to: z.string().trim().email().max(320),
-  toName: z.string().trim().max(300).optional(),
-  replyTo: z.string().trim().email().max(320).optional(),
+  toName: z.string().trim().max(300).optional().nullable(),
+  replyTo: z.string().trim().email().max(320).optional().nullable(),
   subject: z.string().trim().min(1).max(500),
   body: z.string().trim().min(1).max(10000),
-  inReplyToMessageId: z.string().trim().max(500).optional(),
-  references: z.array(z.string().trim().max(500)).optional(),
-  context: z.string().trim().max(4000).optional(),
+  inReplyToMessageId: z.string().trim().max(500).optional().nullable(),
+  references: z.array(z.string().trim().max(500)).optional().nullable(),
+  context: z.string().trim().max(4000).optional().nullable(),
+})
+
+// ---------------------------------------------------------------------------
+// Category
+// ---------------------------------------------------------------------------
+
+export const inboxProposalCategoryEnum = z.enum([
+  'rfq',
+  'order',
+  'order_update',
+  'complaint',
+  'shipping_update',
+  'inquiry',
+  'payment',
+  'other',
+])
+
+export const ALL_CATEGORIES = inboxProposalCategoryEnum.options
+
+const proposalCategoryFilterSchema = z.string()
+  .trim()
+  .max(200)
+  .refine((value) => {
+    const categories = value.split(',').map((category) => category.trim()).filter(Boolean)
+    return (
+      categories.length > 0 &&
+      categories.every((category) => inboxProposalCategoryEnum.safeParse(category).success)
+    )
+  }, {
+    message: `Category filter must contain only: ${ALL_CATEGORIES.join(', ')}`,
+  })
+
+export const categorizeProposalSchema = z.object({
+  category: inboxProposalCategoryEnum,
 })
 
 // ---------------------------------------------------------------------------
@@ -183,6 +217,7 @@ export const extractedDiscrepancySchema = z.object({
 
 export const extractionOutputSchema = z.object({
   summary: z.string(),
+  category: inboxProposalCategoryEnum.optional(),
   participants: z.array(extractedParticipantSchema),
   proposedActions: z.array(extractedActionSchema),
   discrepancies: z.array(extractedDiscrepancySchema),
@@ -219,6 +254,10 @@ export const translateProposalSchema = z.object({
 export const updateSettingsSchema = z.object({
   workingLanguage: z.enum(['en', 'de', 'es', 'pl']).optional(),
   isActive: z.boolean().optional(),
+  // Per-tenant inbound-webhook secret. Write-only: it is never returned by the
+  // settings GET. A non-empty value binds custom-provider webhook signatures for
+  // this inbox to this secret; null/empty clears it and reverts to the global key.
+  webhookSecret: z.string().trim().min(16).max(256).nullable().optional(),
 })
 
 // ---------------------------------------------------------------------------
@@ -227,6 +266,7 @@ export const updateSettingsSchema = z.object({
 
 export const proposalListQuerySchema = z.object({
   status: z.enum(['pending', 'partial', 'accepted', 'rejected']).optional(),
+  category: proposalCategoryFilterSchema.optional(),
   search: z.string().trim().max(200).optional(),
   page: z.coerce.number().int().min(1).default(1),
   pageSize: z.coerce.number().int().min(1).max(100).default(25),

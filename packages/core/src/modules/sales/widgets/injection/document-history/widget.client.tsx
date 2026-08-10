@@ -69,7 +69,7 @@ function StatusDot({ color, className }: { color: string | null | undefined; cla
   if (!color) return <span className={cn('h-2.5 w-2.5 rounded-full bg-muted-foreground/40 border border-border inline-flex', className)} />
   return (
     <span
-      className={cn('h-2.5 w-2.5 rounded-full border border-border/60 inline-flex', className)}
+      className={cn('h-2.5 w-2.5 rounded-full border border-border/70 inline-flex', className)}
       style={{ backgroundColor: color }}
       aria-hidden
     />
@@ -228,7 +228,7 @@ function FilterDropdown({ filter, onChange }: { filter: FilterKind; onChange: (k
         <div
           role="listbox"
           aria-label={t('sales.documents.history.filter.label', 'Filters')}
-          className="absolute left-0 top-full mt-1 z-50 w-48 rounded-md border bg-background p-1 shadow-md"
+          className="absolute left-0 top-full mt-1 z-dropdown w-48 rounded-md border bg-background p-1 shadow-md"
         >
           {options.map(opt => (
             <button
@@ -258,24 +258,33 @@ export const DocumentHistoryWidget: React.FC<InjectionWidgetComponentProps<unkno
   const [filter, setFilter] = React.useState<FilterKind>('all')
 
   React.useEffect(() => {
-    apiCall<{ items?: unknown[] }>('/api/sales/order-statuses?pageSize=100')
-      .then((res) => {
-        if (res.ok && Array.isArray(res.result?.items)) {
-          const map: Record<string, StatusOption> = {}
-          for (const item of res.result.items) {
-            if (!item || typeof item !== 'object') continue
-            const d = item as Record<string, unknown>
-            const value = typeof d.value === 'string' ? d.value : null
-            if (!value) continue
-            map[value] = {
-              value,
-              label: typeof d.label === 'string' && d.label.length ? d.label : value,
-              color: typeof d.color === 'string' && d.color.length ? d.color : null,
-              icon: typeof d.icon === 'string' && d.icon.length ? d.icon : null,
-            }
-          }
-          setStatusMap(map)
+    const urls = [
+      '/api/sales/order-statuses?pageSize=100',
+      '/api/sales/shipment-statuses?pageSize=100',
+      '/api/sales/payment-statuses?pageSize=100',
+    ]
+    const map: Record<string, StatusOption> = {}
+    const merge = (items: unknown[]) => {
+      if (!Array.isArray(items)) return
+      for (const item of items) {
+        if (!item || typeof item !== 'object') continue
+        const d = item as Record<string, unknown>
+        const value = typeof d.value === 'string' ? d.value : null
+        if (!value) continue
+        map[value] = {
+          value,
+          label: typeof d.label === 'string' && d.label.length ? d.label : value,
+          color: typeof d.color === 'string' && d.color.length ? d.color : null,
+          icon: typeof d.icon === 'string' && d.icon.length ? d.icon : null,
         }
+      }
+    }
+    Promise.all(urls.map((url) => apiCall<{ items?: unknown[] }>(url)))
+      .then((responses) => {
+        for (const res of responses) {
+          if (res.ok && Array.isArray(res.result?.items)) merge(res.result.items)
+        }
+        setStatusMap(map)
       })
       .catch(() => {})
   }, [])

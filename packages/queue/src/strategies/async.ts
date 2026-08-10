@@ -1,15 +1,40 @@
-import type { Queue, QueuedJob, JobHandler, AsyncQueueOptions, ProcessResult } from '../types'
-import { getRedisUrl, parseRedisUrl } from '@open-mercato/shared/lib/redis/connection'
+import type { Queue, QueuedJob, JobHandler, AsyncQueueOptions, ProcessResult, EnqueueOptions, QueueJobScope } from '../types'
+import { getRedisUrlOrThrow } from '@open-mercato/shared/lib/redis/connection'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const packageLogger = createLogger('queue')
 
 // BullMQ interface types - we define the shape we use to maintain type safety
 // while keeping bullmq as an optional peer dependency
-type ConnectionOptions = { host?: string; port?: number; password?: string; db?: number }
+type ConnectionOptions = {
+  url?: string
+  host?: string
+  port?: number
+  username?: string
+  password?: string
+  db?: number
+  tls?: Record<string, unknown>
+}
 
 interface BullQueueInterface<T> {
-  add: (name: string, data: T, opts?: { removeOnComplete?: boolean; removeOnFail?: number }) => Promise<{ id?: string }>
+  add: (
+    name: string,
+    data: T,
+    opts?: {
+      removeOnComplete?: boolean
+      removeOnFail?: number
+      delay?: number
+      attempts?: number
+      backoff?: { type: string; delay: number }
+    },
+  ) => Promise<{ id?: string }>
   obliterate: (opts?: { force?: boolean }) => Promise<void>
   close: () => Promise<void>
   getJobCounts: (...states: string[]) => Promise<Record<string, number>>
+  getJobs: (types: string[], start?: number, end?: number) => Promise<Array<{
+    data?: T
+    remove: () => Promise<void>
+  }>>
 }
 
 interface BullWorkerInterface {
@@ -26,29 +51,45 @@ interface BullMQModule {
   ) => BullWorkerInterface
 }
 
+const REMOVABLE_JOB_STATES = ['waiting', 'delayed', 'prioritized', 'paused', 'waiting-children']
+
+function payloadMatchesScope(payload: unknown, scope: QueueJobScope): boolean {
+  if (!payload || typeof payload !== 'object') return false
+  const scopedPayload = payload as { tenantId?: unknown; organizationId?: unknown; jobType?: unknown }
+  if (scopedPayload.tenantId !== scope.tenantId) return false
+  if (scope.organizationId !== undefined) {
+    if ((scopedPayload.organizationId ?? null) !== scope.organizationId) return false
+  }
+  if (scope.jobTypes?.length) {
+    return typeof scopedPayload.jobType === 'string' && scope.jobTypes.includes(scopedPayload.jobType)
+  }
+  return true
+}
+
 /**
  * Resolves Redis connection options from various sources.
  *
- * BullMQ requires connection options as `{ host, port, password, db }` object.
- * It does NOT accept raw URL strings in `{ connection: string }` format.
+ * BullMQ expects an ioredis-compatible connection object. Preserve the full
+ * Redis URL under the `url` key so rediss://, username, database, and query
+ * params are not lost in translation.
  */
 function resolveConnection(options?: AsyncQueueOptions['connection']): ConnectionOptions {
-  // Priority: explicit options > shared env helper
   if (options?.url) {
-    return parseRedisUrl(options.url)
+    return { url: options.url }
   }
 
   if (options?.host) {
     return {
       host: options.host,
       port: options.port ?? 6379,
+      username: options.username,
       password: options.password,
+      db: options.db,
+      tls: options.tls,
     }
   }
 
-  // Delegate env var resolution to the shared helper
-  const url = getRedisUrl('QUEUE')
-  return parseRedisUrl(url)
+  return { url: getRedisUrlOrThrow('QUEUE') }
 }
 
 /**
@@ -70,6 +111,7 @@ export function createAsyncQueue<T = unknown>(
 ): Queue<T> {
   const connection = resolveConnection(options?.connection)
   const concurrency = options?.concurrency ?? 1
+  const logger = packageLogger.child({ queue: name })
 
   let bullQueue: BullQueueInterface<QueuedJob<T>> | null = null
   let bullWorker: BullWorkerInterface | null = null
@@ -104,7 +146,7 @@ export function createAsyncQueue<T = unknown>(
   // Queue Implementation
   // -------------------------------------------------------------------------
 
-  async function enqueue(data: T): Promise<string> {
+  async function enqueue(data: T, options?: EnqueueOptions): Promise<string> {
     const queue = await getQueue()
     const jobData: QueuedJob<T> = {
       id: crypto.randomUUID(),
@@ -113,8 +155,11 @@ export function createAsyncQueue<T = unknown>(
     }
 
     const job = await queue.add(jobData.id, jobData, {
+      delay: options?.delayMs && options.delayMs > 0 ? options.delayMs : undefined,
       removeOnComplete: true,
-      removeOnFail: 1000, // Keep last 1000 failed jobs
+      removeOnFail: 1000,
+      attempts: 3,
+      backoff: { type: 'exponential', delay: 1000 },
     })
 
     return job.id ?? jobData.id
@@ -143,21 +188,21 @@ export function createAsyncQueue<T = unknown>(
     // Set up event handlers
     bullWorker.on('completed', (job) => {
       const jobWithId = job as { id?: string }
-      console.log(`[queue:${name}] Job ${jobWithId.id} completed`)
+      logger.info('Job completed', { jobId: jobWithId.id })
     })
 
     bullWorker.on('failed', (job, err) => {
       const jobWithId = job as { id?: string } | undefined
       const error = err as Error
-      console.error(`[queue:${name}] Job ${jobWithId?.id} failed:`, error.message)
+      logger.error('Job failed', { jobId: jobWithId?.id, err: error })
     })
 
     bullWorker.on('error', (err) => {
       const error = err as Error
-      console.error(`[queue:${name}] Worker error:`, error.message)
+      logger.error('Worker error', { err: error })
     })
 
-    console.log(`[queue:${name}] Worker started with concurrency ${concurrency}`)
+    logger.info('Worker started', { concurrency })
 
     // For async strategy, return a sentinel result indicating worker mode
     // processed=-1 signals that this is a continuous worker, not a batch process
@@ -171,6 +216,25 @@ export function createAsyncQueue<T = unknown>(
     await queue.obliterate({ force: true })
 
     return { removed: -1 } // BullMQ obliterate doesn't return count
+  }
+
+  async function removeQueuedJobsByScope(scope: QueueJobScope): Promise<{ removed: number }> {
+    const queue = await getQueue()
+    const jobs = await queue.getJobs(REMOVABLE_JOB_STATES, 0, -1)
+    let removed = 0
+
+    for (const job of jobs) {
+      if (!payloadMatchesScope(job.data?.payload, scope)) continue
+      try {
+        await job.remove()
+        removed++
+      } catch {
+        // The job may have started between enumeration and removal. In-flight
+        // cancellation is handled by the caller's lock/heartbeat contract.
+      }
+    }
+
+    return { removed }
   }
 
   async function close(): Promise<void> {
@@ -206,6 +270,7 @@ export function createAsyncQueue<T = unknown>(
     enqueue,
     process,
     clear,
+    removeQueuedJobsByScope,
     close,
     getJobCounts,
   }

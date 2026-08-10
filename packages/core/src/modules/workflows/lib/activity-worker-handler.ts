@@ -18,6 +18,9 @@ import {
   executeCallWebhook,
   executeFunction,
 } from './activity-executor'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('workflows').child({ component: 'activity-worker' })
 
 /**
  * Create activity worker handler for queue processing
@@ -34,9 +37,27 @@ export function createActivityWorkerHandler(
     const { payload } = job
     const startTime = Date.now()
 
-    console.log(
-      `[ActivityWorker] Processing activity ${payload.activityId} (job ${ctx.jobId})`
-    )
+    // Timer jobs (kind: 'timer') are a distinct flow — they resume a paused
+    // workflow instance rather than executing an activity. Handle them first.
+    if (payload.kind === 'timer') {
+      logger.debug('Firing timer for instance', { instanceId: payload.workflowInstanceId, jobId: ctx.jobId })
+      try {
+        const { fireTimer } = await import('./timer-handler')
+        await fireTimer(em, container, {
+          instanceId: payload.workflowInstanceId,
+          stepInstanceId: payload.stepInstanceId,
+          tenantId: payload.tenantId,
+          organizationId: payload.organizationId,
+          userId: payload.userId,
+        })
+      } catch (error: any) {
+        logger.error('Failed to fire timer for instance', { instanceId: payload.workflowInstanceId, err: error })
+        throw error
+      }
+      return
+    }
+
+    logger.debug('Processing activity', { activityId: payload.activityId, jobId: ctx.jobId })
 
     try {
       // Fetch workflow instance
@@ -79,6 +100,10 @@ export function createActivityWorkerHandler(
             return await executeCallWebhook(payload.activityConfig, activityContext)
           case 'EXECUTE_FUNCTION':
             return await executeFunction(payload.activityConfig, activityContext, container)
+          case 'WAIT':
+            // Delay already applied by the queue via delayMs; the worker
+            // only needs to record completion so the workflow can resume.
+            return { waited: true, async: true }
           default:
             throw new Error(`Unsupported activity type: ${payload.activityType}`)
         }
@@ -120,16 +145,14 @@ export function createActivityWorkerHandler(
         organizationId: payload.organizationId,
       })
 
-      console.log(
-        `[ActivityWorker] Activity ${payload.activityId} completed in ${executionTimeMs}ms`
-      )
+      logger.debug('Activity completed', { activityId: payload.activityId, executionTimeMs })
 
       // Trigger workflow resume check (via event or direct call)
       await checkAndResumeWorkflow(em, container, payload.workflowInstanceId)
     } catch (error: any) {
       const executionTimeMs = Date.now() - startTime
 
-      console.error(`[ActivityWorker] Activity ${payload.activityId} failed:`, error.message)
+      logger.error('Activity failed', { activityId: payload.activityId, err: error })
 
       // Log failure event
       await logWorkflowEvent(em, {
@@ -179,7 +202,7 @@ async function checkAndResumeWorkflow(
   } catch (error: any) {
     // Ignore error if workflow not ready to resume yet
     if (!error.message?.includes('Activities still pending')) {
-      console.error(`[ActivityWorker] Failed to resume workflow ${workflowInstanceId}:`, error)
+      logger.error('Failed to resume workflow', { instanceId: workflowInstanceId, err: error })
     }
   }
 }

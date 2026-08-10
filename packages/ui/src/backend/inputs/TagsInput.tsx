@@ -3,7 +3,7 @@
 import * as React from 'react'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
 import { Button } from '../../primitives/button'
-import { IconButton } from '../../primitives/icon-button'
+import { Tag } from '../../primitives/tag'
 
 export type TagsInputOption = {
   value: string
@@ -24,6 +24,7 @@ export type TagsInputProps = {
   disabled?: boolean
   allowCustomValues?: boolean
   showSuggestionsOnFocus?: boolean
+  suppressInitialSuggestionsOnFocus?: boolean
 }
 
 function normalizeOptions(input?: Array<string | TagsInputOption>): TagsInputOption[] {
@@ -59,12 +60,24 @@ export function TagsInput({
   disabled = false,
   allowCustomValues = true,
   showSuggestionsOnFocus = true,
+  suppressInitialSuggestionsOnFocus = false,
 }: TagsInputProps) {
   const t = useT()
   const [input, setInput] = React.useState('')
   const [asyncOptions, setAsyncOptions] = React.useState<TagsInputOption[]>([])
   const [loading, setLoading] = React.useState(false)
   const [touched, setTouched] = React.useState(false)
+  const suppressBlurCommitRef = React.useRef(false)
+  const suppressSuggestionsOnFocusRef = React.useRef(Boolean(autoFocus && suppressInitialSuggestionsOnFocus && !disabled))
+  const valueRef = React.useRef(value)
+
+  React.useEffect(() => {
+    valueRef.current = value
+  }, [value])
+
+  React.useEffect(() => {
+    suppressSuggestionsOnFocusRef.current = Boolean(autoFocus && suppressInitialSuggestionsOnFocus && !disabled)
+  }, [autoFocus, disabled, suppressInitialSuggestionsOnFocus])
 
   const staticOptions = React.useMemo(() => normalizeOptions(suggestions), [suggestions])
   const selectedOptionList = React.useMemo(
@@ -133,10 +146,13 @@ export function TagsInput({
       if (disabled) return
       const trimmed = nextValue.trim()
       if (!trimmed) return
-      if (value.includes(trimmed)) return
-      onChange([...value, trimmed])
+      const currentValue = valueRef.current
+      if (currentValue.includes(trimmed)) return
+      const next = [...currentValue, trimmed]
+      valueRef.current = next
+      onChange(next)
     },
-    [disabled, onChange, value]
+    [disabled, onChange]
   )
 
   const findOptionForInput = React.useCallback(
@@ -169,9 +185,11 @@ export function TagsInput({
   const removeTag = React.useCallback(
     (tag: string) => {
       if (disabled) return
-      onChange(value.filter((candidate) => candidate !== tag))
+      const next = valueRef.current.filter((candidate) => candidate !== tag)
+      valueRef.current = next
+      onChange(next)
     },
-    [disabled, onChange, value]
+    [disabled, onChange]
   )
 
   return (
@@ -190,24 +208,21 @@ export function TagsInput({
           const label = option?.label ?? tag
           const description = option?.description
           return (
-            <span key={tag} className="inline-flex items-center gap-2 rounded-sm bg-muted px-2 py-0.5 text-xs">
+            <Tag
+              key={tag}
+              shape="square"
+              variant="default"
+              disabled={disabled}
+              onRemove={() => removeTag(tag)}
+              removeAriaLabel={t('ui.inputs.tagsInput.removeTag', 'Remove {label}', { label })}
+            >
               <span className="flex flex-col items-start leading-tight">
                 <span className="whitespace-nowrap">{label}</span>
                 {description ? (
-                  <span className="text-[10px] text-muted-foreground">{description}</span>
+                  <span className="text-overline text-muted-foreground">{description}</span>
                 ) : null}
               </span>
-              <IconButton
-                type="button"
-                variant="ghost"
-                size="xs"
-                className="opacity-60 hover:opacity-100"
-                onClick={() => removeTag(tag)}
-                disabled={disabled}
-              >
-                ×
-              </IconButton>
-            </span>
+            </Tag>
           )
         })}
         <input
@@ -218,6 +233,10 @@ export function TagsInput({
           data-crud-focus-target=""
           disabled={disabled}
           onFocus={() => {
+            if (suppressSuggestionsOnFocusRef.current) {
+              suppressSuggestionsOnFocusRef.current = false
+              return
+            }
             if (showSuggestionsOnFocus) {
               setTouched(true)
             }
@@ -241,6 +260,11 @@ export function TagsInput({
           }}
           onBlur={() => {
             if (disabled) return
+            if (suppressBlurCommitRef.current) {
+              suppressBlurCommitRef.current = false
+              setInput('')
+              return
+            }
             addTag(input)
             setInput('')
           }}
@@ -257,12 +281,19 @@ export function TagsInput({
                 variant="ghost"
                 size="sm"
                 className="w-full justify-start font-normal flex flex-col items-start text-xs px-1.5 py-1"
-                onMouseDown={(event) => event.preventDefault()}
-                onClick={() => addValue(option.value)}
+                onMouseDown={(event) => {
+                  suppressBlurCommitRef.current = true
+                  event.preventDefault()
+                }}
+                onClick={() => {
+                  suppressBlurCommitRef.current = false
+                  addValue(option.value)
+                  setInput('')
+                }}
               >
                 <span>{option.label}</span>
                 {option.description ? (
-                  <span className="text-[10px] text-muted-foreground">{option.description}</span>
+                  <span className="text-overline text-muted-foreground">{option.description}</span>
                 ) : null}
               </Button>
             ))}

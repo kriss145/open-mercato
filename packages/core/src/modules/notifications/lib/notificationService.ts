@@ -1,9 +1,11 @@
-import type { EntityManager } from '@mikro-orm/core'
-import type { Knex } from 'knex'
+import type { EntityManager } from '@mikro-orm/postgresql'
+import { type Kysely, sql } from 'kysely'
+import { CrudHttpError, conflict } from '@open-mercato/shared/lib/crud/errors'
 import { Notification, type NotificationStatus } from '../data/entities'
 import type { CreateNotificationInput, CreateBatchNotificationInput, CreateRoleNotificationInput, CreateFeatureNotificationInput, ExecuteActionInput } from '../data/validators'
 import type { NotificationPollData } from '@open-mercato/shared/modules/notifications/types'
-import { NOTIFICATION_EVENTS } from './events'
+import { NOTIFICATION_EVENTS, NOTIFICATION_SSE_EVENTS } from './events'
+import { findOneWithDecryption, findWithDecryption } from '@open-mercato/shared/lib/encryption/find'
 import {
   buildNotificationEntity,
   emitNotificationCreated,
@@ -12,25 +14,45 @@ import {
   type NotificationTenantContext,
 } from './notificationFactory'
 import { toNotificationDto } from './notificationMapper'
-import { getRecipientUserIdsForFeature, getRecipientUserIdsForRole } from './notificationRecipients'
+import {
+  getRecipientUserIdsForFeature,
+  getRecipientUserIdsForRole,
+  getScopedNotificationRecipientUserIds,
+} from './notificationRecipients'
 import { assertSafeNotificationHref, sanitizeNotificationActions } from './safeHref'
+import { createLogger } from '@open-mercato/shared/lib/logger'
 
-const DEBUG = process.env.NOTIFICATIONS_DEBUG === 'true'
+const logger = createLogger('notifications').child({ component: 'service' })
 
-function debug(...args: unknown[]): void {
-  if (DEBUG) {
-    console.log('[notifications]', ...args)
-  }
+function debug(message: string, ...details: unknown[]): void {
+  logger.debug(message, details.length ? { details } : undefined)
 }
 
-function getKnex(em: EntityManager): Knex {
-  return (em.getConnection() as unknown as { getKnex: () => Knex }).getKnex()
+function getDb(em: EntityManager): Kysely<any> {
+  return em.getKysely<any>()
 }
 
 const UNIQUE_NOTIFICATION_ACTIVE_STATUSES: NotificationStatus[] = ['unread', 'read', 'actioned']
 
 function normalizeOrgScope(organizationId: string | null | undefined): string | null {
   return organizationId ?? null
+}
+
+async function assertNotificationRecipientsInScope(
+  em: EntityManager,
+  recipientUserIds: string[],
+  ctx: NotificationServiceContext,
+): Promise<void> {
+  const scopedRecipientUserIds = await getScopedNotificationRecipientUserIds(
+    getDb(em),
+    ctx.tenantId,
+    normalizeOrgScope(ctx.organizationId),
+    recipientUserIds,
+  )
+
+  if (scopedRecipientUserIds.length !== recipientUserIds.length) {
+    throw new CrudHttpError(404, { error: 'Notification recipient not found' })
+  }
 }
 
 function applyNotificationContent(
@@ -75,6 +97,54 @@ function applyNotificationContent(
   notification.createdAt = new Date()
 }
 
+async function findScopedNotificationOrThrow(
+  em: EntityManager,
+  notificationId: string,
+  ctx: NotificationServiceContext,
+): Promise<Notification> {
+  const notification = await findOneWithDecryption(
+    em,
+    Notification,
+    {
+      id: notificationId,
+      recipientUserId: ctx.userId,
+      tenantId: ctx.tenantId,
+    },
+    undefined,
+    {
+      tenantId: ctx.tenantId,
+      organizationId: ctx.organizationId ?? null,
+    },
+  )
+  if (!notification) {
+    throw new CrudHttpError(404, { error: 'Notification not found' })
+  }
+  return notification
+}
+
+async function emitNotificationSseEvents(
+  eventBus: { emit: (event: string, payload: unknown) => Promise<void> },
+  notifications: Notification[],
+  ctx: NotificationServiceContext,
+  recipientUserIds: string[],
+): Promise<void> {
+  await eventBus.emit(NOTIFICATION_SSE_EVENTS.BATCH_CREATED, {
+    tenantId: ctx.tenantId,
+    organizationId: normalizeOrgScope(ctx.organizationId),
+    recipientUserIds,
+    count: notifications.length,
+  })
+
+  for (const notification of notifications) {
+    await eventBus.emit(NOTIFICATION_SSE_EVENTS.CREATED, {
+      tenantId: notification.tenantId,
+      organizationId: notification.organizationId ?? null,
+      recipientUserId: notification.recipientUserId,
+      notification: toNotificationDto(notification),
+    })
+  }
+}
+
 async function createOrRefreshNotification(
   em: EntityManager,
   input: NotificationContentInput,
@@ -85,8 +155,8 @@ async function createOrRefreshNotification(
     const orgScope = normalizeOrgScope(ctx.organizationId) ?? 'global'
     const lockKey = `notifications:${ctx.tenantId}:${orgScope}:${recipientUserId}:${input.type}:${input.groupKey}`
     try {
-      const knex = getKnex(em)
-      await knex.raw('select pg_advisory_xact_lock(hashtext(?))', [lockKey])
+      const db = getDb(em)
+      await sql`select pg_advisory_xact_lock(hashtext(${lockKey}))`.execute(db)
     } catch {
       // If advisory locks are unavailable, continue with best-effort dedupe.
     }
@@ -165,12 +235,19 @@ export function createNotificationService(deps: NotificationServiceDeps): Notifi
       const { recipientUserId, ...content } = input
       const writeEm = rootEm.fork()
       const notification = await writeEm.transactional(async (tx) => {
+        await assertNotificationRecipientsInScope(tx, [recipientUserId], ctx)
         const entity = await createOrRefreshNotification(tx, content, recipientUserId, ctx)
         await tx.flush()
         return entity
       })
 
       await emitNotificationCreated(eventBus, notification, ctx)
+      await eventBus.emit(NOTIFICATION_SSE_EVENTS.CREATED, {
+        tenantId: notification.tenantId,
+        organizationId: notification.organizationId ?? null,
+        recipientUserId: notification.recipientUserId,
+        notification: toNotificationDto(notification),
+      })
 
       return notification
     },
@@ -182,6 +259,7 @@ export function createNotificationService(deps: NotificationServiceDeps): Notifi
       const writeEm = rootEm.fork()
 
       await writeEm.transactional(async (tx) => {
+        await assertNotificationRecipientsInScope(tx, recipientUserIds, ctx)
         for (const recipientUserId of recipientUserIds) {
           const notification = await createOrRefreshNotification(tx, content, recipientUserId, ctx)
           notifications.push(notification)
@@ -190,6 +268,7 @@ export function createNotificationService(deps: NotificationServiceDeps): Notifi
       })
 
       await emitNotificationCreatedBatch(eventBus, notifications, ctx)
+      await emitNotificationSseEvents(eventBus, notifications, ctx, recipientUserIds)
 
       return notifications
     },
@@ -197,8 +276,8 @@ export function createNotificationService(deps: NotificationServiceDeps): Notifi
     async createForRole(input, ctx) {
       const em = rootEm.fork()
 
-      const knex = getKnex(em)
-      const recipientUserIds = await getRecipientUserIdsForRole(knex, ctx.tenantId, input.roleId)
+      const db = getDb(em)
+      const recipientUserIds = await getRecipientUserIdsForRole(db, ctx.tenantId, input.roleId)
       if (recipientUserIds.length === 0) {
         return []
       }
@@ -217,14 +296,15 @@ export function createNotificationService(deps: NotificationServiceDeps): Notifi
       })
 
       await emitNotificationCreatedBatch(eventBus, notifications, ctx)
+      await emitNotificationSseEvents(eventBus, notifications, ctx, uniqueRecipientUserIds)
 
       return notifications
     },
 
     async createForFeature(input, ctx) {
       const em = rootEm.fork()
-      const knex = getKnex(em)
-      const recipientUserIds = await getRecipientUserIdsForFeature(knex, ctx.tenantId, input.requiredFeature)
+      const db = getDb(em)
+      const recipientUserIds = await getRecipientUserIdsForFeature(db, ctx.tenantId, input.requiredFeature)
 
       if (recipientUserIds.length === 0) {
         debug('No users found with feature:', input.requiredFeature, 'in tenant:', ctx.tenantId)
@@ -247,17 +327,14 @@ export function createNotificationService(deps: NotificationServiceDeps): Notifi
       })
 
       await emitNotificationCreatedBatch(eventBus, notifications, ctx)
+      await emitNotificationSseEvents(eventBus, notifications, ctx, uniqueRecipientUserIds)
 
       return notifications
     },
 
     async markAsRead(notificationId, ctx) {
       const em = rootEm.fork()
-      const notification = await em.findOneOrFail(Notification, {
-        id: notificationId,
-        recipientUserId: ctx.userId,
-        tenantId: ctx.tenantId,
-      })
+      const notification = await findScopedNotificationOrThrow(em, notificationId, ctx)
 
       if (notification.status === 'unread') {
         notification.status = 'read'
@@ -276,29 +353,68 @@ export function createNotificationService(deps: NotificationServiceDeps): Notifi
 
     async markAllAsRead(ctx) {
       const em = rootEm.fork()
-      const knex = getKnex(em)
+      const db = getDb(em)
+      const applyScope = <QB extends { where: (...args: any[]) => QB }>(q: QB): QB => {
+        let chain = q
+          .where('recipient_user_id' as any, '=', ctx.userId as any)
+          .where('tenant_id' as any, '=', ctx.tenantId)
+          .where('status' as any, '=', 'unread')
+        if (ctx.organizationId) {
+          chain = chain.where('organization_id' as any, '=', ctx.organizationId)
+        }
+        return chain
+      }
 
-      const result = await knex('notifications')
-        .where({
-          recipient_user_id: ctx.userId,
-          tenant_id: ctx.tenantId,
-          status: 'unread',
-        })
-        .update({
+      const targetRows = await applyScope(
+        db
+          .selectFrom('notifications' as any)
+          .select([
+            'id' as any,
+            'organization_id' as any,
+            'recipient_user_id' as any,
+          ]),
+      ).execute() as Array<{ id: string }>
+
+      if (!targetRows.length) {
+        return 0
+      }
+
+      const updateResult = await applyScope(
+        db.updateTable('notifications' as any).set({
           status: 'read',
-          read_at: knex.fn.now(),
+          read_at: sql`now()`,
+        } as any) as any,
+      ).executeTakeFirst() as { numUpdatedRows?: bigint | number } | undefined
+      const result = Number(updateResult?.numUpdatedRows ?? targetRows.length)
+
+      const notifications = await findWithDecryption(em, Notification, {
+        id: { $in: targetRows.map((row) => row.id) },
+      }, undefined, {
+        tenantId: ctx.tenantId,
+        organizationId: ctx.organizationId ?? null,
+      })
+
+      for (const notification of notifications) {
+        await eventBus.emit(NOTIFICATION_EVENTS.READ, {
+          notificationId: notification.id,
+          userId: ctx.userId,
+          tenantId: ctx.tenantId,
         })
+
+        await eventBus.emit(NOTIFICATION_SSE_EVENTS.CREATED, {
+          tenantId: notification.tenantId,
+          organizationId: notification.organizationId ?? null,
+          recipientUserId: notification.recipientUserId,
+          notification: toNotificationDto(notification),
+        })
+      }
 
       return result
     },
 
     async dismiss(notificationId, ctx) {
       const em = rootEm.fork()
-      const notification = await em.findOneOrFail(Notification, {
-        id: notificationId,
-        recipientUserId: ctx.userId,
-        tenantId: ctx.tenantId,
-      })
+      const notification = await findScopedNotificationOrThrow(em, notificationId, ctx)
 
       notification.status = 'dismissed'
       notification.dismissedAt = new Date()
@@ -315,11 +431,7 @@ export function createNotificationService(deps: NotificationServiceDeps): Notifi
 
     async restoreDismissed(notificationId, status, ctx) {
       const em = rootEm.fork()
-      const notification = await em.findOneOrFail(Notification, {
-        id: notificationId,
-        recipientUserId: ctx.userId,
-        tenantId: ctx.tenantId,
-      })
+      const notification = await findScopedNotificationOrThrow(em, notificationId, ctx)
 
       if (notification.status !== 'dismissed') {
         return notification
@@ -349,17 +461,64 @@ export function createNotificationService(deps: NotificationServiceDeps): Notifi
 
     async executeAction(notificationId, input, ctx) {
       const em = rootEm.fork()
-      const notification = await em.findOneOrFail(Notification, {
-        id: notificationId,
-        recipientUserId: ctx.userId,
-        tenantId: ctx.tenantId,
-      })
+      const notification = await findScopedNotificationOrThrow(em, notificationId, ctx)
 
       const actionData = notification.actionData
       const action = actionData?.actions?.find((a) => a.id === input.actionId)
 
       if (!action) {
         throw new Error('Action not found')
+      }
+
+      // Reject an already-actioned notification before dispatching the command,
+      // so a retry or double-click cannot re-run the side effect.
+      if (notification.status === 'actioned') {
+        throw conflict('Notification action already executed')
+      }
+
+      const actionedAt = new Date()
+      const previousStatus = notification.status
+      const previousActionedAt = notification.actionedAt ?? null
+      const previousActionTaken = notification.actionTaken ?? null
+
+      // Atomically claim the notification so only one concurrent request can run
+      // the side-effecting command. The conditional UPDATE matches only while the
+      // notification has not been actioned yet; a losing request updates 0 rows.
+      const claimResult = (await getDb(em)
+        .updateTable('notifications' as any)
+        .set({
+          status: 'actioned',
+          actioned_at: actionedAt,
+          action_taken: input.actionId,
+        } as any)
+        .where('id' as any, '=', notification.id)
+        .where('recipient_user_id' as any, '=', ctx.userId as any)
+        .where('tenant_id' as any, '=', ctx.tenantId)
+        .where('status' as any, '!=', 'actioned')
+        .executeTakeFirst()) as { numUpdatedRows?: bigint | number } | undefined
+
+      if (Number(claimResult?.numUpdatedRows ?? 0) === 0) {
+        throw conflict('Notification action already executed')
+      }
+
+      // The claim is provisional: if the side-effecting command fails, the action
+      // never actually completed, so release the claim to its prior state. This
+      // lets the user retry the action instead of the notification being locked as
+      // `actioned` forever. Only release while we still own the claim
+      // (status = 'actioned'), so a concurrent winner's state is never clobbered.
+      const releaseClaim = async () => {
+        await getDb(em)
+          .updateTable('notifications' as any)
+          .set({
+            status: previousStatus,
+            actioned_at: previousActionedAt,
+            action_taken: previousActionTaken,
+          } as any)
+          .where('id' as any, '=', notification.id)
+          .where('recipient_user_id' as any, '=', ctx.userId as any)
+          .where('tenant_id' as any, '=', ctx.tenantId)
+          .where('status' as any, '=', 'actioned')
+          .executeTakeFirst()
       }
 
       let result: unknown = null
@@ -383,21 +542,33 @@ export function createNotificationService(deps: NotificationServiceDeps): Notifi
           organizationIds: ctx.organizationId ? [ctx.organizationId] : null,
         }
 
-        const commandResult = await commandBus.execute(action.commandId, {
-          input: commandInput,
-          ctx: commandCtx,
-          metadata: {
-            tenantId: ctx.tenantId,
-            organizationId: ctx.organizationId,
-            resourceKind: 'notifications',
-          },
-        })
+        let commandResult: { result: unknown }
+        try {
+          commandResult = await commandBus.execute(action.commandId, {
+            input: commandInput,
+            ctx: commandCtx,
+            metadata: {
+              tenantId: ctx.tenantId,
+              organizationId: ctx.organizationId,
+              resourceKind: 'notifications',
+            },
+          })
+        } catch (err) {
+          // Never let a rollback failure mask the original command error — the
+          // caller needs the real failure to decide whether to retry.
+          try {
+            await releaseClaim()
+          } catch (releaseErr) {
+            debug('failed to release notification action claim', releaseErr)
+          }
+          throw err
+        }
 
         result = commandResult.result
       }
 
       notification.status = 'actioned'
-      notification.actionedAt = new Date()
+      notification.actionedAt = actionedAt
       notification.actionTaken = input.actionId
       notification.actionResult = result as Record<string, unknown>
 
@@ -462,32 +633,33 @@ export function createNotificationService(deps: NotificationServiceDeps): Notifi
 
     async cleanupExpired() {
       const em = rootEm.fork()
-      const knex = getKnex(em)
+      const db = getDb(em)
 
-      const result = await knex('notifications')
-        .where('expires_at', '<', knex.fn.now())
-        .whereNotIn('status', ['actioned', 'dismissed'])
-        .update({
+      const updateResult = await db
+        .updateTable('notifications' as any)
+        .set({
           status: 'dismissed',
-          dismissed_at: knex.fn.now(),
-        })
+          dismissed_at: sql`now()`,
+        } as any)
+        .where('expires_at' as any, '<', sql`now()`)
+        .where('status' as any, 'not in', ['actioned', 'dismissed'])
+        .executeTakeFirst() as { numUpdatedRows?: bigint | number } | undefined
 
-      return result
+      return Number(updateResult?.numUpdatedRows ?? 0)
     },
 
     async deleteBySource(sourceEntityType, sourceEntityId, ctx) {
       const em = rootEm.fork()
-      const knex = getKnex(em)
+      const db = getDb(em)
 
-      const result = await knex('notifications')
-        .where({
-          source_entity_type: sourceEntityType,
-          source_entity_id: sourceEntityId,
-          tenant_id: ctx.tenantId,
-        })
-        .delete()
+      const deleteResult = await db
+        .deleteFrom('notifications' as any)
+        .where('source_entity_type' as any, '=', sourceEntityType)
+        .where('source_entity_id' as any, '=', sourceEntityId)
+        .where('tenant_id' as any, '=', ctx.tenantId)
+        .executeTakeFirst() as { numDeletedRows?: bigint | number } | undefined
 
-      return result
+      return Number(deleteResult?.numDeletedRows ?? 0)
     },
   }
 }

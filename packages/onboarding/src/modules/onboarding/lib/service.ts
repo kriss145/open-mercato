@@ -34,6 +34,7 @@ export class OnboardingService {
       existing.organizationName = input.organizationName
       existing.locale = input.locale ?? existing.locale ?? 'en'
       existing.termsAccepted = true
+      existing.marketingConsent = input.marketingConsent ?? false
       existing.passwordHash = passwordHash
       existing.expiresAt = expiresAt
       existing.completedAt = null
@@ -42,6 +43,9 @@ export class OnboardingService {
       existing.organizationId = null
       existing.userId = null
       existing.lastEmailSentAt = now
+      existing.preparationStartedAt = null
+      existing.preparationCompletedAt = null
+      existing.readyEmailSentAt = null
       await this.em.flush()
       return { request: existing, token }
     }
@@ -55,6 +59,7 @@ export class OnboardingService {
       organizationName: input.organizationName,
       locale: input.locale ?? 'en',
       termsAccepted: true,
+      marketingConsent: input.marketingConsent ?? false,
       passwordHash,
       expiresAt,
       processingStartedAt: null,
@@ -62,7 +67,7 @@ export class OnboardingService {
       createdAt: now,
       updatedAt: now,
     })
-    await this.em.persistAndFlush(request)
+    await this.em.persist(request).flush()
     return { request, token }
   }
 
@@ -81,16 +86,40 @@ export class OnboardingService {
     return this.em.findOne(OnboardingRequest, { tokenHash })
   }
 
-  async startProcessing(request: OnboardingRequest, startedAt: Date) {
-    request.status = 'processing'
-    request.processingStartedAt = startedAt
-    await this.em.flush()
+  async findById(id: string) {
+    return this.em.findOne(OnboardingRequest, { id })
   }
 
-  async resetProcessing(request: OnboardingRequest) {
+  async findLatestByTenantId(tenantId: string) {
+    return this.em.findOne(
+      OnboardingRequest,
+      { tenantId, deletedAt: null },
+      { orderBy: { updatedAt: 'DESC', createdAt: 'DESC' } },
+    )
+  }
+
+  async startProcessing(request: OnboardingRequest, startedAt: Date): Promise<boolean> {
+    const claimedRows = await this.em.nativeUpdate(
+      OnboardingRequest,
+      { id: request.id, status: 'pending' },
+      { status: 'processing', processingStartedAt: startedAt, updatedAt: new Date() },
+    )
+    if (claimedRows === 0) return false
+    request.status = 'processing'
+    request.processingStartedAt = startedAt
+    return true
+  }
+
+  async resetProcessing(request: OnboardingRequest): Promise<boolean> {
+    const revertedRows = await this.em.nativeUpdate(
+      OnboardingRequest,
+      { id: request.id, status: 'processing' },
+      { status: 'pending', processingStartedAt: null, updatedAt: new Date() },
+    )
+    if (revertedRows === 0) return false
     request.status = 'pending'
     request.processingStartedAt = null
-    await this.em.flush()
+    return true
   }
 
   async updateProvisioningIds(request: OnboardingRequest, data: { tenantId: string; organizationId: string; userId: string }) {
@@ -108,6 +137,48 @@ export class OnboardingService {
     request.userId = data.userId
     request.processingStartedAt = null
     request.passwordHash = null
+    await this.em.flush()
+  }
+
+  async markReadyEmailSent(request: OnboardingRequest, sentAt: Date) {
+    request.readyEmailSentAt = sentAt
+    await this.em.flush()
+  }
+
+  async claimPreparation(requestId: string, claimedAt: Date, staleBefore: Date): Promise<boolean> {
+    const claimedRows = await this.em.nativeUpdate(
+      OnboardingRequest,
+      {
+        id: requestId,
+        status: 'completed',
+        preparationCompletedAt: null,
+        $or: [
+          { preparationStartedAt: null },
+          { preparationStartedAt: { $lt: staleBefore } },
+        ],
+      },
+      { preparationStartedAt: claimedAt, updatedAt: new Date() },
+    )
+    return claimedRows > 0
+  }
+
+  async renewPreparation(requestId: string, renewedAt: Date): Promise<boolean> {
+    const renewedRows = await this.em.nativeUpdate(
+      OnboardingRequest,
+      {
+        id: requestId,
+        status: 'completed',
+        preparationCompletedAt: null,
+        preparationStartedAt: { $ne: null },
+      },
+      { preparationStartedAt: renewedAt, updatedAt: new Date() },
+    )
+    return renewedRows > 0
+  }
+
+  async markPreparationCompleted(request: OnboardingRequest, completedAt: Date) {
+    request.preparationCompletedAt = completedAt
+    request.preparationStartedAt = null
     await this.em.flush()
   }
 }

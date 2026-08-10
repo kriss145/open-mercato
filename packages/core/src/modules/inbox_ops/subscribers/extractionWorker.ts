@@ -10,12 +10,20 @@ import { buildExtractionSystemPrompt, buildExtractionUserPrompt } from '../lib/e
 import { REQUIRED_FEATURES_MAP } from '../lib/constants'
 import { fetchCatalogProductsForExtraction } from '../lib/catalogLookup'
 import { enrichOrderPayload } from '../lib/payloadEnrichment'
-import { validatePrices } from '../lib/priceValidator'
+import { validatePrices, type CatalogPricingServiceLike } from '../lib/priceValidator'
 import { extractParticipantsFromThread } from '../lib/emailParser'
 import { runExtractionWithConfiguredProvider } from '../lib/llmProvider'
 import { safeParsePayloadJson } from '../lib/validation'
 import { htmlToPlainText } from '../lib/htmlToPlainText'
+import { runWithCacheTenant } from '@open-mercato/cache'
 import { emitInboxOpsEvent } from '../events'
+import { createMessageRecordForEmail } from '../lib/messagesIntegration'
+import { resolveCache, invalidateCountsCache } from '../lib/cache'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('inbox_ops').child({ component: 'extraction-worker' })
+
+const SYSTEM_USER_ID = '00000000-0000-0000-0000-000000000000'
 
 export const metadata = {
   event: 'inbox_ops.email.received',
@@ -57,7 +65,7 @@ function tryResolve<T>(ctx: ResolverContext, name: string): T | undefined {
   try {
     return ctx.resolve<T>(name)
   } catch {
-    console.debug(`[inbox_ops:extraction] optional dependency "${name}" not available`)
+    logger.debug('Optional dependency not available', { name })
     return undefined
   }
 }
@@ -117,7 +125,7 @@ export default async function handle(payload: EmailReceivedPayload, ctx: Resolve
     { tenantId: payload.tenantId, organizationId: payload.organizationId },
   )
   if (!email) {
-    console.error(`[inbox_ops:extraction-worker] Email not found: ${payload.emailId}`)
+    logger.error('Email not found', { emailId: payload.emailId })
     return
   }
 
@@ -192,7 +200,7 @@ export default async function handle(payload: EmailReceivedPayload, ctx: Resolve
           error: email.processingError,
         })
       } catch (eventError) {
-        console.error('[inbox_ops:extraction-worker] Failed to emit email.failed event:', eventError)
+        logger.error('Failed to emit email.failed event', { err: eventError })
       }
 
       return
@@ -211,8 +219,11 @@ export default async function handle(payload: EmailReceivedPayload, ctx: Resolve
       }))
       .filter((a) => a.actionType === 'create_order' || a.actionType === 'create_quote')
 
+    const catalogPricingService = tryResolve<CatalogPricingServiceLike>(ctx, 'catalogPricingService')
     const priceDiscrepancies = await validatePrices(em, orderActions, scope,
-      entityClasses.catalogProductPrice ? { catalogProductPriceClass: entityClasses.catalogProductPrice } : undefined,
+      entityClasses.catalogProductPrice && catalogPricingService
+        ? { catalogProductPriceClass: entityClasses.catalogProductPrice, catalogPricingService }
+        : undefined,
     )
 
     // Step 4b: Check for duplicate orders by customerReference
@@ -348,6 +359,7 @@ export default async function handle(payload: EmailReceivedPayload, ctx: Resolve
       id: proposalId,
       inboxEmailId: email.id,
       summary: extractionResult.summary,
+      category: extractionResult.category || null,
       participants: enrichedParticipants,
       confidence: String(extractionResult.confidence.toFixed(2)),
       detectedLanguage: extractionResult.detectedLanguage || email.detectedLanguage,
@@ -366,6 +378,7 @@ export default async function handle(payload: EmailReceivedPayload, ctx: Resolve
       contactMatches,
       extractionResult.proposedActions,
       email.toAddress,
+      email.forwardedByAddress,
     )
 
     // Step 6d-2: Also generate create_contact for LLM-discovered unmatched participants
@@ -385,8 +398,15 @@ export default async function handle(payload: EmailReceivedPayload, ctx: Resolve
       email.toAddress,
     )
 
+    // Step 6f: Deduplicate — remove company create_contact actions when a person
+    // action with the same companyName already exists (person creation auto-creates
+    // the company, so the separate company action would be redundant).
+    const dedupedProposedActions = deduplicateCompanyActions([
+      ...autoContactActions, ...autoLinkActions, ...autoProductActions, ...extractionResult.proposedActions,
+    ])
+
     // Create actions — contact & product creation actions go first so they're executed before orders
-    const combinedProposedActions = [...autoContactActions, ...autoLinkActions, ...autoProductActions, ...extractionResult.proposedActions]
+    const combinedProposedActions = dedupedProposedActions
     const allActions = [
       ...combinedProposedActions.map((action, index) => {
         const parsedPayload = safeParsePayloadJson(action.payloadJson)
@@ -518,6 +538,39 @@ export default async function handle(payload: EmailReceivedPayload, ctx: Resolve
 
     await em.flush()
 
+    // Step 8b: Invalidate counts cache (new proposal affects counts)
+    try {
+      const cache = resolveCache(ctx)
+      await runWithCacheTenant(email.tenantId, () => invalidateCountsCache(cache, email.tenantId))
+    } catch (cacheErr) {
+      logger.warn('Cache invalidation failed (non-fatal)', { err: cacheErr })
+    }
+
+    // Step 8c: Register email as a message record (graceful degradation)
+    try {
+      await createMessageRecordForEmail(
+        {
+          id: email.id,
+          subject: email.subject,
+          cleanedText: email.cleanedText,
+          rawText: email.rawText,
+          forwardedByAddress: email.forwardedByAddress,
+          forwardedByName: email.forwardedByName,
+          status: email.status,
+        },
+        {
+          container: ctx,
+          scope: {
+            tenantId: email.tenantId,
+            organizationId: email.organizationId,
+            userId: SYSTEM_USER_ID,
+          },
+        },
+      )
+    } catch (msgErr) {
+      logger.error('Messages integration failed (non-fatal)', { err: msgErr })
+    }
+
     // Step 9: Emit events
     try {
       await emitInboxOpsEvent('inbox_ops.email.processed', {
@@ -537,7 +590,7 @@ export default async function handle(payload: EmailReceivedPayload, ctx: Resolve
         summary: proposal.summary,
       })
     } catch (eventError) {
-      console.error('[inbox_ops:extraction-worker] Failed to emit events:', eventError)
+      logger.error('Failed to emit events', { err: eventError })
     }
   } catch (err) {
     email.status = 'failed'
@@ -552,10 +605,10 @@ export default async function handle(payload: EmailReceivedPayload, ctx: Resolve
         error: email.processingError,
       })
     } catch (eventError) {
-      console.error('[inbox_ops:extraction-worker] Failed to emit email.failed event:', eventError)
+      logger.error('Failed to emit email.failed event', { err: eventError })
     }
 
-    console.error('[inbox_ops:extraction-worker] Extraction failed:', err)
+    logger.error('Extraction failed', { err })
   }
 }
 
@@ -580,6 +633,7 @@ function buildContactActionsForUnmatchedParticipants(
   contactMatches: { participant: { name: string; email: string }; match?: { contactId: string } | null }[],
   existingActions: { actionType: string; payloadJson: string }[],
   inboxAddress: string,
+  forwardedByAddress?: string,
 ): { actionType: 'create_contact'; description: string; confidence: number; requiredFeature: string; payloadJson: string }[] {
   const alreadyProposed = new Set(
     existingActions
@@ -592,14 +646,17 @@ function buildContactActionsForUnmatchedParticipants(
   )
 
   const inboxLower = (inboxAddress || '').toLowerCase()
+  const forwardedByLower = (forwardedByAddress || '').toLowerCase()
   const systemPatterns = ['noreply', 'no-reply', 'donotreply', 'mailer-daemon', 'postmaster']
 
   return contactMatches
     .filter((m) => {
       if (m.match?.contactId) return false
       const emailLower = m.participant.email.toLowerCase()
+      if (!emailLower || !emailLower.includes('@')) return false
       if (alreadyProposed.has(emailLower)) return false
       if (emailLower === inboxLower) return false
+      if (forwardedByLower && emailLower === forwardedByLower) return false
       return !systemPatterns.some((p) => emailLower.includes(p))
     })
     .map((m) => ({
@@ -842,6 +899,29 @@ function buildFullTextForExtraction(email: InboxEmail): string {
     .replace(/ {2,}/g, ' ')
     .replace(/\n{3,}/g, '\n\n')
     .trim()
+}
+
+function deduplicateCompanyActions<T extends { actionType: string; payloadJson: string }>(
+  actions: T[],
+): T[] {
+  // Collect company names that will be auto-created by person actions via companyName field
+  const personCompanyNames = new Set<string>()
+  for (const action of actions) {
+    if (action.actionType !== 'create_contact') continue
+    const payload = safeParsePayloadJson(action.payloadJson)
+    if (payload.type === 'person' && typeof payload.companyName === 'string' && payload.companyName.trim()) {
+      personCompanyNames.add(payload.companyName.trim().toLowerCase())
+    }
+  }
+  if (personCompanyNames.size === 0) return actions
+
+  return actions.filter((action) => {
+    if (action.actionType !== 'create_contact') return true
+    const payload = safeParsePayloadJson(action.payloadJson)
+    if (payload.type !== 'company') return true
+    const companyName = typeof payload.name === 'string' ? payload.name.trim().toLowerCase() : ''
+    return !companyName || !personCompanyNames.has(companyName)
+  })
 }
 
 function findPartialNameMatch(name: string, map: Map<string, string>): string | undefined {

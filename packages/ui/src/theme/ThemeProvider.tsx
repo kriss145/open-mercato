@@ -1,6 +1,10 @@
 'use client'
 
 import * as React from 'react'
+import { createContext, useContext } from 'react'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('ui').child({ component: 'ThemeProvider' })
 
 export type Theme = 'light' | 'dark' | 'system'
 
@@ -10,7 +14,7 @@ type ThemeContextValue = {
   setTheme: (theme: Theme) => void
 }
 
-const ThemeContext = React.createContext<ThemeContextValue | undefined>(undefined)
+const ThemeContext = createContext<ThemeContextValue | undefined>(undefined)
 
 const THEME_STORAGE_KEY = 'om-theme'
 
@@ -30,7 +34,7 @@ function getStoredTheme(): Theme {
     // localStorage may be unavailable in private browsing, iframes, or restricted contexts
     // Theme will default to system preference - this is expected graceful degradation
     if (process.env.NODE_ENV === 'development') {
-      console.warn('[ThemeProvider] localStorage read failed:', error)
+      logger.warn('localStorage read failed', { err: error })
     }
   }
   return 'system'
@@ -84,7 +88,7 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
     } catch (error) {
       // localStorage may be unavailable - theme still works for this session, just won't persist
       if (process.env.NODE_ENV === 'development') {
-        console.warn('[ThemeProvider] localStorage write failed:', error)
+        logger.warn('localStorage write failed', { err: error })
       }
     }
     const resolved = newTheme === 'system' ? getSystemTheme() : newTheme
@@ -106,7 +110,7 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
 }
 
 export function useTheme(): ThemeContextValue {
-  const context = React.useContext(ThemeContext)
+  const context = useContext(ThemeContext)
   if (context === undefined) {
     // Return safe defaults when not in provider (e.g., server render)
     return {
@@ -117,4 +121,3 @@ export function useTheme(): ThemeContextValue {
   }
   return context
 }
-

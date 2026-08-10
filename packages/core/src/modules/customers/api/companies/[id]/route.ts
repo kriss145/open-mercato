@@ -12,10 +12,14 @@ import {
   CustomerActivity,
   CustomerTagAssignment,
   CustomerTag,
+  CustomerLabelAssignment,
+  CustomerLabel,
   CustomerDealCompanyLink,
   CustomerDeal,
   CustomerTodoLink,
+  CustomerPersonCompanyLink,
   CustomerPersonProfile,
+  CustomerInteraction,
 } from '../../../data/entities'
 import { User } from '@open-mercato/core/modules/auth/data/entities'
 import { loadCustomFieldValues } from '@open-mercato/shared/lib/crud/custom-fields'
@@ -24,15 +28,107 @@ import {
   resolveCompanyCustomFieldRouting,
   mergeCompanyCustomFieldValues,
 } from '../../../lib/customFieldRouting'
+import { isOpenInteractionStatus, TERMINAL_INTERACTION_STATUS_LIST } from '../../../lib/interactionStatus'
+import {
+  CUSTOMER_INTERACTION_ACTIVITY_ADAPTER_SOURCE,
+  EXAMPLE_TODO_SOURCE,
+  CUSTOMER_INTERACTION_TODO_ADAPTER_SOURCE,
+  mapInteractionRecordToActivitySummary,
+  mapInteractionRecordToTodoSummary,
+} from '../../../lib/interactionCompatibility'
+import { resolveCustomerInteractionFeatureFlags } from '../../../lib/interactionFeatureFlags'
+import { hydrateCanonicalInteractions } from '../../../lib/interactionReadModel'
+import { buildEmailVisibilityMikroFilter } from '../../../lib/visibilityFilter'
+import { resolveCustomerDetailTenantScope } from '../../../lib/detailTenantScope'
 import type { QueryEngine } from '@open-mercato/shared/lib/query/types'
 import type { EntityId } from '@open-mercato/shared/modules/entities'
 import type { OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
-import { findWithDecryption } from '@open-mercato/shared/lib/encryption/find'
-import { parseBooleanFromUnknown, parseBooleanToken } from '@open-mercato/shared/lib/boolean'
+import { findOneWithDecryption, findWithDecryption } from '@open-mercato/shared/lib/encryption/find'
+import { parseBooleanFromUnknown } from '@open-mercato/shared/lib/boolean'
+import {
+  filterActivePersonCompanyLinks,
+  withActiveCustomerPersonCompanyLinkFilter,
+} from '../../../lib/personCompanyLinkTable'
+import { normalizeCustomerDetailCustomFields } from '../../detailCustomFields'
+import { isOrganizationReadAccessAllowed } from '@open-mercato/core/modules/directory/utils/organizationScopeGuard'
+import { runWithCacheTenant } from '@open-mercato/cache'
+import {
+  buildCollectionTags,
+  canonicalizeResourceTag,
+  isCrudCacheEnabled,
+  resolveCrudCache,
+} from '@open-mercato/shared/lib/crud/cache'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('customers')
+
+export const metadata = {
+  GET: { requireAuth: true, requireFeatures: ['customers.companies.view'] },
+}
 
 const paramsSchema = z.object({
   id: z.string().uuid(),
 })
+
+const COMPANY_DETAIL_CACHE_TTL_MS = 60_000
+
+// The customers write commands already invalidate these resource collections via
+// invalidateCrudCache using these exact resourceKind strings. Reusing them as
+// cache tags means the cached detail is flushed by those existing commands with
+// no new wiring (#3664, mirroring #3143). Canonicalize each kind the same way
+// invalidateCrudCache does (camelCase split + lowercase) so the tag shapes match.
+const COMPANY_DETAIL_CACHE_RESOURCE_KINDS = [
+  'customers.company',
+  'customers.address',
+  'customers.tagAssignment',
+  'customers.labelAssignment',
+  'customers.personCompanyLink',
+  'customers.interaction',
+  'customers.activity',
+] as const
+
+function buildCompanyDetailCacheTags(tenantId: string | null, organizationId: string | null): string[] {
+  const tags = new Set<string>()
+  for (const resourceKind of COMPANY_DETAIL_CACHE_RESOURCE_KINDS) {
+    const resource = canonicalizeResourceTag(resourceKind) ?? resourceKind
+    for (const tag of buildCollectionTags(resource, tenantId, [organizationId])) {
+      tags.add(tag)
+    }
+  }
+  return Array.from(tags)
+}
+
+function buildCompanyDetailCacheKey(parts: {
+  tenantId: string | null
+  organizationId: string | null
+  companyId: string
+  selectedOrganizationId: string | null
+  filterIds: string[] | null
+  allowedIds: string[] | null
+  isSuperAdmin: boolean
+  viewerUserId: string | null
+  interactionMode: string
+  includeTokens: string[]
+}): string {
+  const sortKeys = (values: string[]): string[] =>
+    [...values].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+  const filterIds = parts.filterIds ? sortKeys(parts.filterIds).join(',') : 'all'
+  const allowedIds = parts.allowedIds ? sortKeys(parts.allowedIds).join(',') : 'all'
+  const includeTokens = sortKeys(parts.includeTokens).join(',')
+  return [
+    'customers:companies:detail',
+    `tenant:${parts.tenantId ?? 'null'}`,
+    `org:${parts.organizationId ?? 'null'}`,
+    `company:${parts.companyId}`,
+    `selected:${parts.selectedOrganizationId ?? 'null'}`,
+    `filter:${filterIds}`,
+    `allowed:${allowedIds}`,
+    `super:${parts.isSuperAdmin ? '1' : '0'}`,
+    `viewer:${parts.viewerUserId ?? 'null'}`,
+    `mode:${parts.interactionMode}`,
+    `include:${includeTokens}`,
+  ].join('|')
+}
 
 function parseIncludeParams(request: Request): Set<string> {
   const url = new URL(request.url)
@@ -127,6 +223,54 @@ function readCustomField(record: Record<string, unknown>, key: string): unknown 
   return undefined
 }
 
+type CompanyDetailKpiSummary = {
+  activeDealsCount: number
+  activeDealsValue: number | null
+  dealCurrency: string | null
+  activityCount: number
+  activityTrend: { value: number; direction: 'up' | 'down' | 'unchanged' } | null
+  ltvValue: number | null
+  completedDealsCount: number
+  clientTenureYears: number | null
+}
+
+function parseDealAmount(value: string | number | null | undefined): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    if (!trimmed.length) return null
+    const parsed = Number(trimmed)
+    return Number.isNaN(parsed) ? null : parsed
+  }
+  return null
+}
+
+function computeActivityTrend(
+  timestamps: string[],
+): { value: number; direction: 'up' | 'down' | 'unchanged' } | null {
+  if (!timestamps.length) return null
+  const now = Date.now()
+  const weekMs = 7 * 86_400_000
+  let thisWeek = 0
+  let lastWeek = 0
+  timestamps.forEach((value) => {
+    const time = new Date(value).getTime()
+    if (Number.isNaN(time)) return
+    const diff = now - time
+    if (diff < 0 || diff >= weekMs * 2) return
+    if (diff < weekMs) {
+      thisWeek += 1
+      return
+    }
+    lastWeek += 1
+  })
+  if (lastWeek === 0 && thisWeek === 0) return null
+  if (lastWeek === 0) return { value: 100, direction: 'up' }
+  const pct = ((thisWeek - lastWeek) / lastWeek) * 100
+  if (Math.abs(pct) < 0.5) return { value: 0, direction: 'unchanged' }
+  return { value: Math.round(Math.abs(pct) * 100) / 100, direction: pct > 0 ? 'up' : 'down' }
+}
+
 async function resolveTodoDetails(
   queryEngine: QueryEngine,
   links: CustomerTodoLink[],
@@ -141,7 +285,7 @@ async function resolveTodoDetails(
 
   const idsBySource = new Map<string, Set<string>>()
   for (const link of links) {
-    const source = typeof link.todoSource === 'string' && link.todoSource.trim().length > 0 ? link.todoSource : 'example:todo'
+    const source = typeof link.todoSource === 'string' && link.todoSource.trim().length > 0 ? link.todoSource : EXAMPLE_TODO_SOURCE
     const id = typeof link.todoId === 'string' && link.todoId.trim().length > 0 ? link.todoId : String(link.todoId ?? '')
     if (!id) continue
     if (!idsBySource.has(source)) idsBySource.set(source, new Set<string>())
@@ -274,7 +418,7 @@ async function resolveTodoDetails(
         })
       }
     } catch (err) {
-      console.warn(`customers.companies.detail: failed to resolve todos for source ${source}`, err)
+      logger.warn('customers.companies.detail: failed to resolve todos', { source, err })
     }
   }
 
@@ -292,56 +436,258 @@ export async function GET(_req: Request, ctx: { params?: { id?: string } }) {
   const includeAddresses = includeTokens.has('addresses')
   const includeComments = includeTokens.has('comments') || includeTokens.has('notes')
   const includeDeals = includeTokens.has('deals')
+  const includeInteractions = includeTokens.has('interactions')
   const includeTodos = includeTokens.has('todos') || includeTokens.has('tasks')
   const includePeople = includeTokens.has('people')
+  const plannedPreviewLimit = 5
 
   const container = await createRequestContainer()
   const scope = await resolveOrganizationScopeForRequest({ container, auth, request: _req })
   const em = (container.resolve('em') as EntityManager)
+  const interactionFlags = await resolveCustomerInteractionFeatureFlags(container, scope?.tenantId ?? auth.tenantId)
+  const interactionMode = interactionFlags.unified ? 'canonical' : 'legacy'
 
-  const company = await em.findOne(
+  const tenantScope = resolveCustomerDetailTenantScope(parse.data.id, 'company', auth)
+  if (!tenantScope.allowed) return notFound('Company not found')
+
+  const company = await findOneWithDecryption(
+    em,
     CustomerEntity,
-    { id: parse.data.id, kind: 'company', deletedAt: null },
+    tenantScope.where,
     { populate: ['companyProfile'] },
+    {
+      tenantId: auth.tenantId ?? null,
+      organizationId: scope?.selectedId ?? auth.orgId ?? null,
+    },
   )
   if (!company) return notFound('Company not found')
 
-  if (auth.tenantId && company.tenantId !== auth.tenantId) return notFound('Company not found')
-  const allowedOrgIds = new Set<string>()
-  if (scope?.filterIds?.length) scope.filterIds.forEach((id) => allowedOrgIds.add(id))
-  else if (auth.orgId) allowedOrgIds.add(auth.orgId)
-
-  if (allowedOrgIds.size && company.organizationId && !allowedOrgIds.has(company.organizationId)) {
+  if (!isOrganizationReadAccessAllowed({ scope, auth, organizationId: company.organizationId })) {
     return forbidden('Access denied')
   }
 
-  const profile = company.companyProfile
-    ? await em.findOne(CustomerCompanyProfile, { id: company.companyProfile.id })
-    : await em.findOne(CustomerCompanyProfile, { entity: company })
+  const companyScope = {
+    tenantId: company.tenantId ?? auth.tenantId ?? null,
+    organizationId: company.organizationId ?? scope?.selectedId ?? auth.orgId ?? null,
+  }
 
-  const addresses = includeAddresses
-    ? await em.find(CustomerAddress, { entity: company.id }, { orderBy: { isPrimary: 'desc', createdAt: 'desc' } })
-    : []
-  const tagAssignments = await findWithDecryption(
-    em,
-    CustomerTagAssignment,
-    { entity: company.id },
-    { populate: ['tag'] },
-    { tenantId: company.tenantId ?? auth.tenantId ?? null, organizationId: company.organizationId ?? auth.orgId ?? null },
-  )
+  // Per-user email privacy (CRM email integration): exclude private email
+  // interactions owned by other users from every read path that returns
+  // customer_interactions. Non-email rows, shared emails, and legacy
+  // null-visibility rows pass through. v1 is strict owner-only: there is NO
+  // admin bypass — the filter ignores caller features, and
+  // `customers.email.view_private` is reserved (inert) for v2 oversight.
+  // Mirrors the people detail route. API-key callers resolve to null
+  // (no author match — shared/non-email rows only).
+  const viewerUserId = auth.isApiKey ? null : (auth.sub ?? null)
+  const emailVisibilityFilter = buildEmailVisibilityMikroFilter({
+    currentUserId: viewerUserId,
+    userFeatures: undefined,
+  })
 
-  const comments = includeComments
-    ? await em.find(CustomerComment, { entity: company.id }, { orderBy: { createdAt: 'desc' }, limit: 50 })
+  // Opt-in cache (#3664): the company existence + org read-access checks above
+  // always run, so authorization is never served from cache. Only the expensive
+  // detail sweeps below are cached. Key on tenant/org/company + the RBAC scope,
+  // viewer (email privacy), interaction mode, and the requested include set.
+  const cacheTenantId = companyScope.tenantId
+  const cache = isCrudCacheEnabled() ? resolveCrudCache(container) : null
+  const cacheKey = cache
+    ? buildCompanyDetailCacheKey({
+        tenantId: cacheTenantId,
+        organizationId: companyScope.organizationId,
+        companyId: company.id,
+        selectedOrganizationId: scope?.selectedId ?? auth.orgId ?? null,
+        filterIds: scope?.filterIds ?? null,
+        allowedIds: scope?.allowedIds ?? null,
+        isSuperAdmin: auth.isSuperAdmin === true,
+        viewerUserId,
+        interactionMode,
+        includeTokens: Array.from(includeTokens),
+      })
+    : null
+  if (cache && cacheKey) {
+    const cached = await runWithCacheTenant(cacheTenantId, () => cache.get(cacheKey))
+    if (cached) return NextResponse.json(cached)
+  }
+
+  const shouldLoadCanonicalInteractions = includeInteractions || includeActivities || includeTodos
+
+  // These reads only depend on the resolved company + scope + email visibility
+  // filter, so dispatch them together to avoid a server-side request waterfall
+  // before the detail surface can render (issue #3203).
+  const [profile, addresses, tagAssignments, labelAssignments, comments, canonicalInteractionRows] = await Promise.all([
+    company.companyProfile
+      ? findOneWithDecryption(
+          em,
+          CustomerCompanyProfile,
+          {
+            id: company.companyProfile.id,
+            tenantId: company.tenantId,
+            organizationId: company.organizationId,
+          },
+          {},
+          companyScope,
+        )
+      : findOneWithDecryption(
+          em,
+          CustomerCompanyProfile,
+          {
+            entity: company,
+            tenantId: company.tenantId,
+            organizationId: company.organizationId,
+          },
+          {},
+          companyScope,
+        ),
+    includeAddresses
+      ? findWithDecryption(
+          em,
+          CustomerAddress,
+          {
+            entity: company.id,
+            tenantId: company.tenantId,
+            organizationId: company.organizationId,
+          },
+          { orderBy: { isPrimary: 'desc', createdAt: 'desc' } },
+          companyScope,
+        )
+      : Promise.resolve<CustomerAddress[]>([]),
+    findWithDecryption(
+      em,
+      CustomerTagAssignment,
+      {
+        entity: company.id,
+        tenantId: company.tenantId,
+        organizationId: company.organizationId,
+      },
+      { populate: ['tag'] },
+      companyScope,
+    ),
+    findWithDecryption(
+      em,
+      CustomerLabelAssignment,
+      {
+        entity: company.id,
+        tenantId: company.tenantId,
+        organizationId: company.organizationId,
+      },
+      { populate: ['label'] },
+      companyScope,
+    ),
+    includeComments
+      ? findWithDecryption(
+          em,
+          CustomerComment,
+          {
+            entity: company.id,
+            tenantId: company.tenantId,
+            organizationId: company.organizationId,
+          },
+          { orderBy: { createdAt: 'desc' }, limit: 50 },
+          companyScope,
+        )
+      : Promise.resolve<CustomerComment[]>([]),
+    shouldLoadCanonicalInteractions
+      ? findWithDecryption(
+          em,
+          CustomerInteraction,
+          interactionFlags.unified
+            ? {
+                entity: company.id,
+                tenantId: company.tenantId,
+                organizationId: company.organizationId,
+                deletedAt: null,
+                ...emailVisibilityFilter,
+              }
+            : {
+                entity: company.id,
+                tenantId: company.tenantId,
+                organizationId: company.organizationId,
+                ...emailVisibilityFilter,
+              },
+          { orderBy: { scheduledAt: 'asc', createdAt: 'desc' }, limit: 100 },
+          companyScope,
+        )
+      : Promise.resolve<CustomerInteraction[]>([]),
+  ])
+  const canonicalActiveInteractions = canonicalInteractionRows.filter((interaction) => !interaction.deletedAt)
+  const canonicalInteractions = shouldLoadCanonicalInteractions
+    ? await hydrateCanonicalInteractions({
+        em,
+        container,
+        auth,
+        selectedOrganizationId: scope?.selectedId ?? auth.orgId ?? null,
+        interactions: canonicalActiveInteractions,
+        enrich: includeInteractions,
+      })
     : []
-  const activities = includeActivities
-    ? await em.find(CustomerActivity, { entity: company.id }, { orderBy: { occurredAt: 'desc', createdAt: 'desc' }, limit: 50 })
+
+  const plannedPreviewRows =
+    canonicalActiveInteractions.length > 0
+      ? canonicalActiveInteractions
+          .filter((interaction) => isOpenInteractionStatus(interaction.status) && interaction.interactionType !== 'task')
+          .sort((left, right) => {
+            const leftTime = new Date(left.scheduledAt ?? left.createdAt).getTime()
+            const rightTime = new Date(right.scheduledAt ?? right.createdAt).getTime()
+            if (leftTime === rightTime) return left.id.localeCompare(right.id)
+            return leftTime - rightTime
+          })
+          .slice(0, plannedPreviewLimit)
+      : await findWithDecryption(
+          em,
+          CustomerInteraction,
+          {
+            entity: company.id,
+            organizationId: company.organizationId,
+            tenantId: company.tenantId,
+            deletedAt: null,
+            status: { $nin: [...TERMINAL_INTERACTION_STATUS_LIST] },
+            interactionType: { $ne: 'task' },
+            ...emailVisibilityFilter,
+          },
+          { orderBy: { scheduledAt: 'ASC', createdAt: 'ASC' }, limit: plannedPreviewLimit },
+          companyScope,
+        )
+  const plannedActivitiesPreview = plannedPreviewRows.length
+    ? await hydrateCanonicalInteractions({
+        em,
+        container,
+        auth,
+        selectedOrganizationId: scope?.selectedId ?? auth.orgId ?? null,
+        interactions: plannedPreviewRows,
+        enrich: true,
+      })
     : []
-  const todoLinks = includeTodos
-    ? await em.find(CustomerTodoLink, { entity: company.id }, { orderBy: { createdAt: 'desc' }, limit: 50 })
+
+  const activities = includeActivities && !interactionFlags.unified
+    ? await findWithDecryption(
+        em,
+        CustomerActivity,
+        {
+          entity: company.id,
+          tenantId: company.tenantId,
+          organizationId: company.organizationId,
+        },
+        { orderBy: { occurredAt: 'desc', createdAt: 'desc' }, limit: 50 },
+        companyScope,
+      )
+    : []
+  const todoLinks = includeTodos && !interactionFlags.unified
+    ? await findWithDecryption(
+        em,
+        CustomerTodoLink,
+        {
+          entity: company.id,
+          tenantId: company.tenantId,
+          organizationId: company.organizationId,
+        },
+        { orderBy: { createdAt: 'desc' }, limit: 50 },
+        companyScope,
+      )
     : []
 
   let todoDetails = new Map<string, TodoDetail>()
-  if (includeTodos && todoLinks.length) {
+  if (includeTodos && !interactionFlags.unified && todoLinks.length) {
     const queryEngine = (container.resolve('queryEngine') as QueryEngine)
     try {
       todoDetails = await resolveTodoDetails(
@@ -351,9 +697,27 @@ export async function GET(_req: Request, ctx: { params?: { id?: string } }) {
         [company.organizationId ?? null, ...(scope?.filterIds ?? [])],
       )
     } catch (err) {
-      console.warn('customers.companies.detail: failed to enrich todo links', err)
+      logger.warn('customers.companies.detail: failed to enrich todo links', { err })
     }
   }
+
+  const canonicalActivityBridgeIds = new Set(
+    canonicalInteractionRows
+      .filter((interaction) => interaction.source === CUSTOMER_INTERACTION_ACTIVITY_ADAPTER_SOURCE)
+      .map((interaction) => interaction.id),
+  )
+  const canonicalTodoBridgeIds = new Set(
+    canonicalInteractionRows
+      .filter((interaction) => interaction.source === CUSTOMER_INTERACTION_TODO_ADAPTER_SOURCE)
+      .map((interaction) => interaction.id),
+  )
+
+  const canonicalActivityItems = canonicalInteractions
+    .filter((interaction) => interaction.interactionType !== 'task')
+    .map((interaction) => mapInteractionRecordToActivitySummary(interaction))
+  const canonicalTodoItems = canonicalInteractions
+    .filter((interaction) => interaction.interactionType === 'task')
+    .map((interaction) => mapInteractionRecordToTodoSummary(interaction))
 
   const authorIds = new Set<string>()
   if (includeActivities) {
@@ -366,13 +730,21 @@ export async function GET(_req: Request, ctx: { params?: { id?: string } }) {
       if (comment.authorUserId) authorIds.add(comment.authorUserId)
     }
   }
-  const viewerUserId = auth.isApiKey ? null : auth.sub ?? null
   if (viewerUserId) authorIds.add(viewerUserId)
 
   let userMap = new Map<string, { name: string | null; email: string | null }>()
   if (authorIds.size) {
     const authorIdList = Array.from(authorIds)
-    const users = await em.find(User, { id: { $in: authorIdList } })
+    const users = await findWithDecryption(
+      em,
+      User,
+      {
+        id: { $in: authorIdList },
+        tenantId: company.tenantId,
+      },
+      {},
+      companyScope,
+    )
     userMap = new Map(
       users.map((user) => [
         user.id,
@@ -389,66 +761,304 @@ export async function GET(_req: Request, ctx: { params?: { id?: string } }) {
     const dealLinks = await findWithDecryption(
       em,
       CustomerDealCompanyLink,
-      { company: company.id },
+      {
+        company: company.id,
+      },
       { populate: ['deal'] },
-      { tenantId: company.tenantId ?? auth.tenantId ?? null, organizationId: company.organizationId ?? auth.orgId ?? null },
+      companyScope,
     )
     deals = dealLinks
       .map((link) => (link.deal as CustomerDeal | string | null) ?? null)
-      .filter((deal): deal is CustomerDeal => !!deal && typeof deal !== 'string')
+      .filter(
+        (deal): deal is CustomerDeal =>
+          !!deal &&
+          typeof deal !== 'string' &&
+          deal.tenantId === company.tenantId &&
+          deal.organizationId === company.organizationId,
+      )
   }
 
-  let relatedPeople: Array<{ entity: CustomerEntity; profile: CustomerPersonProfile | null }> = []
+  const dealLinksForMetrics = includeDeals
+    ? deals
+    : (
+        await findWithDecryption(
+          em,
+          CustomerDealCompanyLink,
+          {
+            company: company.id,
+          },
+          { populate: ['deal'] },
+          companyScope,
+        )
+      )
+        .map((link) => (link.deal as CustomerDeal | string | null) ?? null)
+        .filter(
+          (deal): deal is CustomerDeal =>
+            !!deal &&
+            typeof deal !== 'string' &&
+            deal.tenantId === company.tenantId &&
+            deal.organizationId === company.organizationId,
+        )
+
+  let relatedPeople: Array<{
+    entity: CustomerEntity
+    profile: CustomerPersonProfile | null
+    linkedAt: string | null
+  }> = []
   if (includePeople) {
-    const profiles = await em.find(
-      CustomerPersonProfile,
-      { company: company.id, entity: { deletedAt: null } },
-      { populate: ['entity'] },
-    )
-    relatedPeople = profiles.reduce<Array<{ entity: CustomerEntity; profile: CustomerPersonProfile | null }>>(
-      (acc, entry) => {
-        const entity = entry.entity as CustomerEntity | null
-        if (!entity || entity.kind !== 'person' || entity.deletedAt) return acc
-        acc.push({ entity, profile: entry ?? null })
-        return acc
-      },
-      [],
-    )
-  }
-
-  const entityCustomFieldValues = await loadCustomFieldValues({
-    em,
-    entityId: E.customers.customer_entity,
-    recordIds: [company.id],
-    tenantIdByRecord: { [company.id]: company.tenantId ?? null },
-    organizationIdByRecord: { [company.id]: company.organizationId ?? null },
-    tenantFallbacks: [
-      company.tenantId ?? auth.tenantId ?? null,
-    ].filter((v): v is string => !!v),
-  })
-  let profileCustomFieldValues: Record<string, Record<string, unknown>> = {}
-  const profileId = profile?.id ?? null
-  if (profileId) {
-    profileCustomFieldValues = await loadCustomFieldValues({
+    const peopleDecryptionScope = {
+      tenantId: company.tenantId ?? auth.tenantId ?? null,
+      organizationId: company.organizationId ?? scope?.selectedId ?? auth.orgId ?? null,
+    }
+    const relatedPeopleById = new Map<
+      string,
+      { entity: CustomerEntity; profile: CustomerPersonProfile | null; linkedAt: string | null }
+    >()
+    const companyLinkWhere = await withActiveCustomerPersonCompanyLinkFilter(
       em,
-      entityId: E.customers.customer_company_profile,
-      recordIds: [profileId],
-      tenantIdByRecord: { [profileId]: profile?.tenantId ?? null },
-      organizationIdByRecord: { [profileId]: profile?.organizationId ?? null },
-      tenantFallbacks: [
-        profile?.tenantId ?? company.tenantId ?? auth.tenantId ?? null,
-      ].filter((v): v is string => !!v),
+      {
+        company: company.id,
+        organizationId: company.organizationId,
+        tenantId: company.tenantId,
+      },
+      'customers.companies.GET',
+    )
+    const companyLinks = filterActivePersonCompanyLinks(
+      await findWithDecryption(
+        em,
+        CustomerPersonCompanyLink,
+        companyLinkWhere,
+        {
+          populate: ['person', 'person.personProfile'],
+          orderBy: { isPrimary: 'desc', createdAt: 'asc' },
+        },
+        peopleDecryptionScope,
+      ),
+    )
+    companyLinks.forEach((link) => {
+      const entity = typeof link.person === 'string' ? null : link.person
+      if (!entity || entity.kind !== 'person' || entity.deletedAt) return
+      const personProfile =
+        entity.personProfile && typeof entity.personProfile !== 'string'
+          ? entity.personProfile
+          : null
+      relatedPeopleById.set(entity.id, {
+        entity,
+        profile: personProfile,
+        linkedAt: link.createdAt instanceof Date ? link.createdAt.toISOString() : null,
+      })
     })
+
+    const profiles = await findWithDecryption(
+      em,
+      CustomerPersonProfile,
+      {
+        company: company.id,
+        tenantId: company.tenantId,
+        organizationId: company.organizationId,
+        entity: { deletedAt: null },
+      },
+      { populate: ['entity'] },
+      peopleDecryptionScope,
+    )
+    profiles.forEach((entry) => {
+      const entity = entry.entity as CustomerEntity | null
+      if (!entity || entity.kind !== 'person' || entity.deletedAt) return
+      if (!relatedPeopleById.has(entity.id)) {
+        relatedPeopleById.set(entity.id, {
+          entity,
+          profile: entry ?? null,
+          linkedAt: entry.createdAt instanceof Date ? entry.createdAt.toISOString() : null,
+        })
+      }
+    })
+    relatedPeople = Array.from(relatedPeopleById.values())
   }
 
-  const routing = await resolveCompanyCustomFieldRouting(em, company.tenantId ?? null, company.organizationId ?? null)
-  const customFields = mergeCompanyCustomFieldValues(
-    routing,
-    entityCustomFieldValues?.[company.id] ?? {},
-    profileId ? profileCustomFieldValues?.[profileId] ?? {} : {},
+  // Entity custom fields, profile custom fields, and the routing lookup do not
+  // depend on each other (profileId is already resolved above), so load them in
+  // parallel instead of three sequential awaits (issue #3203).
+  const profileId = profile?.id ?? null
+  const [entityCustomFieldValues, profileCustomFieldValues, routing] = await Promise.all([
+    loadCustomFieldValues({
+      em,
+      entityId: E.customers.customer_entity,
+      recordIds: [company.id],
+      tenantIdByRecord: { [company.id]: company.tenantId ?? null },
+      organizationIdByRecord: { [company.id]: company.organizationId ?? null },
+      tenantFallbacks: [
+        company.tenantId ?? auth.tenantId ?? null,
+      ].filter((v): v is string => !!v),
+    }),
+    profileId
+      ? loadCustomFieldValues({
+          em,
+          entityId: E.customers.customer_company_profile,
+          recordIds: [profileId],
+          tenantIdByRecord: { [profileId]: profile?.tenantId ?? null },
+          organizationIdByRecord: { [profileId]: profile?.organizationId ?? null },
+          tenantFallbacks: [
+            profile?.tenantId ?? company.tenantId ?? auth.tenantId ?? null,
+          ].filter((v): v is string => !!v),
+        })
+      : Promise.resolve<Record<string, Record<string, unknown>>>({}),
+    resolveCompanyCustomFieldRouting(em, company.tenantId ?? null, company.organizationId ?? null),
+  ])
+  const customFields = normalizeCustomerDetailCustomFields(
+    mergeCompanyCustomFieldValues(
+      routing,
+      entityCustomFieldValues?.[company.id] ?? {},
+      profileId ? profileCustomFieldValues?.[profileId] ?? {} : {},
+    ),
   )
 
-  return NextResponse.json({
+  // The count queries, related-people fallback, and KPI interaction fallback are
+  // all independent of each other; dispatch them together rather than awaiting
+  // each inline so the response counts/KPIs are assembled in one parallel round
+  // instead of a waterfall (issue #3203).
+  const peopleCountQuery = includePeople
+    ? Promise.resolve(relatedPeople.length)
+    : (async () => {
+        const peopleLinkWhere = await withActiveCustomerPersonCompanyLinkFilter(
+          em,
+          {
+            company: company.id,
+            organizationId: company.organizationId,
+            tenantId: company.tenantId,
+          },
+          'customers.companies.GET',
+        )
+        return filterActivePersonCompanyLinks(
+          await findWithDecryption(
+            em,
+            CustomerPersonCompanyLink,
+            peopleLinkWhere,
+            {},
+            { tenantId: company.tenantId, organizationId: company.organizationId },
+          ),
+        ).length
+      })()
+  const [
+    activityCount,
+    interactionCount,
+    todoCount,
+    commentsCount,
+    addressesCount,
+    peopleCount,
+    kpiInteractionRows,
+  ] = await Promise.all([
+    em.count(CustomerInteraction, {
+      entity: company.id,
+      organizationId: company.organizationId,
+      tenantId: company.tenantId,
+      deletedAt: null,
+      interactionType: { $ne: 'task' },
+      ...emailVisibilityFilter,
+    }),
+    em.count(CustomerInteraction, {
+      entity: company.id,
+      organizationId: company.organizationId,
+      tenantId: company.tenantId,
+      deletedAt: null,
+      ...emailVisibilityFilter,
+    }),
+    interactionFlags.unified
+      ? em.count(CustomerInteraction, {
+          entity: company.id,
+          organizationId: company.organizationId,
+          tenantId: company.tenantId,
+          deletedAt: null,
+          interactionType: 'task',
+        })
+      : em.count(CustomerTodoLink, {
+          entity: company.id,
+          organizationId: company.organizationId,
+          tenantId: company.tenantId,
+        }),
+    includeComments
+      ? Promise.resolve(comments.length)
+      : em.count(CustomerComment, {
+          entity: company.id,
+          organizationId: company.organizationId,
+          tenantId: company.tenantId,
+        }),
+    includeAddresses
+      ? Promise.resolve(addresses.length)
+      : em.count(CustomerAddress, {
+          entity: company.id,
+          organizationId: company.organizationId,
+          tenantId: company.tenantId,
+        }),
+    peopleCountQuery,
+    canonicalActiveInteractions.length
+      ? Promise.resolve(canonicalActiveInteractions)
+      : findWithDecryption(
+          em,
+          CustomerInteraction,
+          {
+            entity: company.id,
+            organizationId: company.organizationId,
+            tenantId: company.tenantId,
+            deletedAt: null,
+            ...emailVisibilityFilter,
+          },
+          {
+            fields: ['id', 'occurredAt', 'scheduledAt', 'createdAt'],
+            orderBy: { createdAt: 'DESC' },
+          },
+          { tenantId: company.tenantId, organizationId: company.organizationId },
+        ),
+  ])
+  const activityTrend = computeActivityTrend(
+    kpiInteractionRows
+      .map((interaction) => interaction.occurredAt ?? interaction.scheduledAt ?? interaction.createdAt)
+      .map((value) => (value instanceof Date ? value.toISOString() : typeof value === 'string' ? value : ''))
+      .filter((value) => value.length > 0),
+  )
+  const activeDeals = dealLinksForMetrics.filter(
+    (deal) => deal.status !== 'won' && deal.status !== 'lost' && deal.status !== 'closed',
+  )
+  const wonDeals = dealLinksForMetrics.filter((deal) => deal.status === 'won')
+  const activeDealsValue = activeDeals.reduce((sum, deal) => sum + (parseDealAmount(deal.valueAmount) ?? 0), 0)
+  const ltvValue = wonDeals.length
+    ? wonDeals.reduce((sum, deal) => sum + (parseDealAmount(deal.valueAmount) ?? 0), 0)
+    : null
+  const earliestInteractionTime = kpiInteractionRows.reduce<number | null>((earliest, interaction) => {
+    const candidate = interaction.occurredAt ?? interaction.scheduledAt ?? interaction.createdAt
+    const time = candidate instanceof Date ? candidate.getTime() : new Date(candidate).getTime()
+    if (Number.isNaN(time)) return earliest
+    if (earliest === null) return time
+    return Math.min(earliest, time)
+  }, null)
+  const companyKpis: CompanyDetailKpiSummary = {
+    activeDealsCount: activeDeals.length,
+    activeDealsValue: activeDeals.length ? activeDealsValue : null,
+    dealCurrency:
+      activeDeals[0]?.valueCurrency ??
+      dealLinksForMetrics[0]?.valueCurrency ??
+      null,
+    activityCount,
+    activityTrend,
+    ltvValue,
+    completedDealsCount: wonDeals.length,
+    clientTenureYears:
+      earliestInteractionTime === null
+        ? null
+        : Math.floor((Date.now() - earliestInteractionTime) / (365.25 * 86_400_000)),
+  }
+  const counts = {
+    tags: tagAssignments.length + labelAssignments.length,
+    comments: commentsCount,
+    activities: activityCount,
+    interactions: interactionCount,
+    todos: todoCount,
+    deals: includeDeals ? deals.length : dealLinksForMetrics.length,
+    people: peopleCount,
+    addresses: addressesCount,
+  }
+
+  const payload = {
+    interactionMode,
     company: {
       id: company.id,
       displayName: company.displayName,
@@ -467,6 +1077,8 @@ export async function GET(_req: Request, ctx: { params?: { id?: string } }) {
       organizationId: company.organizationId,
       tenantId: company.tenantId,
       isActive: company.isActive,
+      temperature: company.temperature ?? null,
+      renewalQuarter: company.renewalQuarter ?? null,
       createdAt: company.createdAt.toISOString(),
       updatedAt: company.updatedAt.toISOString(),
     },
@@ -483,7 +1095,16 @@ export async function GET(_req: Request, ctx: { params?: { id?: string } }) {
         }
       : null,
     customFields,
-    tags: serializeTags(tagAssignments),
+    tags: [
+      ...serializeTags(tagAssignments),
+      ...labelAssignments
+        .map((assignment) => {
+          const label = assignment.label as CustomerLabel | string | null
+          if (!label || typeof label === 'string') return null
+          return { id: label.id, label: label.label, color: null }
+        })
+        .filter((tag): tag is { id: string; label: string; color: null } => tag !== null),
+    ],
     addresses: includeAddresses
       ? addresses.map((address) => ({
           id: address.id,
@@ -520,30 +1141,56 @@ export async function GET(_req: Request, ctx: { params?: { id?: string } }) {
         })
       : [],
     activities: includeActivities
-      ? activities.map((activity) => ({
-          id: activity.id,
-          activityType: activity.activityType,
-          subject: activity.subject,
-          body: activity.body,
-          occurredAt: activity.occurredAt ? activity.occurredAt.toISOString() : null,
-          dealId: activity.deal ? (typeof activity.deal === 'string' ? activity.deal : activity.deal.id) : null,
-          authorUserId: activity.authorUserId,
-          authorName: activity.authorUserId ? userMap.get(activity.authorUserId)?.name ?? null : null,
-          authorEmail: activity.authorUserId ? userMap.get(activity.authorUserId)?.email ?? null : null,
-          createdAt: activity.createdAt.toISOString(),
-          appearanceIcon: activity.appearanceIcon ?? null,
-          appearanceColor: activity.appearanceColor ?? null,
-        }))
+      ? (
+          interactionFlags.unified
+            ? canonicalActivityItems
+            : [
+                ...activities
+                  .filter((activity) => !canonicalActivityBridgeIds.has(activity.id))
+                  .map((activity) => ({
+                    id: activity.id,
+                    activityType: activity.activityType,
+                    subject: activity.subject,
+                    body: activity.body,
+                    occurredAt: activity.occurredAt ? activity.occurredAt.toISOString() : null,
+                    dealId: activity.deal ? (typeof activity.deal === 'string' ? activity.deal : activity.deal.id) : null,
+                    authorUserId: activity.authorUserId,
+                    authorName: activity.authorUserId ? userMap.get(activity.authorUserId)?.name ?? null : null,
+                    authorEmail: activity.authorUserId ? userMap.get(activity.authorUserId)?.email ?? null : null,
+                    createdAt: activity.createdAt.toISOString(),
+                    appearanceIcon: activity.appearanceIcon ?? null,
+                    appearanceColor: activity.appearanceColor ?? null,
+                  })),
+                ...canonicalActivityItems.filter(
+                  (activity) =>
+                    canonicalInteractions.some(
+                      (interaction) =>
+                        interaction.id === activity.id &&
+                        interaction.source === CUSTOMER_INTERACTION_ACTIVITY_ADAPTER_SOURCE,
+                    ),
+                ),
+              ].sort((left, right) => {
+                const leftTime = new Date(left.occurredAt ?? left.createdAt).getTime()
+                const rightTime = new Date(right.occurredAt ?? right.createdAt).getTime()
+                if (leftTime === rightTime) return right.id.localeCompare(left.id)
+                return rightTime - leftTime
+              }).slice(0, 50)
+        )
       : [],
-    deals: includeDeals
-      ? deals.map((deal) => ({
-          id: deal.id,
-          title: deal.title,
-          status: deal.status,
-          pipelineStage: deal.pipelineStage,
-          valueAmount: deal.valueAmount,
-          valueCurrency: deal.valueCurrency,
-          probability: deal.probability,
+    interactions: includeInteractions
+      ? canonicalInteractions
+      : [],
+      deals: includeDeals
+        ? deals.map((deal) => ({
+            id: deal.id,
+            title: deal.title,
+            status: deal.status,
+            pipelineStage: deal.pipelineStage,
+            pipelineId: deal.pipelineId ?? null,
+            pipelineStageId: deal.pipelineStageId ?? null,
+            valueAmount: deal.valueAmount,
+            valueCurrency: deal.valueCurrency,
+            probability: deal.probability,
           expectedCloseAt: deal.expectedCloseAt ? deal.expectedCloseAt.toISOString() : null,
           ownerUserId: deal.ownerUserId,
           source: deal.source,
@@ -552,29 +1199,50 @@ export async function GET(_req: Request, ctx: { params?: { id?: string } }) {
         }))
       : [],
     todos: includeTodos
-      ? todoLinks.map((link) => {
-          const source = typeof link.todoSource === 'string' && link.todoSource.trim().length > 0 ? link.todoSource : 'example:todo'
-          const key = `${source}:${link.todoId}`
-          const detail = todoDetails.get(key)
-          return {
-            id: link.id,
-            todoId: link.todoId,
-            todoSource: source,
-            createdAt: link.createdAt.toISOString(),
-            createdByUserId: link.createdByUserId,
-            title: detail?.title ?? null,
-            isDone: detail?.isDone ?? null,
-            priority: detail?.priority ?? null,
-            severity: detail?.severity ?? null,
-            description: detail?.description ?? null,
-            dueAt: detail?.dueAt ?? null,
-            todoOrganizationId: detail?.organizationId ?? null,
-            customValues: detail?.customValues ?? null,
-          }
-        })
+      ? (
+          interactionFlags.unified
+            ? canonicalTodoItems
+            : [
+                  ...todoLinks
+                    .filter((link) => !canonicalTodoBridgeIds.has(link.todoId))
+                    .map((link) => {
+                      const source = typeof link.todoSource === 'string' && link.todoSource.trim().length > 0 ? link.todoSource : EXAMPLE_TODO_SOURCE
+                    const key = `${source}:${link.todoId}`
+                    const detail = todoDetails.get(key)
+                    return {
+                      id: link.id,
+                      todoId: link.todoId,
+                      todoSource: source,
+                      createdAt: link.createdAt.toISOString(),
+                      createdByUserId: link.createdByUserId,
+                      title: detail?.title ?? null,
+                      isDone: detail?.isDone ?? null,
+                      priority: detail?.priority ?? null,
+                      severity: detail?.severity ?? null,
+                      description: detail?.description ?? null,
+                      dueAt: detail?.dueAt ?? null,
+                      todoOrganizationId: detail?.organizationId ?? null,
+                      customValues: detail?.customValues ?? null,
+                    }
+                  }),
+                ...canonicalTodoItems.filter(
+                  (todo) =>
+                    canonicalInteractions.some(
+                      (interaction) =>
+                        interaction.id === todo.todoId &&
+                        interaction.source === CUSTOMER_INTERACTION_TODO_ADAPTER_SOURCE,
+                    ),
+                ),
+              ].sort((left, right) => {
+                const leftTime = new Date(left.createdAt).getTime()
+                const rightTime = new Date(right.createdAt).getTime()
+                if (leftTime === rightTime) return right.id.localeCompare(left.id)
+                return rightTime - leftTime
+              }).slice(0, 50)
+        )
       : [],
     people: includePeople
-      ? relatedPeople.map(({ entity, profile: personProfile }) => ({
+      ? relatedPeople.map(({ entity, profile: personProfile, linkedAt }) => ({
           id: entity.id,
           displayName: entity.displayName,
           primaryEmail: entity.primaryEmail ?? null,
@@ -585,24 +1253,46 @@ export async function GET(_req: Request, ctx: { params?: { id?: string } }) {
           department: personProfile?.department ?? null,
           createdAt: entity.createdAt.toISOString(),
           organizationId: entity.organizationId,
+          source: entity.source ?? null,
+          temperature: entity.temperature ?? null,
+          linkedAt,
         }))
       : [],
+    plannedActivitiesPreview,
+    counts,
+    kpis: companyKpis,
     viewer: {
       userId: viewerUserId,
       name: viewerUserId ? userMap.get(viewerUserId)?.name ?? null : null,
       email: viewerUserId ? userMap.get(viewerUserId)?.email ?? auth.email ?? null : auth.email ?? null,
     },
-  })
+  }
+
+  if (cache && cacheKey) {
+    try {
+      await runWithCacheTenant(cacheTenantId, () =>
+        cache.set(cacheKey, payload, {
+          ttl: COMPANY_DETAIL_CACHE_TTL_MS,
+          tags: buildCompanyDetailCacheTags(cacheTenantId, companyScope.organizationId),
+        }),
+      )
+    } catch (err) {
+      logger.warn('Failed to set company detail cache', { component: 'companies', err })
+    }
+  }
+
+  return NextResponse.json(payload)
 }
 
 const companyDetailQuerySchema = z.object({
   include: z
     .string()
     .optional()
-    .describe('Comma-separated list of relations to include (addresses, comments, activities, deals, todos, people).'),
+    .describe('Comma-separated list of relations to include (addresses, comments, activities, interactions, deals, todos, people).'),
 }).passthrough()
 
 const companyDetailResponseSchema = z.object({
+  interactionMode: z.enum(['canonical', 'legacy']),
   company: z.object({
     id: z.string().uuid(),
     displayName: z.string().nullable().optional(),
@@ -621,6 +1311,8 @@ const companyDetailResponseSchema = z.object({
     organizationId: z.string().uuid().nullable().optional(),
     tenantId: z.string().uuid().nullable().optional(),
     isActive: z.boolean().optional(),
+    temperature: z.string().nullable().optional(),
+    renewalQuarter: z.string().nullable().optional(),
     createdAt: z.string(),
     updatedAt: z.string(),
   }),
@@ -692,6 +1384,34 @@ const companyDetailResponseSchema = z.object({
       appearanceColor: z.string().nullable().optional(),
     }),
   ),
+  interactions: z.array(
+    z.object({
+      id: z.string().uuid(),
+      entityId: z.string().uuid().nullable().optional(),
+      interactionType: z.string(),
+      title: z.string().nullable().optional(),
+      body: z.string().nullable().optional(),
+      status: z.string(),
+      scheduledAt: z.string().nullable().optional(),
+      occurredAt: z.string().nullable().optional(),
+      priority: z.number().nullable().optional(),
+      authorUserId: z.string().uuid().nullable().optional(),
+      ownerUserId: z.string().uuid().nullable().optional(),
+      dealId: z.string().uuid().nullable().optional(),
+      organizationId: z.string().uuid().nullable().optional(),
+      tenantId: z.string().uuid().nullable().optional(),
+      authorName: z.string().nullable().optional(),
+      authorEmail: z.string().nullable().optional(),
+      dealTitle: z.string().nullable().optional(),
+      customValues: z.record(z.string(), z.unknown()).nullable().optional(),
+      appearanceIcon: z.string().nullable().optional(),
+      appearanceColor: z.string().nullable().optional(),
+      source: z.string().nullable().optional(),
+      _integrations: z.record(z.string(), z.unknown()).optional(),
+      createdAt: z.string(),
+      updatedAt: z.string(),
+    }),
+  ),
   deals: z.array(
     z.object({
       id: z.string().uuid(),
@@ -737,6 +1457,9 @@ const companyDetailResponseSchema = z.object({
       department: z.string().nullable().optional(),
       createdAt: z.string(),
       organizationId: z.string().uuid().nullable().optional(),
+      source: z.string().nullable().optional(),
+      temperature: z.string().nullable().optional(),
+      linkedAt: z.string().nullable().optional(),
     }),
   ),
   viewer: z.object({
@@ -756,7 +1479,7 @@ export const openApi: OpenApiRouteDoc = {
   methods: {
     GET: {
       summary: 'Fetch company with related data',
-      description: 'Returns a company customer record with optional related resources such as addresses, comments, activities, deals, todos, and linked people.',
+      description: 'Returns a company customer record with optional related resources such as addresses, comments, activities, interactions, deals, todos, and linked people.',
       query: companyDetailQuerySchema,
       responses: [
         { status: 200, description: 'Company detail payload', schema: companyDetailResponseSchema },

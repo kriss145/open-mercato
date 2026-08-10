@@ -1,4 +1,5 @@
 # Full stack with app in dev mode: mounted source + yarn dev (watch).
+# Before first run: cp .env.example .env && yarn install
 # Usage: docker compose -f docker-compose.fullapp.dev.yml up --build
 
 services:
@@ -6,9 +7,14 @@ services:
     build:
       context: .
       target: dev
-    image: open-mercato/app:${DEPLOY_ENV:-local}-dev
+      args:
+        - OPEN_MERCATO_DOCKER_REGISTRY_HOST=host.docker.internal
+      extra_hosts:
+        - "host.docker.internal:host-gateway"
     user: "0"
     command: ["/bin/sh", "/app/docker/scripts/dev-entrypoint.sh"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - .:/app
       - app_node_modules:/app/node_modules
@@ -26,15 +32,26 @@ services:
       TENANT_DATA_ENCRYPTION_DEBUG: ${TENANT_DATA_ENCRYPTION_DEBUG:-false}
       TENANT_DATA_ENCRYPTION_FALLBACK_KEY: ${TENANT_DATA_ENCRYPTION_FALLBACK_KEY:-dev-tenant-encryption-fallback-key-32chars}
       NODE_ENV: development
+      NODE_OPTIONS: ${NODE_OPTIONS:---max-old-space-size=3072}
       DEPLOY_ENV: ${DEPLOY_ENV:-local}
       PORT: 3000
       DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-open-mercato}
       JWT_SECRET: ${JWT_SECRET:-JWT}
       APP_URL: ${APP_URL:-http://localhost:3000}
+      # Additional trusted app/dev origins for the Open Mercato origin allowlist (resolveAllowedDevOrigins)
+      APP_ALLOWED_ORIGINS: ${APP_ALLOWED_ORIGINS:-}
       CACHE_REDIS_URL: redis://redis:6379
       CACHE_STRATEGY: ${CACHE_STRATEGY:-redis}
       ENABLE_CRUD_API_CACHE: ${ENABLE_CRUD_API_CACHE:-true}
+      OM_AI_PROVIDER: ${OM_AI_PROVIDER:-openai}
+      OM_AI_MODEL: ${OM_AI_MODEL:-gpt-5-mini}
+      OPENCODE_PROVIDER: ${OPENCODE_PROVIDER:-}
+      OPENCODE_MODEL: ${OPENCODE_MODEL:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GOOGLE_GENERATIVE_AI_API_KEY: ${GOOGLE_GENERATIVE_AI_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-}
       MEILISEARCH_HOST: http://meilisearch:7700
       MEILISEARCH_API_KEY: ${MEILISEARCH_API_KEY:-meilisearch-dev-key}
       MEILISEARCH_MASTER_KEY: ${MEILISEARCH_MASTER_KEY:-meilisearch-dev-key}
@@ -48,6 +65,7 @@ services:
       ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
       OM_INIT_SUPERADMIN_EMAIL: ${OM_INIT_SUPERADMIN_EMAIL:-}
       OM_INIT_SUPERADMIN_PASSWORD: ${OM_INIT_SUPERADMIN_PASSWORD:-password}
+      OPEN_MERCATO_DOCKER_REGISTRY_HOST: ${OPEN_MERCATO_DOCKER_REGISTRY_HOST:-host.docker.internal}
     depends_on:
       postgres:
         condition: service_healthy
@@ -60,7 +78,6 @@ services:
 
   postgres:
     image: pgvector/pgvector:pg17-trixie
-    container_name: mercato-postgres-${DEPLOY_ENV:-local}
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
@@ -78,9 +95,10 @@ services:
 
   redis:
     image: redis:7-alpine
-    container_name: mercato-redis-${DEPLOY_ENV:-local}
     volumes:
+      - ./docker/redis/redis.conf:/usr/local/etc/redis/redis.conf
       - redis_data:/data
+    command: redis-server /usr/local/etc/redis/redis.conf --maxmemory ${REDIS_MAXMEMORY:-512mb}
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -91,7 +109,6 @@ services:
 
   meilisearch:
     image: getmeili/meilisearch:v1.11
-    container_name: mercato-meilisearch-${DEPLOY_ENV:-local}
     restart: unless-stopped
     environment:
       MEILI_ENV: development
@@ -100,30 +117,44 @@ services:
     volumes:
       - meilisearch_data:/meili_data
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:7700/health"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7700/health"]
       interval: 10s
       timeout: 5s
       retries: 5
     networks:
       - mercato-network-fullapp
 
+  localstack:
+    image: localstack/localstack:latest
+    restart: unless-stopped
+    profiles:
+      - storage-s3
+    ports:
+      - "${LOCALSTACK_PORT:-4566}:4566"
+    environment:
+      SERVICES: s3
+      AWS_DEFAULT_REGION: us-east-1
+      LOCALSTACK_HOST: localhost
+    volumes:
+      - localstack_data:/var/lib/localstack
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - mercato-network-fullapp
+
 volumes:
   postgres_data:
-    name: mercato-postgres-data-${DEPLOY_ENV:-local}
   redis_data:
-    name: mercato-redis-data-${DEPLOY_ENV:-local}
   meilisearch_data:
-    name: mercato-meilisearch-data-${DEPLOY_ENV:-local}
+  localstack_data:
   init_marker:
-    name: mercato-init-marker-${DEPLOY_ENV:-local}
   attachments_storage:
-    name: mercato-attachments-storage-${DEPLOY_ENV:-local}
   app_node_modules:
-    name: mercato-app-node-modules-${DEPLOY_ENV:-local}
   app_next:
-    name: mercato-app-next-${DEPLOY_ENV:-local}
 
 networks:
   mercato-network-fullapp:
-    name: mercato-network-${DEPLOY_ENV:-local}
     driver: bridge

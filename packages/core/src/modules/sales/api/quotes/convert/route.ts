@@ -6,14 +6,18 @@ import { resolveOrganizationScopeForRequest } from '@open-mercato/core/modules/d
 import { serializeOperationMetadata } from '@open-mercato/shared/lib/commands/operationMetadata'
 import type { CommandBus, CommandRuntimeContext } from '@open-mercato/shared/lib/commands'
 import { resolveTranslations } from '@open-mercato/shared/lib/i18n/server'
-import { CrudHttpError } from '@open-mercato/shared/lib/crud/errors'
+import { CrudHttpError, isCrudHttpError } from '@open-mercato/shared/lib/crud/errors'
 import type { OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
 import {
-  runCrudMutationGuardAfterSuccess,
-  validateCrudMutationGuard,
-  type CrudMutationGuardValidationResult,
-} from '@open-mercato/shared/lib/crud/mutation-guard'
+  bridgeLegacyGuard,
+  runMutationGuards,
+  type MutationGuard,
+  type MutationGuardInput,
+} from '@open-mercato/shared/lib/crud/mutation-guard-registry'
 import { withScopedPayload } from '../../utils'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('sales')
 
 const convertSchema = z.object({
   quoteId: z.string().uuid(),
@@ -29,9 +33,51 @@ type RequestContext = {
   ctx: CommandRuntimeContext
 }
 
-function buildMutationGuardErrorResponse(validation: CrudMutationGuardValidationResult): NextResponse | null {
-  if (validation.ok) return null
-  return NextResponse.json(validation.body, { status: validation.status })
+function resolveUserFeatures(auth: unknown): string[] {
+  const features = (auth as { features?: unknown })?.features
+  if (!Array.isArray(features)) return []
+  return features.filter((value): value is string => typeof value === 'string')
+}
+
+async function runGuards(
+  ctx: CommandRuntimeContext,
+  input: MutationGuardInput,
+): Promise<{
+  ok: boolean
+  errorBody?: Record<string, unknown>
+  errorStatus?: number
+  afterSuccessCallbacks: Array<{ guard: MutationGuard; metadata: Record<string, unknown> | null }>
+}> {
+  const legacyGuard = bridgeLegacyGuard(ctx.container)
+  if (!legacyGuard) {
+    return { ok: true, afterSuccessCallbacks: [] }
+  }
+
+  return runMutationGuards([legacyGuard], input, {
+    userFeatures: resolveUserFeatures(ctx.auth),
+  })
+}
+
+async function runGuardAfterSuccessCallbacks(
+  callbacks: Array<{ guard: MutationGuard; metadata: Record<string, unknown> | null }>,
+  input: {
+    tenantId: string
+    organizationId: string | null
+    userId: string
+    resourceKind: string
+    resourceId: string
+    operation: 'create' | 'update' | 'delete'
+    requestMethod: string
+    requestHeaders: Headers
+  },
+): Promise<void> {
+  for (const callback of callbacks) {
+    if (!callback.guard.afterSuccess) continue
+    await callback.guard.afterSuccess({
+      ...input,
+      metadata: callback.metadata ?? null,
+    })
+  }
 }
 
 async function resolveRequestContext(req: Request): Promise<RequestContext> {
@@ -70,7 +116,7 @@ export async function POST(req: Request) {
     const payload = await req.json().catch(() => ({}))
     const scoped = withScopedPayload(payload ?? {}, ctx, translate)
     const input = convertSchema.parse(scoped)
-    const mutationGuardValidation = await validateCrudMutationGuard(ctx.container, {
+    const guardResult = await runGuards(ctx, {
       tenantId: ctx.auth?.tenantId ?? '',
       organizationId: ctx.selectedOrganizationId ?? ctx.auth?.orgId ?? null,
       userId: ctx.auth?.sub ?? '',
@@ -80,9 +126,8 @@ export async function POST(req: Request) {
       requestMethod: req.method,
       requestHeaders: req.headers,
     })
-    if (mutationGuardValidation) {
-      const lockErrorResponse = buildMutationGuardErrorResponse(mutationGuardValidation)
-      if (lockErrorResponse) return lockErrorResponse
+    if (!guardResult.ok) {
+      return NextResponse.json(guardResult.errorBody ?? { error: 'Operation blocked by guard' }, { status: guardResult.errorStatus ?? 422 })
     }
     const commandBus = ctx.container.resolve('commandBus') as CommandBus
     const { result, logEntry } = await commandBus.execute<
@@ -112,8 +157,8 @@ export async function POST(req: Request) {
       )
     }
 
-    if (mutationGuardValidation?.ok && mutationGuardValidation.shouldRunAfterSuccess) {
-      await runCrudMutationGuardAfterSuccess(ctx.container, {
+    if (guardResult.afterSuccessCallbacks.length) {
+      await runGuardAfterSuccessCallbacks(guardResult.afterSuccessCallbacks, {
         tenantId: ctx.auth?.tenantId ?? '',
         organizationId: ctx.selectedOrganizationId ?? ctx.auth?.orgId ?? null,
         userId: ctx.auth?.sub ?? '',
@@ -122,17 +167,16 @@ export async function POST(req: Request) {
         operation: 'update',
         requestMethod: req.method,
         requestHeaders: req.headers,
-        metadata: mutationGuardValidation.metadata ?? null,
       })
     }
 
     return jsonResponse
   } catch (err) {
-    if (err instanceof CrudHttpError) {
+    if (isCrudHttpError(err)) {
       return NextResponse.json(err.body, { status: err.status })
     }
     const { translate } = await resolveTranslations()
-    console.error('sales.quotes.convert failed', err)
+    logger.error('sales.quotes.convert failed', { err })
     return NextResponse.json(
       { error: translate('sales.documents.detail.convertError', 'Failed to convert quote.') },
       { status: 400 }

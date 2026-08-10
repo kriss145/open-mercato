@@ -1,12 +1,15 @@
 import { defaultLocale, locales, type Locale } from './config'
 import type { Dict } from './context'
+import { resolveForcedLocale, resolveLocaleFromAcceptLanguage } from './locale'
 import { createFallbackTranslator, createTranslator } from './translate'
 import { getModules } from '../modules/registry'
 import { loadAppDictionary } from './app-dictionaries'
+import { getCachedDictionary, setCachedDictionary } from './dictionary-cache'
 
 // Re-export for backwards compatibility
 export { registerModules, getModules } from '../modules/registry'
 export { registerAppDictionaryLoader } from './app-dictionaries'
+export { invalidateDictionaryCache } from './dictionary-cache'
 
 function flattenDictionary(source: unknown, prefix = ''): Dict {
   if (!source || typeof source !== 'object' || Array.isArray(source)) return {}
@@ -24,6 +27,9 @@ function flattenDictionary(source: unknown, prefix = ''): Dict {
 }
 
 export async function detectLocale(): Promise<Locale> {
+  // Ops-level override: pin the whole app to one locale (default: unset).
+  const forced = resolveForcedLocale(process.env)
+  if (forced) return forced
   // Dynamic import to avoid requiring Next.js in non-Next.js contexts (CLI, tests)
   try {
     const { cookies, headers } = await import('next/headers')
@@ -35,7 +41,7 @@ export async function detectLocale(): Promise<Locale> {
     }
     try {
       const accept = (await headers()).get('accept-language') || ''
-      const match = locales.find(l => new RegExp(`(^|,)\\s*${l}(-|;|,|$)`, 'i').test(accept))
+      const match = resolveLocaleFromAcceptLanguage(accept)
       if (match) return match
     } catch {
       // headers() may not be available outside request context (e.g., in tests)
@@ -47,6 +53,11 @@ export async function detectLocale(): Promise<Locale> {
 }
 
 export async function loadDictionary(locale: Locale): Promise<Dict> {
+  // Locale dictionaries are immutable at runtime, so the flatten+merge below
+  // only needs to run once per locale. The cache is invalidated whenever
+  // modules or the app dictionary loader are (re)registered.
+  const cached = getCachedDictionary(locale)
+  if (cached) return cached
   // Load from registry instead of @/ import (works in standalone packages)
   const baseRaw = await loadAppDictionary(locale)
   const merged: Dict = { ...flattenDictionary(baseRaw) }
@@ -55,6 +66,7 @@ export async function loadDictionary(locale: Locale): Promise<Dict> {
     const dict = m.translations?.[locale]
     if (dict) Object.assign(merged, flattenDictionary(dict))
   }
+  setCachedDictionary(locale, merged)
   return merged
 }
 

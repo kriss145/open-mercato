@@ -4,6 +4,9 @@ import { getCurrentCacheTenant, runWithCacheTenant } from '@open-mercato/cache'
 import { UserAcl, RoleAcl, User, UserRole } from '@open-mercato/core/modules/auth/data/entities'
 import { ApiKey } from '@open-mercato/core/modules/api_keys/data/entities'
 import { findWithDecryption } from '@open-mercato/shared/lib/encryption/find'
+import { buildOrgScopeUserCacheTag, buildOrgScopeTenantCacheTag } from '@open-mercato/core/modules/directory/utils/organizationScope'
+import { matchFeature as sharedMatchFeature, hasAllFeatures as sharedHasAllFeatures } from '@open-mercato/shared/lib/auth/featureMatch'
+import { filterGrantsByEnabledModules, getOwningModuleId, getEnabledModuleIds } from '@open-mercato/shared/security/enabledModulesRegistry'
 
 interface AclData {
   isSuperAdmin: boolean
@@ -61,18 +64,18 @@ export class RbacService {
    * matchFeature('users.view', 'users.view') // true - exact match
    */
   private matchFeature(required: string, granted: string): boolean {
-    if (granted === '*') return true
-    if (granted.endsWith('.*')) {
-      const prefix = granted.slice(0, -2)
-      return required === prefix || required.startsWith(prefix + '.')
-    }
-    return granted === required
+    return sharedMatchFeature(required, granted)
   }
 
   public hasAllFeatures(required: string[], granted: string[]): boolean {
-    if (!required.length) return true
-    if (!granted.length) return false
-    return required.every((req) => granted.some((g) => this.matchFeature(req, g)))
+    return sharedHasAllFeatures(required, granted)
+  }
+
+  private roleAclAllowsOrganization(acl: RoleAcl, organizationId: string | null | undefined): boolean {
+    if (!organizationId) return true
+    const organizations = Array.isArray(acl.organizationsJson) ? acl.organizationsJson : null
+    if (!organizations || !organizations.length || organizations.includes('__all__')) return true
+    return organizations.includes(organizationId)
   }
 
   private getCacheKey(userId: string, scope: { tenantId: string | null; organizationId: string | null }): string {
@@ -128,7 +131,12 @@ export class RbacService {
    */
   async invalidateUserCache(userId: string): Promise<void> {
     this.globalSuperAdminCache.delete(userId)
-    await this.deleteCacheByTags([this.getUserTag(userId)])
+    // Also drop the directory OrganizationScope cache for this user. That scope's
+    // accessible-org set is derived from this user's ACL/role grants, so any
+    // permission change that invalidates the RBAC cache must invalidate the
+    // resolved scope too. This is the missing `org-scope:user:*` caller required
+    // before the cross-request scope TTL can be safely enabled (issue #2259).
+    await this.deleteCacheByTags([this.getUserTag(userId), buildOrgScopeUserCacheTag(userId)])
   }
 
   /**
@@ -140,7 +148,10 @@ export class RbacService {
    */
   async invalidateTenantCache(tenantId: string): Promise<void> {
     this.globalSuperAdminCache.clear()
-    await this.deleteCacheByTags([this.getTenantTag(tenantId)], [tenantId])
+    // Role ACL changes invalidate every user in the tenant; the resolved
+    // OrganizationScope for those users derives from the same grants, so drop
+    // the tenant-tagged scope entries alongside the RBAC ones (issue #2259).
+    await this.deleteCacheByTags([this.getTenantTag(tenantId), buildOrgScopeTenantCacheTag(tenantId)], [tenantId])
   }
 
   /**
@@ -280,6 +291,8 @@ export class RbacService {
           if (organizations !== null) {
             if (acl.organizationsJson == null) {
               organizations = null
+            } else if (Array.isArray(acl.organizationsJson) && acl.organizationsJson.includes('__all__')) {
+              organizations = null
             } else {
               organizations = Array.from(new Set([...(organizations || []), ...acl.organizationsJson]))
             }
@@ -341,11 +354,12 @@ export class RbacService {
         if (Array.isArray(r.featuresJson)) for (const f of r.featuresJson) if (!features.includes(f)) features.push(f)
         if (organizations !== null) {
           if (r.organizationsJson == null) organizations = null
+          else if (Array.isArray(r.organizationsJson) && r.organizationsJson.includes('__all__')) organizations = null
           else organizations = Array.from(new Set([...(organizations || []), ...r.organizationsJson]))
         }
       }
     }
-    if (organizations && orgId && !organizations.includes(orgId)) {
+    if (organizations && orgId && !organizations.includes(orgId) && !organizations.includes('__all__')) {
       // Out-of-scope org; caller will enforce
     }
     const result = { isSuperAdmin: isSuper, features, organizations }
@@ -354,23 +368,54 @@ export class RbacService {
   }
 
   /**
+   * Checks whether any tenant role grants a feature.
+   *
+   * This supports non-user runtimes such as scheduler workers that execute with
+   * tenant scope but without an authenticated user.
+   */
+  async tenantHasFeature(
+    tenantId: string | null | undefined,
+    feature: string,
+    opts?: { organizationId?: string | null },
+  ): Promise<boolean> {
+    if (!tenantId || !feature) return false
+
+    const enabledIds = getEnabledModuleIds()
+    if (enabledIds.length && !enabledIds.includes(getOwningModuleId(feature))) return false
+
+    const em = this.em.fork()
+    const roleAcls = await em.find(RoleAcl, { tenantId, deletedAt: null } as any, {})
+    const list = Array.isArray(roleAcls) ? roleAcls : []
+    const organizationId = opts?.organizationId ?? null
+
+    for (const acl of list) {
+      if (!this.roleAclAllowsOrganization(acl, organizationId)) continue
+      if (acl.isSuperAdmin) return true
+      const grants = Array.isArray(acl.featuresJson) ? acl.featuresJson : []
+      if (this.hasAllFeatures([feature], filterGrantsByEnabledModules(grants))) return true
+    }
+
+    return false
+  }
+
+  /**
    * Checks if a user has all required features within a given scope.
-   * 
+   *
    * This is the primary authorization check method used throughout the application.
    * It combines feature checking with organization visibility validation.
-   * 
+   *
    * Authorization logic:
    * 1. No features required → always returns true
    * 2. User is super admin → always returns true
    * 3. Organization restriction check: If the user's ACL has a restricted organization list
    *    and the requested organization is not in that list → returns false
    * 4. Feature matching: User must have all required features (supports wildcards)
-   * 
+   *
    * @param userId - The ID of the user
    * @param required - Array of feature strings to check (e.g., ['users.view', 'users.edit'])
    * @param scope - The tenant and organization context for authorization
    * @returns true if the user has all required features and organization access, false otherwise
-   * 
+   *
    * @example
    * // Check if user can view and edit users
    * const canManageUsers = await rbacService.userHasAllFeatures(
@@ -378,7 +423,7 @@ export class RbacService {
    *   ['users.view', 'users.edit'],
    *   { tenantId: 'tenant-1', organizationId: 'org-1' }
    * )
-   * 
+   *
    * @example
    * // Check with wildcard features
    * const canAccessEntities = await rbacService.userHasAllFeatures(
@@ -391,8 +436,38 @@ export class RbacService {
   async userHasAllFeatures(userId: string, required: string[], scope: { tenantId: string | null; organizationId: string | null }): Promise<boolean> {
     if (!required.length) return true
     const acl = await this.loadAcl(userId, scope)
-    if (acl.isSuperAdmin) return true
-    if (acl.organizations && scope.organizationId && !acl.organizations.includes(scope.organizationId)) return false
-    return this.hasAllFeatures(required, acl.features)
+    if (acl.isSuperAdmin) {
+      const enabledIds = getEnabledModuleIds()
+      if (!enabledIds.length) return true
+      const enabledSet = new Set(enabledIds)
+      return required.every((feature) => enabledSet.has(getOwningModuleId(feature)))
+    }
+    if (acl.organizations && scope.organizationId && !acl.organizations.includes(scope.organizationId) && !acl.organizations.includes('__all__')) return false
+    return this.hasAllFeatures(required, filterGrantsByEnabledModules(acl.features))
+  }
+
+  /**
+   * Returns the effective feature grant list for a user within a scope,
+   * filtered to enabled modules only. Super admins receive `['*']` expanded
+   * to per-module wildcards via `filterGrantsByEnabledModules` — consistent
+   * with `userHasAllFeatures` which also enforces disabled-module boundaries
+   * for super admins. Returns `[]` when the requested organization is outside
+   * the user's visibility list, or when the user does not exist.
+   */
+  async getGrantedFeatures(
+    userId: string,
+    scope: { tenantId: string | null; organizationId: string | null },
+  ): Promise<string[]> {
+    const acl = await this.loadAcl(userId, scope)
+    if (acl.isSuperAdmin) return filterGrantsByEnabledModules(['*'])
+    if (
+      acl.organizations &&
+      scope.organizationId &&
+      !acl.organizations.includes(scope.organizationId) &&
+      !acl.organizations.includes('__all__')
+    ) {
+      return []
+    }
+    return filterGrantsByEnabledModules(acl.features)
   }
 }

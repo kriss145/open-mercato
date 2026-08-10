@@ -1,7 +1,10 @@
+import { createLogger } from '@open-mercato/shared/lib/logger'
 import { NextResponse, type NextRequest } from 'next/server'
+import type { OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
 import { getAuthFromRequest } from '@open-mercato/shared/lib/auth/server'
 import {
   handleOpenCodeMessageStreaming,
+  type OpenCodeAuthContext,
   type OpenCodeStreamEvent,
 } from '../../lib/opencode-handlers'
 import { createOpenCodeClient } from '../../lib/opencode-client'
@@ -10,9 +13,13 @@ import type { EntityManager } from '@mikro-orm/postgresql'
 import {
   generateSessionToken,
   createSessionApiKey,
+  bindOpencodeSessionToApiKey,
+  findApiKeyByOpencodeSessionId,
 } from '@open-mercato/core/modules/api_keys/services/apiKeyService'
-import { UserRole } from '@open-mercato/core/modules/auth/data/entities'
-import { findWithDecryption } from '@open-mercato/shared/lib/encryption/find'
+import { checkAiChatRateLimit } from '../../lib/rate-limit'
+import { getUserRoleIds } from '../../lib/user-role-ids'
+
+const logger = createLogger('ai_assistant')
 
 /**
  * System instructions injected at the start of new chat sessions.
@@ -21,54 +28,119 @@ import { findWithDecryption } from '@open-mercato/shared/lib/encryption/find'
 const CHAT_SYSTEM_INSTRUCTIONS = `
 You are a helpful business assistant for Open Mercato.
 
-EFFICIENCY - CRITICAL:
-- MINIMIZE tool calls. If you already have the information, DO NOT call tools again.
-- When you retrieve entity info or search results, REMEMBER and REUSE that data.
-- For simple queries, use ONE search and present results - don't over-fetch.
-- For updates: search once to find the record, then call_api once to update.
+═══════════════════════════════════════
+ABSOLUTE RULES — FOLLOW THESE OR BE CUT OFF
+═══════════════════════════════════════
+1. READ = GET only. If the user says find/list/show/search/get → use only GET. NEVER call PUT/POST/DELETE for a read query.
+2. PUT path = collection path. id goes in the BODY, not the URL. Example: PUT /api/customers/companies with { id: '...', name: 'New' }. There are NO /{id} path segments.
+3. Confirm before ANY write. Before POST/PUT/DELETE: present your plan in business language, then STOP and wait for user to say "yes". Do NOT execute the write in the same turn.
+4. Maximum 4 tool calls per message. Hard limit is 10.
 
-STATUS UPDATES: Before each tool call, output a brief status line:
-- "🔍 Searching..." before search_query
-- "📋 Getting details..." before search_get or understand_entity
-- "🔗 Calling API..." before call_api
+You have 2 tools — both accept a "code" parameter with an async JavaScript arrow function.
+
+TOOL: search — discover endpoints and schemas (READ-ONLY, fast)
+  - spec.findEndpoints(keyword) → [{ path, methods }]
+  - spec.describeEndpoint(path, method) → COMPACT: { requiredFields, optionalFields, nestedCollections, example, relatedEndpoints, relatedEntity }
+  - spec.describeEntity(keyword) → { className, fields, relationships }
+
+TOOL: execute — make API calls (reads and writes)
+  - api.request({ method, path, query?, body? }) → { success, statusCode, data }
+
+COMMON API PATHS (use directly — do NOT call findEndpoints for these):
+  /api/customers/companies      — companies (GET list, POST create, PUT update)
+  /api/customers/people         — contacts/people
+  /api/customers/deals          — deals/opportunities
+  /api/customers/activities     — activities/tasks
+  /api/sales/orders             — sales orders
+  /api/sales/quotes             — quotes
+  /api/sales/invoices           — invoices
+  /api/catalog/products         — products
+  /api/catalog/categories       — categories
+
+═══════════════════════════════════════
+RECIPES — follow EXACTLY for each task type
+═══════════════════════════════════════
+
+FIND/LIST records (1 call):
+  For COMMON PATHS: skip describeEndpoint, go straight to execute.
+  1. execute: api.request({ method: 'GET', path: '/api/<module>/<resource>' })
+  The "search" query param only matches indexed text fields — it will NOT match concepts like "Polish" or "large".
+  For conceptual/subjective queries, fetch ALL records and use YOUR reasoning to identify matches from the returned data.
+  For unknown paths: 1 search + 1 execute.
+
+UPDATE a record (3-4 calls):
+  1. search: spec.describeEndpoint('/api/<module>/<resource>', 'PUT')  → learn requestBody fields AND relatedEntity
+  2. execute: GET the record → find it, get its ID
+  3. execute: PUT to the COLLECTION path with id IN THE BODY:
+     api.request({ method: 'PUT', path: '/api/<module>/<resource>', body: { id: '<uuid>', ...changes } })
+  NOTE: All CRUD endpoints use the COLLECTION path. The id goes in the request BODY, not the URL. There are NO /{id} path segments.
+
+CREATE a record (2-3 calls):
+  1. search: spec.describeEndpoint('/api/<module>/<resource>', 'POST') → gives requiredFields, optionalFields, nestedCollections, and a working example
+  2. Ask user for confirmation with the field values
+  3. execute: api.request({ method: 'POST', ...body })
+  If the endpoint has nestedCollections (like lines), include them INLINE in the body — do NOT create them separately.
+  Use the "example" from describeEndpoint as your template — fill in real values.
+  Example — create a quote with line items:
+    api.request({ method: 'POST', path: '/api/sales/quotes', body: {
+      currencyCode: 'EUR', customerEntityId: '<company-uuid>',
+      lines: [{ currencyCode: 'EUR', quantity: 1, productId: '<product-uuid>', name: 'Product Name', kind: 'product' }]
+    }})
+  Do NOT create lines separately. Do NOT include id, quoteId, or total fields — the server generates them.
+
+CREATE MULTIPLE records (2-3 calls):
+  1. search: spec.describeEndpoint('/api/<module>/<resource>', 'POST') → learn fields + example
+  2. execute: loop in one call:
+     async () => {
+       const results = [];
+       for (const item of items) {
+         results.push(await api.request({ method: 'POST', path: '...', body: item }));
+       }
+       return results;
+     }
+
+DISCOVER (what endpoints/entities exist) (1 call):
+  1. search: spec.findEndpoints('<keyword>') or spec.describeEntity('<keyword>')
+
+═══════════════════════════════════════
+HARD RULES
+═══════════════════════════════════════
+- MAXIMUM 4 tool calls per user message. You WILL be cut off after 10.
+- NEVER call findEndpoints or describeEndpoint for COMMON PATHS listed above — use them directly with execute.
+- NEVER call describeEntity if describeEndpoint already returned relatedEntity.
+- NEVER repeat a search from earlier in the conversation — reuse previous results.
+- NEVER make N+1 API calls (1 call per record). Fetch a list and reason about the results yourself.
+- When you already have the data you need from a previous call, use it — do NOT fetch more data to "enrich" it.
+- Do NOT write JavaScript filters/regex to match records. Fetch data with a simple api.request() call and use YOUR knowledge to interpret the results.
+- The "search" query param is fulltext only — it won't match nationalities, categories, or subjective criteria. For those, fetch all and reason.
+- describeEndpoint returns a COMPACT summary with requiredFields, optionalFields, and an example. Use the example as your template — fill in real values and send it.
+- For fields you don't know, OMIT them — the API uses defaults for optional fields.
+- NEVER try to set computed/total fields (amounts, totals, counts) — the server calculates them.
+- For updates: describeEndpoint gives you the field names. Go straight to GET + PUT. PUT path is the COLLECTION path, id in BODY.
+- For creates with children (e.g. quote + lines): include children INLINE in the body using the nestedCollections field name.
 
 RESPONSE RULES:
-- Be proactive - fetch data and present results, don't ask what the user wants to see
-- Never show technical terms, IDs, JSON, or internal reasoning
-- Present results in clean business language with **bold names** and bullet points
-- Only ask for confirmation before create/update/delete operations
+- Be proactive — fetch data and present results, don't ask what the user wants to see.
+- Never show technical terms, IDs, JSON, or internal reasoning.
+- Present results in clean business language with **bold names** and bullet points.
+- Only ask for confirmation before create/update/delete operations.
 `.trim()
+
+export const openApi: OpenApiRouteDoc = {
+  tag: 'AI Assistant',
+  summary: 'AI chat',
+  methods: {
+    POST: { summary: 'Send message to AI agent via SSE stream' },
+  },
+}
 
 export const metadata = {
   POST: { requireAuth: true, requireFeatures: ['ai_assistant.view'] },
 }
 
 /**
- * Get user's role IDs from the database.
- */
-async function getUserRoleIds(
-  em: EntityManager,
-  userId: string,
-  tenantId: string | null
-): Promise<string[]> {
-  if (!tenantId) return []
-
-  const links = await findWithDecryption(
-    em,
-    UserRole,
-    { user: userId as any, role: { tenantId } } as any,
-    { populate: ['role'] },
-    { tenantId, organizationId: null },
-  )
-  const linkList = Array.isArray(links) ? links : []
-  return linkList
-    .map((l) => (l.role as any)?.id)
-    .filter((id): id is string => typeof id === 'string' && id.length > 0)
-}
-
-/**
  * Chat endpoint that routes messages to OpenCode agent.
- * OpenCode connects to MCP server for tool access (api_discover, api_execute, api_schema).
+ * OpenCode connects to MCP server for tool access (search, execute, context_whoami).
  *
  * Emits verbose SSE events for debugging:
  * - thinking: Agent started processing
@@ -113,7 +185,7 @@ export async function POST(req: NextRequest) {
         await writer.write(encoder.encode(`data: ${jsonStr}\n\n`))
       } catch (err) {
         // Writer may have been closed by client disconnect
-        console.warn('[AI Chat] Failed to write SSE event:', event.type)
+        logger.warn('Failed to write SSE event', { eventType: event.type })
       }
     }
 
@@ -127,19 +199,59 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    // Resolve a request-scoped EntityManager once — needed both by the
+    // answerQuestion short-circuit (for ownership re-check) and by the
+    // streaming branch (for session-token mint + post-`done` binding).
+    const container = await createRequestContainer()
+    const em = container.resolve<EntityManager>('em')
+
+    const opencodeAuth: OpenCodeAuthContext = {
+      userId: auth.sub,
+      tenantId: auth.tenantId ?? null,
+      organizationId: auth.orgId ?? null,
+    }
+
     // Handle question answer - simple JSON response, not SSE
     // The original SSE stream continues and will receive the follow-up response
     if (answerQuestion) {
       try {
         const client = createOpenCodeClient()
+        // Resolve the question's actual sessionID from OpenCode — never
+        // trust the caller-supplied `answerQuestion.sessionId` blindly.
+        const pending = await client.getPendingQuestions()
+        const matching = pending.find((q) => q.id === answerQuestion.questionId)
+        if (!matching) {
+          // Unknown / stale question id — same opaque response as a
+          // foreign-owner mismatch to avoid leaking which case occurred.
+          return NextResponse.json({ error: 'Session not available' }, { status: 403 })
+        }
+        if (matching.sessionID !== answerQuestion.sessionId) {
+          return NextResponse.json({ error: 'Session not available' }, { status: 403 })
+        }
+        // Look up the api_key row bound to this OpenCode session and
+        // assert ownership matches the authenticated caller.
+        const ownerRow = await findApiKeyByOpencodeSessionId(em, matching.sessionID)
+        if (
+          !ownerRow ||
+          ownerRow.sessionUserId !== opencodeAuth.userId ||
+          (ownerRow.tenantId ?? null) !== opencodeAuth.tenantId ||
+          (ownerRow.organizationId ?? null) !== opencodeAuth.organizationId
+        ) {
+          return NextResponse.json({ error: 'Session not available' }, { status: 403 })
+        }
+
         await client.answerQuestion(answerQuestion.questionId, answerQuestion.answer)
         return NextResponse.json({ success: true })
       } catch (error) {
-        console.error('[AI Chat] Answer error:', error)
-        return NextResponse.json(
-          { error: error instanceof Error ? error.message : 'Failed to answer question' },
-          { status: 500 }
-        )
+        // Fail-closed: any failure during the answerQuestion path — ownership
+        // mismatch, OpenCode unreachable, getPendingQuestions throwing,
+        // findApiKeyByOpencodeSessionId throwing — returns the same opaque
+        // 403 envelope used for ownership rejection. This matches finding #1's
+        // security intent that the answerQuestion short-circuit MUST NOT leak
+        // whether the failure was authorization vs backend connectivity vs
+        // implementation error. The real reason is captured in server logs.
+        logger.error('AI Chat — Answer error', { err: error })
+        return NextResponse.json({ error: 'Session not available' }, { status: 403 })
       }
     }
 
@@ -154,14 +266,29 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'No user message found' }, { status: 400 })
     }
 
+    // Bound per-user LLM spend, DB writes (incl. the ephemeral session-key insert
+    // below), and SSE buffering. Fail-open so a missing limiter never blocks a turn.
+    // Reuses the request container resolved above for the answerQuestion ownership re-check.
+    const rateLimited = await checkAiChatRateLimit({
+      req,
+      container,
+      userId: auth.sub,
+      tenantId: auth.tenantId,
+    })
+    if (rateLimited) return rateLimited
+
+    const chatStartTime = Date.now()
+    logger.info('Chat request', {
+      userId: auth.sub,
+      sessionId: sessionId ? sessionId.slice(0, 16) : 'new',
+      messageChars: lastUserMessage.length,
+    })
+
     // For new sessions, create an ephemeral API key that inherits user permissions
     // The API key secret is encrypted and stored; MCP server recovers it via session token
     let sessionToken: string | null = null
     if (!sessionId) {
       try {
-        const container = await createRequestContainer()
-        const em = container.resolve<EntityManager>('em')
-
         // Get user's role IDs from database
         const userRoleIds = await getUserRoleIds(em, auth.sub, auth.tenantId)
 
@@ -175,9 +302,9 @@ export async function POST(req: NextRequest) {
           organizationId: auth.orgId,
           ttlMinutes: 120,
         })
-        console.log('[AI Chat] Created session token:', sessionToken.slice(0, 12) + '...')
+        logger.info('Created session token')
       } catch (error) {
-        console.error('[AI Chat] Failed to create session key:', error)
+        logger.error('AI Chat — Failed to create session key', { err: error })
         // Continue without session key - tools will use static API key auth
       }
     }
@@ -201,10 +328,14 @@ export async function POST(req: NextRequest) {
 
     // Process in background - starts AFTER Response is returned so there's a reader for the stream
     ;(async () => {
+      let toolCallCount = 0
+      let lastTokens: { input?: number; output?: number } | undefined
+      let resultSessionId: string | undefined
+
       try {
         // Emit session-authorized event first (if we have a token)
         if (sessionToken) {
-          console.log('[AI Chat] Emitting session-authorized event')
+          logger.info('AI Chat — Emitting session-authorized event')
           await writeSSE({
             type: 'session-authorized',
             sessionToken: sessionToken.slice(0, 12) + '...',
@@ -219,18 +350,50 @@ export async function POST(req: NextRequest) {
           {
             message: messageToSend,
             sessionId,
+            auth: opencodeAuth,
+            em,
           },
           async (event) => {
+            // Track usage from stream events
+            if (event.type === 'tool-call') toolCallCount++
+            if (event.type === 'metadata' && 'tokens' in event) lastTokens = event.tokens
+            if (event.type === 'done' && 'sessionId' in event) {
+              resultSessionId = event.sessionId
+              // First-time binding: when the caller did NOT supply a
+              // sessionId (i.e., this is a freshly minted chat) and we
+              // successfully created a session token earlier, bind the
+              // newly-resolved OpenCode session id to that api_key row so
+              // subsequent resumes can be authorized.
+              if (!sessionId && sessionToken && event.sessionId) {
+                try {
+                  await bindOpencodeSessionToApiKey(em, sessionToken, event.sessionId)
+                } catch (bindErr) {
+                  // The response stream is already in-flight — surface the
+                  // failure to logs without disturbing the SSE pipeline.
+                  logger.error('AI Chat — Failed to bind OpenCode session to api_key', { err: bindErr })
+                }
+              }
+            }
+
             await writeSSE(event)
           }
         )
       } catch (error) {
-        console.error('[AI Chat] OpenCode error:', error)
+        logger.error('AI Chat — OpenCode error', { err: error })
         await writeSSE({
           type: 'error',
           error: error instanceof Error ? error.message : 'OpenCode request failed',
         })
       } finally {
+        const durationMs = Date.now() - chatStartTime
+        logger.info('Chat complete', {
+          userId: auth.sub,
+          sessionId: (resultSessionId || sessionId || 'unknown').slice(0, 16),
+          durationMs,
+          toolCalls: toolCallCount,
+          inputTokens: lastTokens?.input || 0,
+          outputTokens: lastTokens?.output || 0,
+        })
         await closeWriter()
       }
     })()
@@ -243,7 +406,7 @@ export async function POST(req: NextRequest) {
       },
     })
   } catch (error) {
-    console.error('[AI Chat] Error:', error)
+    logger.error('AI Chat — Error', { err: error })
     return NextResponse.json({ error: 'Chat request failed' }, { status: 500 })
   }
 }

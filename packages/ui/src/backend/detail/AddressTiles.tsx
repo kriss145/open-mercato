@@ -6,6 +6,7 @@ import { Button } from '@open-mercato/ui/primitives/button'
 import { flash } from '@open-mercato/ui/backend/FlashMessages'
 import { TabEmptyState } from '@open-mercato/ui/backend/detail'
 import { useOrganizationScopeVersion } from '@open-mercato/shared/lib/frontend/useOrganizationScope'
+import { normalizeCoordinateInput, validateCoordinateInput } from '@open-mercato/shared/lib/location/coordinates'
 import { AddressView, formatAddressString, type AddressFormatStrategy } from './addressFormat'
 import AddressEditor, { type AddressTypesAdapter } from './AddressEditor'
 import {
@@ -36,6 +37,8 @@ export type AddressInput = {
   region?: string
   postalCode?: string
   country?: string
+  latitude?: number | null
+  longitude?: number | null
   isPrimary?: boolean
 }
 
@@ -43,6 +46,8 @@ export type AddressValue = AddressInput & {
   id: string
   purpose?: string | null
   companyName?: string | null
+  latitude?: number | null
+  longitude?: number | null
 }
 
 type AddressTilesProps<C = unknown> = {
@@ -59,6 +64,7 @@ type AddressTilesProps<C = unknown> = {
   emptyStateTitle?: string
   emptyStateActionLabel?: string
   labelPrefix?: string
+  showCoordinateFields?: boolean
   addressTypesAdapter?: AddressTypesAdapter<C>
   addressTypesContext?: C
   loadFormat?: (context?: C) => Promise<AddressFormatStrategy>
@@ -77,6 +83,8 @@ type DraftAddressState = {
   region: string
   postalCode: string
   country: string
+  latitude: string
+  longitude: string
   isPrimary: boolean
 }
 
@@ -103,6 +111,8 @@ const defaultDraft: DraftAddressState = {
   region: '',
   postalCode: '',
   country: '',
+  latitude: '',
+  longitude: '',
   isPrimary: false,
 }
 
@@ -118,6 +128,8 @@ const serverFieldMap: Record<string, DraftFieldKey> = {
   region: 'region',
   postalCode: 'postalCode',
   country: 'country',
+  latitude: 'latitude',
+  longitude: 'longitude',
   isPrimary: 'isPrimary',
 }
 
@@ -170,6 +182,7 @@ export function AddressTiles<C = unknown>({
   emptyStateTitle,
   emptyStateActionLabel,
   labelPrefix = 'customers.people.detail.addresses',
+  showCoordinateFields = false,
   addressTypesAdapter,
   addressTypesContext,
   loadFormat,
@@ -206,9 +219,15 @@ export function AddressTiles<C = unknown>({
       region: label('fields.region', 'Region'),
       postalCode: label('fields.postalCode', 'Postal code'),
       country: label('fields.country', 'Country'),
+      latitude: label('fields.latitude', 'Latitude'),
+      longitude: label('fields.longitude', 'Longitude'),
       isPrimary: label('fields.primary', 'Primary address'),
     }),
     [label],
+  )
+  const line1FieldLabel = React.useMemo(
+    () => (format === 'street_first' ? fieldLabels.street : fieldLabels.addressLine1),
+    [fieldLabels.addressLine1, fieldLabels.street, format],
   )
 
   const resetForm = React.useCallback(() => {
@@ -273,6 +292,8 @@ export function AddressTiles<C = unknown>({
       region: value.region ?? '',
       postalCode: value.postalCode ?? '',
       country: value.country ?? '',
+      latitude: value.latitude != null ? String(value.latitude) : '',
+      longitude: value.longitude != null ? String(value.longitude) : '',
       isPrimary: value.isPrimary ?? false,
     })
     setEditingId(value.id)
@@ -284,14 +305,25 @@ export function AddressTiles<C = unknown>({
   const validate = React.useCallback((): boolean => {
     const errors: Partial<Record<DraftFieldKey, string>> = {}
     if (!draft.addressLine1.trim()) {
-      errors.addressLine1 = label('validation.required', '{{field}} is required').replace('{{field}}', fieldLabels.addressLine1)
+      errors.addressLine1 = label('validation.required', '{{field}} is required').replace('{{field}}', line1FieldLabel)
+    }
+    for (const key of ['latitude', 'longitude'] as const) {
+      const result = validateCoordinateInput(key, draft[key])
+      if (result.status === 'invalid') {
+        errors[key] = label('validation.invalid', 'Invalid value for {{field}}').replace('{{field}}', fieldLabels[key])
+      } else if (result.status === 'outOfRange') {
+        errors[key] = label('validation.coordinateRange', '{{field}} must be between {{min}} and {{max}}')
+          .replace('{{field}}', fieldLabels[key])
+          .replace('{{min}}', `${result.min}`)
+          .replace('{{max}}', `${result.max}`)
+      }
     }
     if (Object.keys(errors).length > 0) {
       setFieldErrors(errors)
       return false
     }
     return true
-  }, [draft.addressLine1, fieldLabels.addressLine1, label])
+  }, [draft.addressLine1, draft.latitude, draft.longitude, fieldLabels, label, line1FieldLabel])
 
   const handleSave = React.useCallback(async () => {
     if (!validate()) return
@@ -310,6 +342,11 @@ export function AddressTiles<C = unknown>({
         region: normalizeOptional(draft.region),
         postalCode: normalizeOptional(draft.postalCode),
         country: normalizeOptional(draft.country)?.toUpperCase(),
+        // On edit, an emptied coordinate must be sent as `null` to clear the stored value; omitting
+        // it (undefined) makes the partial-update handler keep the old coordinate. On create there is
+        // nothing to clear, so leave it undefined (omitted).
+        latitude: normalizeCoordinateInput(draft.latitude) ?? (editingId ? null : undefined),
+        longitude: normalizeCoordinateInput(draft.longitude) ?? (editingId ? null : undefined),
         isPrimary: draft.isPrimary,
       }
       if (editingId && onUpdate) {
@@ -329,7 +366,7 @@ export function AddressTiles<C = unknown>({
           if (!key) return
           const fieldKey = serverFieldMap[key]
           if (!fieldKey) return
-          const fieldLabel = fieldLabels[fieldKey] ?? key
+          const fieldLabel = fieldKey === 'addressLine1' ? line1FieldLabel : (fieldLabels[fieldKey] ?? key)
           nextErrors[fieldKey] = resolveFieldMessage(detail, fieldLabel, t, labelPrefix)
         })
         setFieldErrors(nextErrors)
@@ -393,7 +430,7 @@ export function AddressTiles<C = unknown>({
     (key: string) => (
       <div
         key={key}
-        className="rounded-lg border-2 border-dashed border-muted-foreground/50 bg-muted/20 p-4 text-sm"
+        className="rounded-lg border-2 border-dashed border-muted-foreground/50 bg-muted/30 p-4 text-sm"
         onKeyDown={(event) => {
           if (!(event.metaKey || event.ctrlKey)) return
           if (event.key !== 'Enter') return
@@ -421,7 +458,7 @@ export function AddressTiles<C = unknown>({
           <AddressEditor
             value={draft}
             onChange={(next) => {
-              setDraft(next)
+              setDraft({ ...next, latitude: next.latitude ?? '', longitude: next.longitude ?? '' })
               if (Object.keys(fieldErrors).length) {
                 const nextErrors = { ...fieldErrors }
                 ;(Object.keys(nextErrors) as DraftFieldKey[]).forEach((key) => {
@@ -438,6 +475,7 @@ export function AddressTiles<C = unknown>({
             disabled={disableActions}
             errors={fieldErrors}
             showFormatHint={!formatLoading}
+            showCoordinateFields={showCoordinateFields}
             labelPrefix={labelPrefix}
             addressTypesAdapter={addressTypesAdapter}
             addressTypesContext={addressTypesContext}
@@ -480,13 +518,14 @@ export function AddressTiles<C = unknown>({
       label,
       labelPrefix,
       saving,
+      showCoordinateFields,
       t,
     ]
   )
 
   return (
     <div className="space-y-4">
-      {!hideAddButton ? (
+      {!hideAddButton && hasAddresses ? (
         <div className="flex justify-end">
           <Button
             type="button"
@@ -510,7 +549,7 @@ export function AddressTiles<C = unknown>({
             return (
               <div
                 key={address.id}
-                className="group rounded-lg border border-border/60 bg-card p-4 text-sm transition hover:border-border"
+                className="group rounded-lg border border-border/70 bg-card p-4 text-sm transition hover:border-border"
               >
                 <div className="flex items-start justify-between gap-2">
                   <div className="space-y-1">
@@ -519,7 +558,7 @@ export function AddressTiles<C = unknown>({
                         {address.name ?? label('labelFallback', 'Address')}
                       </p>
                       {address.isPrimary ? (
-                        <span className="rounded-full border border-border bg-muted px-2 py-0.5 text-[10px] font-semibold uppercase">
+                        <span className="rounded-full border border-border bg-muted px-2 py-0.5 text-overline font-semibold uppercase">
                           {label('primaryBadge', 'Primary')}
                         </span>
                       ) : null}

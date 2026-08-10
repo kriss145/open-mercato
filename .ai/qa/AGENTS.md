@@ -1,5 +1,34 @@
 # QA Integration Testing Instructions
 
+## Always
+
+- Prefer executable Playwright TypeScript tests in module `__integration__` folders.
+- Reuse shared helpers from `@open-mercato/core/helpers/integration/*`.
+- Keep integration tests independent, data-independent, deterministic, and safe across retries.
+- Create required fixtures per test and clean up created data in `finally`/teardown.
+- Check `.ai/qa/ephemeral-env.json` before starting a new manual exploration environment.
+
+## Ask First
+
+- Ask before applying migrations or resetting a developer's local database.
+- Ask before adding tests that require live external services or secrets instead of using metadata gates.
+- Ask before placing executable specs outside the preferred module `__integration__` locations.
+
+## Never
+
+- Never put executable `.spec.ts` files under `.ai/qa/tests`; that directory is for shared Playwright config.
+- Never rely on seeded/demo data being present.
+- Never leave broken tests; fix them or use `test.skip()` with a clear reason.
+- Never use loose `testIgnore` globs that can match parent workspace paths.
+
+## Validation Commands
+
+```bash
+yarn test:integration
+yarn test:integration:ephemeral
+npx playwright test --config .ai/qa/tests/playwright.config.ts --list
+```
+
 ## Quick Start
 
 ```bash
@@ -25,7 +54,11 @@ yarn test:integration:report
 Preferred local workflow for short iterations:
 1. Start `yarn test:integration:ephemeral:start`
 2. Reuse the running environment from `.ai/qa/ephemeral-env.json`
-3. Use `/integration-tests` against that URL
+3. Use `/om-integration-tests` against that URL
+
+Discovery troubleshooting:
+- If Playwright reports `No tests found`, run `npx playwright test --config .ai/qa/tests/playwright.config.ts --list` first.
+- Keep `testIgnore` entries in `.ai/qa/tests/playwright.config.ts` scoped to absolute paths under `projectRoot`; avoid loose relative globs such as `.codex/**` that can match parent workspace paths.
 
 ---
 
@@ -38,12 +71,8 @@ Preferred local workflow for short iterations:
 │   ├── TC-AUTH-001-*.md         #   Human-readable, used as input for test generation
 │   ├── TC-CAT-001-*.md         #   NOT required — tests can be generated directly
 │   └── ...
-├── tests/                       # Playwright config/helpers + legacy test location
+├── tests/                       # Playwright config only — do not place specs here
 │   ├── playwright.config.ts
-│   ├── .gitignore               # Ignores test-results/
-│   ├── helpers/
-│   │   ├── auth.ts              # Login helper
-│   │   └── api.ts               # API call helper
 └── ...
 
 packages/<package>/src/modules/<module>/__integration__/   # Preferred test location
@@ -55,25 +84,81 @@ packages/enterprise/modules/<module>/__integration__/      # Optional enterprise
 
 ## Reusable Helpers
 
-Use shared helpers directly from `@open-mercato/core/modules/core/__integration__/helpers/*` instead of creating module-local re-export wrappers.
+Use shared helpers from `@open-mercato/core/helpers/integration/*`. These are published in the npm package and available to both monorepo and standalone app developers.
+
+> **Legacy path**: `@open-mercato/core/modules/core/__integration__/helpers/*` still works in the monorepo via re-exports but is NOT available from npm. New code should use the `@open-mercato/core/helpers/integration/*` path.
 
 | Helper Import | Main Exports | Typical Use |
 |------|-------|--------|
-| `@open-mercato/core/modules/core/__integration__/helpers/auth` | `login`, `DEFAULT_CREDENTIALS` | UI authentication and role-based login (`admin`, `employee`, `superadmin`) |
-| `@open-mercato/core/modules/core/__integration__/helpers/api` | `getAuthToken`, `apiRequest` | Authenticated API setup and raw API calls in integration tests |
-| `@open-mercato/core/modules/core/__integration__/helpers/authUi` | `createUserViaUi` | Auth module UI flows for user creation/edit smoke coverage |
-| `@open-mercato/core/modules/core/__integration__/helpers/catalogFixtures` | `createProductFixture`, `deleteCatalogProductIfExists` | Catalog fixture lifecycle for setup/cleanup |
-| `@open-mercato/core/modules/core/__integration__/helpers/crmFixtures` | `createCompanyFixture`, `createPersonFixture`, `createDealFixture`, `deleteEntityIfExists`, `readJsonSafe` | Customers/CRM fixture creation and cleanup; `readJsonSafe` for parsing Playwright APIResponse body to JSON |
-| `@open-mercato/core/modules/core/__integration__/helpers/salesFixtures` | `createSalesQuoteFixture`, `createSalesOrderFixture`, `createOrderLineFixture`, `deleteSalesEntityIfExists` | Sales API fixture lifecycle |
-| `@open-mercato/core/modules/core/__integration__/helpers/salesUi` | `createSalesDocument`, `addCustomLine`, `updateLineQuantity`, `deleteLine`, `addAdjustment`, `addPayment`, `addShipment`, `readGrandTotalGross` | Sales document UI interactions and totals assertions |
-| `packages/create-app/template/src/modules/auth/__integration__/helpers/auth.ts` | `login` | Template-local helper for generated apps (kept local to template) |
+| `@open-mercato/core/helpers/integration/auth` | `login`, `DEFAULT_CREDENTIALS` | UI authentication and role-based login (`admin`, `employee`, `superadmin`) |
+| `@open-mercato/core/helpers/integration/api` | `getAuthToken`, `apiRequest` | Authenticated API setup and raw API calls in integration tests |
+| `@open-mercato/core/helpers/integration/authUi` | `createUserViaUi` | Auth module UI flows for user creation/edit smoke coverage |
+| `@open-mercato/core/helpers/integration/catalogFixtures` | `createProductFixture`, `deleteCatalogProductIfExists` | Catalog fixture lifecycle for setup/cleanup |
+| `@open-mercato/core/helpers/integration/crmFixtures` | `createCompanyFixture`, `createPersonFixture`, `createDealFixture`, `deleteEntityIfExists`, `readJsonSafe` | Customers/CRM fixture creation and cleanup; `readJsonSafe` for parsing Playwright APIResponse body to JSON |
+| `@open-mercato/core/helpers/integration/salesFixtures` | `createSalesQuoteFixture`, `createSalesOrderFixture`, `createOrderLineFixture`, `deleteSalesEntityIfExists` | Sales API fixture lifecycle |
+| `@open-mercato/core/helpers/integration/salesUi` | `createSalesDocument`, `addCustomLine`, `updateLineQuantity`, `deleteLine`, `addAdjustment`, `addPayment`, `addShipment`, `readGrandTotalGross` | Sales document UI interactions and totals assertions |
+| `@open-mercato/core/helpers/integration/queue` | `drainIntegrationQueue` | Drains local queue jobs in the correct app context; standalone runs spawn from `OM_TEST_APP_ROOT` so worker env/package resolution matches the app under test |
+| `@open-mercato/core/helpers/integration/authFixtures` | `createRoleFixture`, `deleteRoleIfExists`, `createUserFixture`, `deleteUserIfExists` | Role and user fixture lifecycle |
+| `@open-mercato/core/helpers/integration/generalFixtures` | `readJsonSafe`, `getTokenContext`, `expectId`, `deleteEntityByPathIfExists` | General-purpose test utilities |
+| `@open-mercato/core/helpers/integration/dictionariesFixtures` | `createDictionaryFixture` | Dictionary fixture creation |
 
 Import pattern from module tests:
 
 ```ts
-import { login } from '@open-mercato/core/modules/core/__integration__/helpers/auth';
-import { apiRequest, getAuthToken } from '@open-mercato/core/modules/core/__integration__/helpers/api';
+import { login } from '@open-mercato/core/helpers/integration/auth';
+import { apiRequest, getAuthToken } from '@open-mercato/core/helpers/integration/api';
 ```
+
+Queue-backed tests:
+- If a test creates a local queue job and then waits for a result, call `drainIntegrationQueue('<queue-name>')` instead of importing worker handlers or `createRequestContainer` directly in the spec.
+- This is required for standalone parity (`OM_TEST_APP_ROOT`) because the Playwright process is the monorepo, while the job was created by the scaffolded app. The helper runs the drain from the target app root so env, generated files, package versions, and encryption keys match.
+
+> **Barrel import** (subset): `@open-mercato/core/testing/integration` re-exports the most common helpers as a single import for convenience.
+
+---
+
+## CrudForm Field-Persistence Sweep (#2466)
+
+Automated follow-up to the manual CrudForm data-persistence QA (umbrella #2466). Every
+CrudForm / detail-edit surface gets a spec proving it **saves and reloads every field type**
+— scalars, dictionary references, multiselect/array values, and **custom fields** — on both
+create and update. Specs land per-module under `__integration__/TC-<MOD>-CRUDFORM-*.spec.ts`.
+
+### Shared harness
+
+`@open-mercato/core/helpers/integration/crudFormPersistence`:
+
+- `skipIfCrudFormExtensionTestsDisabled()` — call in `test.beforeAll`; skips the spec when the
+  sweep is disabled (see flag below).
+- `runCrudFormRoundTrip(config)` — runs create → read-back → assert all fields → update →
+  read-back → assert → delete for a makeCrud collection route. Pass `expectAfterCreate` /
+  `expectAfterUpdate` as `{ scalars?, customFields? }`. Supply `readById` for detail-GET routes.
+- `assertScalarFieldsPersisted(record, expected)` / `assertCustomFieldsPersisted(record, expected)`
+  — for hand-written specs that don't fit the round-trip runner.
+- `getCustomFieldValue(record, name)` — resolves a custom field from any response shape
+  (`customValues` bare keys, top-level `cf_<name>` / `cf:<name>`, or a `customFields[]` array).
+
+Reference spec: `packages/core/src/modules/currencies/__integration__/TC-CUR-CRUDFORM-001.spec.ts`.
+
+### Disable flag
+
+`OM_INTEGRATION_CRUDFORM_EXTENSION_TESTS_DISABLED` (default **false** → the sweep runs). Set
+truthy (`1`/`true`/`yes`/`on`) to skip every CrudForm-persistence spec wholesale without
+deleting them — parsed via `parseBooleanWithDefault` from `@open-mercato/shared/lib/boolean`.
+
+### Re-run the whole sweep
+
+```bash
+# All CrudForm-persistence specs across all modules (against a running app on :3000):
+npx playwright test --config .ai/qa/tests/playwright.config.ts CRUDFORM
+# One module only:
+OM_INTEGRATION_MODULES=currencies npx playwright test --config .ai/qa/tests/playwright.config.ts CRUDFORM
+# Disable the sweep (e.g. on a constrained CI lane):
+OM_INTEGRATION_CRUDFORM_EXTENSION_TESTS_DISABLED=1 yarn test:integration
+```
+
+The pure harness logic (env-gate + custom-field resolution) is unit-tested under jest at
+`packages/core/src/helpers/integration/__tests__/crudFormFields.test.ts` (runs in `yarn test`).
 
 ---
 
@@ -83,10 +168,10 @@ Markdown test scenarios (`.ai/qa/scenarios/TC-*.md`) are **optional reference ma
 
 | Path | Input | Output |
 |------|-------|--------|
-| **From spec** | `.ai/specs/SPEC-*.md` | `.spec.ts` directly (no scenario needed) |
+| **From spec** | `.ai/specs/*.md` or `.ai/specs/enterprise/*.md` | `.spec.ts` directly (no scenario needed) |
 | **From scenario** | `.ai/qa/scenarios/TC-*.md` | `.spec.ts` mapped from scenario steps |
 | **From description** | Verbal/written feature description | `.spec.ts` directly |
-| **From skill** | `/integration-tests` | `.spec.ts` + optional scenario markdown |
+| **From skill** | `/om-integration-tests` | `.spec.ts` + optional scenario markdown |
 
 ---
 
@@ -94,7 +179,7 @@ Markdown test scenarios (`.ai/qa/scenarios/TC-*.md`) are **optional reference ma
 
 ### 1. Executable Tests (Playwright TypeScript) — Preferred
 
-Pre-written tests discovered from module `__integration__` folders (with legacy `.ai/qa/tests/` support) run headlessly via `yarn test:integration`. Zero token cost, CI-ready.
+Pre-written tests discovered from module `__integration__` folders run headlessly via `yarn test:integration`. Zero token cost, CI-ready. Do not add executable `.spec.ts` files under `.ai/qa/tests`; that directory is reserved for the shared Playwright config.
 
 ```bash
 yarn test:integration
@@ -141,12 +226,12 @@ Environment state:
 
 ## How to Create New Tests
 
-### Option A: Use `/integration-tests` Skill (Recommended)
+### Option A: Use `/om-integration-tests` Skill (Recommended)
 
 The skill reads the related spec, explores the running app via Playwright MCP, and produces executable tests automatically. It optionally generates a markdown scenario for documentation.
 
 ```
-/integration-tests
+/om-integration-tests
 ```
 
 ### Option B: Manual Workflow
@@ -154,7 +239,7 @@ The skill reads the related spec, explores the running app via Playwright MCP, a
 #### Step 1 — Understand What to Test
 
 Read one of:
-- A spec from `.ai/specs/SPEC-*.md`
+- A spec from `.ai/specs/*.md` or `.ai/specs/enterprise/*.md`
 - A scenario from `.ai/qa/scenarios/TC-*.md` (if one exists)
 - A feature description from the user
 
@@ -259,17 +344,21 @@ npx playwright test --config .ai/qa/tests/playwright.config.ts <path-to-test-fil
 
 ### Conditional Metadata (Folder + Test)
 
-Use optional metadata to skip tests when required modules are not enabled.
+Use optional metadata to skip tests when required modules or external environment variables are not enabled.
 
 - Folder-level metadata:
   - Add `meta.ts` or `index.ts` under any `__integration__/` subfolder
-  - Supported keys: `dependsOnModules`, `requiredModules`, `requiresModules`
+  - Supported module keys: `dependsOnModules`, `requiredModules`, `requiresModules`
+  - Supported env keys: `requiredEnvVars`, `requiresEnvVars`, `requiredAnyEnvVars`, `requiresAnyEnvVars`
 - Per-test metadata:
   - Add the same keys inside the `.spec.ts` file, or create sibling `TC-*.meta.ts`
 - Inheritance:
   - Metadata is inherited from `__integration__/` root through nested subfolders, then test-level metadata is applied
 - Behavior:
   - If any declared dependency module is not enabled, that folder/test is excluded from discovery and run
+  - If any `requiredEnvVars` entry is missing or blank, that folder/test is excluded from discovery and run
+  - If `requiredAnyEnvVars` is set and all listed env vars are missing or blank, that folder/test is excluded from discovery and run
+  - Only use env metadata for tests that genuinely require external services. If the behavior can be stubbed or the model-backed subcase can be skipped inside the test, keep the test runnable without secrets.
 
 Example folder metadata:
 
@@ -280,7 +369,16 @@ export const integrationMeta = {
 }
 ```
 
-### MUST Rules for Executable Tests
+Example env-gated metadata for a truly live LLM test:
+
+```ts
+export const integrationMeta = {
+  description: 'Live AI provider smoke',
+  requiredAnyEnvVars: ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'GOOGLE_GENERATIVE_AI_API_KEY'],
+}
+```
+
+### Executable Test Rules
 
 - Use Playwright locators: `getByRole`, `getByLabel`, `getByText`, `getByPlaceholder` — avoid CSS selectors
 - If a matching scenario exists, reference it in a comment (e.g., `Source: .ai/qa/scenarios/TC-AUTH-001-*.md`)
@@ -288,7 +386,7 @@ export const integrationMeta = {
 - Keep tests data-independent — do not rely on seeded/demo records being present
 - Create required fixtures per test (prefer API setup), and always clean up created data in `finally`/teardown
 - Ensure tests are deterministic/stable across retries and run order (no cross-test state coupling)
-- Keep reusable helpers centralized (recommended: `packages/core/src/modules/core/__integration__/helpers/`), and re-export from module-local helper files when needed
+- Keep reusable helpers centralized in `packages/core/src/helpers/integration/` (importable as `@open-mercato/core/helpers/integration/*`), and re-export from module-local helper files when needed
 - One `.spec.ts` file per test case
 - MUST NOT leave broken tests — fix or skip with `test.skip()` and a reason
 

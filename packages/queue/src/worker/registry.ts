@@ -6,6 +6,10 @@
  */
 
 import type { WorkerDescriptor } from '../types'
+import { applyWorkerOverridesToDescriptors } from '@open-mercato/shared/modules/overrides'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('queue').child({ component: 'worker-registry' })
 
 const workers: Map<string, WorkerDescriptor> = new Map()
 
@@ -15,7 +19,7 @@ const workers: Map<string, WorkerDescriptor> = new Map()
  */
 export function registerWorker(worker: WorkerDescriptor): void {
   if (workers.has(worker.id)) {
-    console.warn(`[worker-registry] Worker "${worker.id}" already registered, overwriting`)
+    logger.warn('Worker already registered, overwriting', { workerId: worker.id })
   }
   workers.set(worker.id, worker)
 }
@@ -25,7 +29,7 @@ export function registerWorker(worker: WorkerDescriptor): void {
  * @param list - Array of worker descriptors to register
  */
 export function registerModuleWorkers(list: WorkerDescriptor[]): void {
-  for (const worker of list) {
+  for (const worker of applyWorkerOverridesToDescriptors(list)) {
     registerWorker(worker)
   }
 }

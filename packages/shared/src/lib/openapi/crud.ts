@@ -1,5 +1,5 @@
 import { z, type ZodTypeAny } from 'zod'
-import type { OpenApiRouteDoc } from './types'
+import type { OpenApiResponseDoc, OpenApiRouteDoc } from './types'
 
 export const defaultCreateResponseSchema = z.object({ id: z.string().uuid().nullable() })
 export const defaultOkResponseSchema = z.object({ ok: z.literal(true) })
@@ -34,6 +34,7 @@ type CrudDeleteConfig = {
   schema?: ZodTypeAny
   description?: string
   responseSchema?: ZodTypeAny
+  errors?: OpenApiResponseDoc[]
 }
 
 export type CrudOpenApiOptions = {
@@ -66,6 +67,17 @@ export type CrudOpenApiFactoryConfig = {
   makeUpdateRequestBodyDescription?: (ctx: CrudTextContext) => string
   makeDeleteDescription?: (ctx: CrudTextContext) => string
   makeDeleteRequestBodyDescription?: (ctx: CrudTextContext) => string
+}
+
+function withIdsQueryParam(schema: ZodTypeAny | undefined): ZodTypeAny | undefined {
+  if (!schema) return schema
+  if (!(schema instanceof z.ZodObject)) return schema
+  return schema.extend({
+    ids: z
+      .string()
+      .optional()
+      .describe('Comma-separated list of record UUIDs to filter by (max 200).'),
+  })
 }
 
 function resolveDefault(
@@ -110,7 +122,7 @@ export function createCrudOpenApiFactory(config: CrudOpenApiFactoryConfig) {
       summary: `List ${pluralLower}`,
       description:
         description ?? resolveDefault(config.makeListDescription, context, `Returns a paginated collection of ${pluralLower}.`),
-      query: querySchema,
+      query: withIdsQueryParam(querySchema),
       responses: [
         {
           status: 200,
@@ -206,6 +218,7 @@ export function createCrudOpenApiFactory(config: CrudOpenApiFactoryConfig) {
             schema: del.responseSchema ?? fallbackOkResponseSchema,
           },
         ],
+        ...(del.errors && del.errors.length > 0 ? { errors: del.errors } : {}),
       }
     }
 

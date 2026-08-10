@@ -1,6 +1,6 @@
 import type { ModuleCli } from '@open-mercato/shared/modules/registry'
 import { createRequestContainer } from '@open-mercato/shared/lib/di/container'
-import { getRedisUrl } from '@open-mercato/shared/lib/redis/connection'
+import { getRedisUrlOrThrow } from '@open-mercato/shared/lib/redis/connection'
 import { recordIndexerError } from '@open-mercato/shared/lib/indexers/error-log'
 import { recordIndexerLog } from '@open-mercato/shared/lib/indexers/status-log'
 import { createProgressBar } from '@open-mercato/shared/lib/cli/progress'
@@ -367,8 +367,8 @@ async function testMeilisearchCommand(): Promise<void> {
   console.log('')
 
   try {
-    const { MeiliSearch } = await import('meilisearch')
-    const client = new MeiliSearch({ host, apiKey })
+    const { Meilisearch } = await import('meilisearch')
+    const client = new Meilisearch({ host, apiKey })
 
     console.log('Testing connection...')
     const health = await client.health()
@@ -577,7 +577,7 @@ async function reindexCommand(rest: string[]): Promise<void> {
       if (purgeFirst && tenantId) {
         try {
           console.log('  -> purging existing vector index rows...')
-          await searchIndexer.purgeEntity({ entityId: entityType as EntityId, tenantId })
+          await searchIndexer.purgeEntity({ entityId: entityType as EntityId, tenantId, organizationId })
           await resetVectorCoverageAfterPurge(baseEm, entityType, tenantId ?? null, organizationId ?? null)
           if (baseEventBus) {
             const scopes = new Set<string>()
@@ -754,6 +754,12 @@ const reindexHelpCli: ModuleCli = {
   command: 'reindex-help',
   async run() {
     console.log('Usage: yarn mercato search reindex [options]')
+    console.log('')
+    console.log('  Rebuilds the query_index projection (entity_indexes) + the Postgres search_tokens')
+    console.log('  index, and enqueues vector embedding jobs. It does NOT populate the fulltext')
+    console.log('  (Meilisearch) index — to rebuild fulltext use POST /api/search/reindex (feature')
+    console.log('  search.reindex) with a running `yarn mercato search worker fulltext-indexing`.')
+    console.log('')
     console.log('  --tenant <id>           Optional tenant scope (required for purge & coverage).')
     console.log('  --org <id>              Optional organization scope (requires tenant).')
     console.log('  --entity <module:entity> Reindex a single entity (defaults to all enabled entities).')
@@ -798,7 +804,7 @@ async function workerCommand(rest: string[]): Promise<void> {
     return
   }
 
-  const redisUrl = getRedisUrl('QUEUE')
+  const redisUrl = getRedisUrlOrThrow('QUEUE')
 
   // Dynamically import runWorker to avoid loading BullMQ unless needed
   const { runWorker } = await import('@open-mercato/queue/worker')
@@ -850,7 +856,8 @@ const helpCli: ModuleCli = {
     console.log('  status              Show search module status and available strategies')
     console.log('  query               Execute a search query')
     console.log('  index               Index a specific record')
-    console.log('  reindex             Reindex vector embeddings for entities')
+    console.log('  reindex             Rebuild query_index projections + search_tokens and enqueue vector embeddings')
+    console.log('                      (does NOT populate the fulltext/Meilisearch index — use POST /api/search/reindex)')
     console.log('  reindex-help        Show reindex command options')
     console.log('  test-meilisearch    Test Meilisearch connection')
     console.log('  worker              Start a queue worker for search indexing')

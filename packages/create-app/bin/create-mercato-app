@@ -6,7 +6,7 @@
 
 import { existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const distIndex = join(__dirname, '..', 'dist', 'index.js');
@@ -17,5 +17,17 @@ if (!existsSync(distIndex)) {
   process.exit(1);
 }
 
-// Import the actual CLI
-await import(distIndex);
+const cliModule = await import(pathToFileURL(distIndex).href);
+
+if (typeof cliModule.main !== 'function') {
+  console.error(`Error: CLI entrypoint at ${distIndex} does not export main().`);
+  process.exit(1);
+}
+
+try {
+  await cliModule.main();
+} catch (error) {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(`Error creating app: ${message}`);
+  process.exit(1);
+}

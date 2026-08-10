@@ -10,6 +10,9 @@ import { z } from 'zod'
 import { rateLimitErrorSchema } from '@open-mercato/shared/lib/ratelimit/helpers'
 import { readEndpointRateLimitConfig } from '@open-mercato/shared/lib/ratelimit/config'
 import { checkAuthRateLimit } from '@open-mercato/core/modules/auth/lib/rateLimitCheck'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('auth').child({ component: 'reset-confirm' })
 
 const resetConfirmRateLimitConfig = readEndpointRateLimitConfig('RESET_CONFIRM', {
   points: 5, duration: 300, keyPrefix: 'reset-confirm',
@@ -48,12 +51,12 @@ export async function POST(req: Request) {
       }
     }
   } catch (err) {
-    console.error('[auth.reset.confirm] Failed to create notification:', err)
+    logger.error('Failed to create notification', { err })
   }
   return NextResponse.json({ ok: true, redirect: '/login' })
 }
 
-export const metadata = {}
+export const metadata = { requireAuth: false }
 
 const passwordResetConfirmResponseSchema = z.object({
   ok: z.literal(true),

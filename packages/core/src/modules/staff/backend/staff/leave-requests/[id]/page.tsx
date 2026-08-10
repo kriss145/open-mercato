@@ -1,58 +1,36 @@
 "use client"
 
 import * as React from 'react'
-import { useRouter } from 'next/navigation'
-import { Send } from 'lucide-react'
+import { usePathname, useRouter } from 'next/navigation'
 import { Page, PageBody } from '@open-mercato/ui/backend/Page'
 import { Badge } from '@open-mercato/ui/primitives/badge'
 import { Button } from '@open-mercato/ui/primitives/button'
 import { Textarea } from '@open-mercato/ui/primitives/textarea'
-import { LoadingMessage, ErrorMessage } from '@open-mercato/ui/backend/detail'
+import { LoadingMessage, ErrorMessage, RecordNotFoundState } from '@open-mercato/ui/backend/detail'
 import { SendObjectMessageDialog } from '@open-mercato/ui/backend/messages'
-import { apiCallOrThrow, readApiResultOrThrow } from '@open-mercato/ui/backend/utils/apiCall'
+import { apiCallOrThrow, readApiResultOrThrow, withScopedApiRequestHeaders } from '@open-mercato/ui/backend/utils/apiCall'
+import { buildOptimisticLockHeader } from '@open-mercato/ui/backend/utils/optimisticLock'
 import { updateCrud } from '@open-mercato/ui/backend/utils/crud'
 import { flash } from '@open-mercato/ui/backend/FlashMessages'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
 import { LeaveRequestForm, buildLeaveRequestPayload, type LeaveRequestFormValues } from '@open-mercato/core/modules/staff/components/LeaveRequestForm'
-
-type LeaveRequestRecord = {
-  id: string
-  member?: { id?: string; displayName?: string }
-  memberId?: string | null
-  member_id?: string | null
-  startDate?: string | null
-  start_date?: string | null
-  endDate?: string | null
-  end_date?: string | null
-  timezone?: string | null
-  status?: 'pending' | 'approved' | 'rejected'
-  unavailabilityReasonEntryId?: string | null
-  unavailability_reason_entry_id?: string | null
-  unavailabilityReasonValue?: string | null
-  unavailability_reason_value?: string | null
-  note?: string | null
-  decisionComment?: string | null
-  decision_comment?: string | null
-  decidedAt?: string | null
-  decided_at?: string | null
-} & Record<string, unknown>
-
-type LeaveRequestsResponse = {
-  items?: LeaveRequestRecord[]
-}
+import { buildRecordInjectionContext, useSetCurrentRecordInjectionContext } from '@open-mercato/ui/backend/injection/recordContext'
+import { type LeaveRequestRecord, type LeaveRequestsResponse, type NormalizedLeaveRequest, normalizeLeaveRequest, resolveStatusVariant, formatDateLabel, formatDateRange } from '../../../../lib/leaveRequestHelpers'
 
 export default function StaffLeaveRequestDetailPage({ params }: { params?: { id?: string } }) {
   const id = params?.id
   const t = useT()
   const router = useRouter()
+  const pathname = usePathname()
   const [isLoading, setIsLoading] = React.useState(true)
   const [error, setError] = React.useState<string | null>(null)
-  const [record, setRecord] = React.useState<LeaveRequestRecord | null>(null)
+  const [isNotFound, setIsNotFound] = React.useState(false)
+  const [record, setRecord] = React.useState<NormalizedLeaveRequest | null>(null)
   const [decisionComment, setDecisionComment] = React.useState('')
 
   React.useEffect(() => {
     if (!id) {
-      setError(t('staff.leaveRequests.errors.notFound', 'Leave request not found.'))
+      setIsNotFound(true)
       setIsLoading(false)
       return
     }
@@ -61,6 +39,7 @@ export default function StaffLeaveRequestDetailPage({ params }: { params?: { id?
     async function load() {
       setIsLoading(true)
       setError(null)
+      setIsNotFound(false)
       try {
         const params = new URLSearchParams({ page: '1', pageSize: '1', ids: requestId })
         const payload = await readApiResultOrThrow<LeaveRequestsResponse>(
@@ -69,22 +48,28 @@ export default function StaffLeaveRequestDetailPage({ params }: { params?: { id?
           { errorMessage: t('staff.leaveRequests.errors.load', 'Failed to load leave request.') },
         )
         const entry = Array.isArray(payload.items) ? payload.items[0] : null
-        if (!entry) throw new Error(t('staff.leaveRequests.errors.notFound', 'Leave request not found.'))
+        if (!entry) {
+          if (!cancelled) {
+            setIsNotFound(true)
+            setRecord(null)
+          }
+          return
+        }
         if (!cancelled) {
-          setRecord(entry)
-          setDecisionComment(
-            typeof entry.decisionComment === 'string'
-              ? entry.decisionComment
-              : typeof entry.decision_comment === 'string'
-                ? entry.decision_comment
-                : ''
-          )
+          const normalized = normalizeLeaveRequest(entry)
+          setRecord(normalized)
+          setDecisionComment(normalized.decisionComment ?? '')
         }
       } catch (err) {
         if (!cancelled) {
-          const message = err instanceof Error ? err.message : t('staff.leaveRequests.errors.load', 'Failed to load leave request.')
-          setError(message)
-          setRecord(null)
+          if ((err as { status?: number }).status === 404) {
+            setIsNotFound(true)
+            setRecord(null)
+          } else {
+            const message = err instanceof Error ? err.message : t('staff.leaveRequests.errors.load', 'Failed to load leave request.')
+            setError(message)
+            setRecord(null)
+          }
         }
       } finally {
         if (!cancelled) setIsLoading(false)
@@ -96,20 +81,18 @@ export default function StaffLeaveRequestDetailPage({ params }: { params?: { id?
 
   const status = record?.status ?? 'pending'
   const memberLabel = record?.member?.displayName ?? null
-  const dateSummary = formatDateRange(
-    record?.startDate ?? record?.start_date ?? null,
-    record?.endDate ?? record?.end_date ?? null,
-  )
+  const dateSummary = formatDateRange(record?.startDate, record?.endDate)
   const initialValues = React.useMemo<LeaveRequestFormValues>(() => ({
     id: record?.id,
-    memberId: record?.memberId ?? record?.member_id ?? null,
+    memberId: record?.memberId ?? null,
     memberLabel,
-    startDate: record?.startDate ?? record?.start_date ?? null,
-    endDate: record?.endDate ?? record?.end_date ?? null,
+    startDate: record?.startDate ?? null,
+    endDate: record?.endDate ?? null,
     timezone: record?.timezone ?? null,
-    unavailabilityReasonEntryId: record?.unavailabilityReasonEntryId ?? record?.unavailability_reason_entry_id ?? null,
-    unavailabilityReasonValue: record?.unavailabilityReasonValue ?? record?.unavailability_reason_value ?? null,
+    unavailabilityReasonEntryId: record?.unavailabilityReasonEntryId ?? null,
+    unavailabilityReasonValue: record?.unavailabilityReasonValue ?? null,
     note: record?.note ?? null,
+    updatedAt: record?.updatedAt ?? null,
   }), [record, memberLabel])
 
 const handleSubmit = React.useCallback(async (values: LeaveRequestFormValues) => {
@@ -125,11 +108,14 @@ const handleSubmit = React.useCallback(async (values: LeaveRequestFormValues) =>
   const handleDecision = React.useCallback(async (action: 'accept' | 'reject') => {
     if (!record?.id) return
     const endpoint = action === 'accept' ? '/api/staff/leave-requests/accept' : '/api/staff/leave-requests/reject'
-    await apiCallOrThrow(endpoint, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ id: record.id, decisionComment: decisionComment || null }),
-    })
+    await withScopedApiRequestHeaders(
+      buildOptimisticLockHeader(record.updatedAt),
+      () => apiCallOrThrow(endpoint, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ id: record.id, decisionComment: decisionComment || null }),
+      }),
+    )
     flash(
       action === 'accept'
         ? t('staff.leaveRequests.messages.accepted', 'Leave request approved.')
@@ -137,13 +123,41 @@ const handleSubmit = React.useCallback(async (values: LeaveRequestFormValues) =>
       'success',
     )
     router.refresh()
-  }, [decisionComment, record?.id, router, t])
+  }, [decisionComment, record?.id, record?.updatedAt, router, t])
+
+  // Publish page-load record context to the AppShell-owned `backend:record:current`
+  // mount so the enterprise record_locks widget resolves `staff.leaveRequest` + id
+  // explicitly. The resourceKind follows the module's camelCase version-history
+  // convention so the held lock matches the leave request's save-time conflict surface.
+  useSetCurrentRecordInjectionContext(
+    buildRecordInjectionContext({
+      resourceKind: 'staff.leaveRequest',
+      resourceId: id || null,
+      updatedAt: record?.updatedAt ?? null,
+      data: record as Record<string, unknown> | null,
+      path: pathname,
+    }),
+  )
 
   if (isLoading) {
     return (
       <Page>
         <PageBody>
           <LoadingMessage label={t('staff.leaveRequests.form.loading', 'Loading leave request...')} />
+        </PageBody>
+      </Page>
+    )
+  }
+
+  if (isNotFound) {
+    return (
+      <Page>
+        <PageBody>
+          <RecordNotFoundState
+            label={t('staff.leaveRequests.errors.notFound', 'Leave request not found.')}
+            backHref="/backend/staff/leave-requests"
+            backLabel={t('staff.leaveRequests.actions.backToList', 'Back to leave requests')}
+          />
         </PageBody>
       </Page>
     )
@@ -167,9 +181,9 @@ const handleSubmit = React.useCallback(async (values: LeaveRequestFormValues) =>
             <Badge variant={resolveStatusVariant(status)}>
               {t(`staff.leaveRequests.status.${status}`, status)}
             </Badge>
-            {record.decided_at || record.decidedAt ? (
+            {record.decidedAt ? (
               <span className="text-xs text-muted-foreground">
-                {t('staff.leaveRequests.decision.at', 'Decision at')} {formatDateLabel(record.decidedAt ?? record.decided_at ?? null)}
+                {t('staff.leaveRequests.decision.at', 'Decision at')} {formatDateLabel(record.decidedAt)}
               </span>
             ) : null}
           </div>
@@ -201,10 +215,10 @@ const handleSubmit = React.useCallback(async (values: LeaveRequestFormValues) =>
               </Button>
             </div>
           </div>
-        ) : record.decisionComment || record.decision_comment ? (
+        ) : record.decisionComment ? (
           <div className="mb-6 rounded-lg border bg-card p-4 text-sm text-muted-foreground">
             <div className="mb-1 font-medium text-foreground">{t('staff.leaveRequests.decision.comment', 'Decision comment')}</div>
-            <p>{record.decisionComment ?? record.decision_comment}</p>
+            <p>{record.decisionComment}</p>
           </div>
         ) : null}
 
@@ -251,24 +265,4 @@ const handleSubmit = React.useCallback(async (values: LeaveRequestFormValues) =>
       </PageBody>
     </Page>
   )
-}
-
-function resolveStatusVariant(status: 'pending' | 'approved' | 'rejected') {
-  if (status === 'approved') return 'default'
-  if (status === 'rejected') return 'destructive'
-  return 'secondary'
-}
-
-function formatDateLabel(value?: string | null): string {
-  if (!value) return ''
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return value
-  return date.toLocaleDateString()
-}
-
-function formatDateRange(start?: string | null, end?: string | null): string {
-  const startLabel = formatDateLabel(start)
-  const endLabel = formatDateLabel(end)
-  if (startLabel && endLabel) return `${startLabel} -> ${endLabel}`
-  return startLabel || endLabel || '-'
 }

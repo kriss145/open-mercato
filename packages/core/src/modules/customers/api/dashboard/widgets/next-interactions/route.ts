@@ -1,12 +1,15 @@
 import { NextResponse } from 'next/server'
 import { z } from 'zod'
 import { resolveTranslations } from '@open-mercato/shared/lib/i18n/server'
-import { CrudHttpError } from '@open-mercato/shared/lib/crud/errors'
+import { CrudHttpError, isCrudHttpError } from '@open-mercato/shared/lib/crud/errors'
 import { CustomerEntity } from '../../../../data/entities'
 import type { FilterQuery } from '@mikro-orm/core'
 import { resolveWidgetScope, type WidgetScopeContext } from '../utils'
 import type { OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
 import { parseBooleanToken } from '@open-mercato/shared/lib/boolean'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('customers')
 
 const querySchema = z.object({
   limit: z.coerce.number().min(1).max(20).default(5),
@@ -89,10 +92,10 @@ export async function GET(req: Request) {
 
     return NextResponse.json({ items, now: now.toISOString() })
   } catch (err) {
-    if (err instanceof CrudHttpError) {
+    if (isCrudHttpError(err)) {
       return NextResponse.json(err.body, { status: err.status })
     }
-    console.error('customers.widgets.nextInteractions failed', err)
+    logger.error('customers.widgets.nextInteractions failed', { err })
     return NextResponse.json(
       { error: translate('customers.widgets.nextInteractions.error', 'Failed to load upcoming interactions') },
       { status: 500 }

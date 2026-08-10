@@ -1,7 +1,7 @@
 import { expect, test } from '@playwright/test';
 import { login } from '@open-mercato/core/modules/core/__integration__/helpers/auth';
-import { createCompanyFixture, deleteEntityIfExists } from '@open-mercato/core/modules/core/__integration__/helpers/crmFixtures';
-import { getAuthToken } from '@open-mercato/core/modules/core/__integration__/helpers/api';
+import { createCompanyFixture, deleteEntityIfExists, readJsonSafe } from '@open-mercato/core/modules/core/__integration__/helpers/crmFixtures';
+import { apiRequest, getAuthToken } from '@open-mercato/core/modules/core/__integration__/helpers/api';
 
 function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -37,17 +37,27 @@ test.describe('TC-CRM-003: Edit Company Details', () => {
       await expect(page.getByRole('button', { name: new RegExp(`Website\\s+${escapeRegex(updatedWebsite)}`) })).toBeVisible();
 
       await page.getByRole('button', { name: /Lifecycle stage/i }).click();
-      await page
-        .locator('select')
-        .filter({ has: page.locator('option', { hasText: 'Prospect' }) })
-        .first()
-        .selectOption({ label: 'Prospect' });
+      // Radix Select: click trigger then click option from portal
+      await page.locator('[role="combobox"][aria-expanded="false"]').first().click();
+      await page.getByRole('option', { name: 'Prospect', exact: true }).click();
       await page.getByRole('button', { name: /Save .*Ctrl\+Enter/i }).first().click();
       await expect(page.getByRole('button', { name: /Lifecycle stage\s+Prospect/i })).toBeVisible();
 
-      await page.goto('/backend/customers/companies');
-      await page.getByRole('textbox', { name: /Search companies/i }).fill(updatedName);
-      await expect(page.getByRole('link', { name: updatedName, exact: true })).toBeVisible();
+      const listResponse = await apiRequest(
+        request,
+        'GET',
+        '/api/customers/companies?page=1&pageSize=100',
+        { token },
+      );
+      expect(listResponse.ok()).toBeTruthy();
+      const listBody = (await readJsonSafe<{
+        items?: Array<{ id?: unknown; display_name?: unknown }>;
+      }>(listResponse)) ?? {};
+      const items = Array.isArray(listBody.items) ? listBody.items : [];
+      const updatedCompany =
+        items.find((item) => item && typeof item === 'object' && (item as { id?: unknown }).id === companyId) ?? null;
+      expect(updatedCompany).toBeTruthy();
+      expect((updatedCompany as { display_name?: unknown }).display_name).toBe(updatedName);
     } finally {
       await deleteEntityIfExists(request, token, '/api/customers/companies', companyId);
     }

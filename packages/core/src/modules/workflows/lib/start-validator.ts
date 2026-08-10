@@ -9,7 +9,11 @@
 import { EntityManager } from '@mikro-orm/core'
 import { WorkflowDefinition } from '../data/entities'
 import * as ruleEngine from '../../business_rules/lib/rule-engine'
+import { findWorkflowDefinition } from './find-definition'
 import type { StartPreCondition } from '../data/validators'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('workflows')
 
 // ============================================================================
 // Types and Interfaces
@@ -110,12 +114,16 @@ export async function validateWorkflowStart(
 
   const preConditions: StartPreCondition[] = startStep.preConditions || []
 
-  console.log('[start-validator] START step:', JSON.stringify(startStep, null, 2))
-  console.log('[start-validator] preConditions:', preConditions.length, JSON.stringify(preConditions))
+  logger.debug('Evaluating START step pre-conditions', {
+    component: 'start-validator',
+    startStep,
+    preConditionCount: preConditions.length,
+    preConditions,
+  })
 
   // If no pre-conditions, workflow can start
   if (preConditions.length === 0) {
-    console.log('[start-validator] No pre-conditions defined, allowing start')
+    logger.debug('No pre-conditions defined, allowing start', { component: 'start-validator' })
     return {
       canStart: true,
       errors: [],
@@ -258,38 +266,4 @@ function getLocalizedMessage(
   return defaultMessage
 }
 
-/**
- * Find workflow definition by ID and optional version
- */
-async function findWorkflowDefinition(
-  em: EntityManager,
-  options: {
-    workflowId: string
-    version?: number
-    tenantId: string
-    organizationId: string
-  }
-): Promise<WorkflowDefinition | null> {
-  const { workflowId, version, tenantId, organizationId } = options
-
-  const where: any = {
-    workflowId,
-    tenantId,
-    organizationId,
-    deletedAt: null,
-  }
-
-  if (version !== undefined) {
-    where.version = version
-  }
-
-  // If no version specified, get latest enabled version
-  if (version === undefined) {
-    where.enabled = true
-    return em.findOne(WorkflowDefinition, where, {
-      orderBy: { version: 'DESC' },
-    })
-  }
-
-  return em.findOne(WorkflowDefinition, where)
-}
+// findWorkflowDefinition is imported from ./find-definition

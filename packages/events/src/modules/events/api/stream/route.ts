@@ -9,8 +9,10 @@
  */
 
 import { resolveRequestContext } from '@open-mercato/shared/lib/api/context'
+import { createLogger } from '@open-mercato/shared/lib/logger'
 import { isBroadcastEvent } from '@open-mercato/shared/modules/events'
-import { registerGlobalEventTap } from '../../../../bus'
+import { registerCrossProcessEventListener, registerGlobalEventTap } from '../../../../bus'
+import type { EmitOptions } from '../../../../types'
 
 export const metadata = {
   GET: { requireAuth: true },
@@ -18,6 +20,8 @@ export const metadata = {
 
 const HEARTBEAT_INTERVAL_MS = 30_000
 const MAX_PAYLOAD_BYTES = 4096
+
+const logger = createLogger('events').child({ component: 'stream' })
 
 type SseConnection = {
   tenantId: string
@@ -40,19 +44,29 @@ function collectStringValues(input: unknown): string[] {
   return values
 }
 
-function normalizeAudience(data: Record<string, unknown>): {
+function normalizeAudience(data: Record<string, unknown>, options?: EmitOptions): {
   tenantId: string | null
   organizationScopes: string[]
   recipientUserScopes: string[]
   recipientRoleScopes: string[]
 } {
-  const tenantId = typeof data.tenantId === 'string' ? data.tenantId : null
+  const trustedTenantId = typeof options?.tenantId === 'string' && options.tenantId.trim().length > 0
+    ? options.tenantId.trim()
+    : null
+  const tenantId = trustedTenantId ?? (typeof data.tenantId === 'string' ? data.tenantId : null)
   const organizationScopes = new Set<string>()
-  if (typeof data.organizationId === 'string' && data.organizationId.trim().length > 0) {
-    organizationScopes.add(data.organizationId.trim())
-  }
-  for (const organizationId of collectStringValues(data.organizationIds)) {
-    organizationScopes.add(organizationId)
+  const trustedOrganizationId = typeof options?.organizationId === 'string' && options.organizationId.trim().length > 0
+    ? options.organizationId.trim()
+    : null
+  if (trustedOrganizationId) {
+    organizationScopes.add(trustedOrganizationId)
+  } else {
+    if (typeof data.organizationId === 'string' && data.organizationId.trim().length > 0) {
+      organizationScopes.add(data.organizationId.trim())
+    }
+    for (const organizationId of collectStringValues(data.organizationIds)) {
+      organizationScopes.add(organizationId)
+    }
   }
 
   const recipientUserScopes = new Set<string>()
@@ -109,6 +123,40 @@ const connections = new Set<SseConnection>()
 
 let globalTapRegistered = false
 
+async function broadcastEventToConnections(
+  eventName: string,
+  payload: Record<string, unknown>,
+  options?: EmitOptions,
+): Promise<void> {
+  if (!eventName || connections.size === 0) return
+
+  if (!isBroadcastEvent(eventName)) return
+
+  const data = payload ?? {}
+  const audience = normalizeAudience(data, options)
+
+  const organizationId = audience.organizationScopes[0] ?? ''
+  let ssePayload = buildSsePayload(eventName, data, organizationId)
+
+  if (new TextEncoder().encode(ssePayload).length > MAX_PAYLOAD_BYTES) {
+    ssePayload = buildTruncatedPayload(eventName, data, organizationId)
+    if (new TextEncoder().encode(ssePayload).length > MAX_PAYLOAD_BYTES) {
+      logger.warn('Event payload exceeds size limit, skipping', { event: eventName, maxBytes: MAX_PAYLOAD_BYTES })
+      return
+    }
+  }
+
+  for (const conn of connections) {
+    if (!matchesAudience(conn, audience)) continue
+
+    try {
+      conn.send(ssePayload)
+    } catch {
+      // Connection may have been closed; cleanup happens via abort handler
+    }
+  }
+}
+
 function buildSsePayload(eventName: string, data: Record<string, unknown>, organizationId: string): string {
   return JSON.stringify({
     id: eventName,
@@ -147,36 +195,17 @@ function ensureGlobalTapSubscription(): void {
   if (globalTapRegistered) return
   globalTapRegistered = true
 
-  registerGlobalEventTap(async (eventName, payload) => {
-    if (!eventName || connections.size === 0) return
+  registerGlobalEventTap(async (eventName, payload, options) => {
+    await broadcastEventToConnections(eventName, (payload ?? {}) as Record<string, unknown>, options)
+  })
 
-    // Only bridge events with clientBroadcast: true
-    if (!isBroadcastEvent(eventName)) return
-
-    const data = (payload ?? {}) as Record<string, unknown>
-    const audience = normalizeAudience(data)
-
-    const organizationId = audience.organizationScopes[0] ?? ''
-    let ssePayload = buildSsePayload(eventName, data, organizationId)
-
-    // Enforce max payload size
-    if (new TextEncoder().encode(ssePayload).length > MAX_PAYLOAD_BYTES) {
-      ssePayload = buildTruncatedPayload(eventName, data, organizationId)
-      if (new TextEncoder().encode(ssePayload).length > MAX_PAYLOAD_BYTES) {
-        console.warn(`[events:stream] Event ${eventName} payload exceeds ${MAX_PAYLOAD_BYTES} bytes, skipping`)
-        return
-      }
-    }
-
-    for (const conn of connections) {
-      if (!matchesAudience(conn, audience)) continue
-
-      try {
-        conn.send(ssePayload)
-      } catch {
-        // Connection may have been closed; cleanup happens via abort handler
-      }
-    }
+  registerCrossProcessEventListener(async (envelope) => {
+    if (envelope.originPid === process.pid) return
+    await broadcastEventToConnections(
+      envelope.event,
+      (envelope.payload ?? {}) as Record<string, unknown>,
+      envelope.options,
+    )
   })
 }
 
@@ -199,6 +228,7 @@ export async function GET(req: Request): Promise<Response> {
   const encoder = new TextEncoder()
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null
   let connection: SseConnection | null = null
+  const onAbort = () => cleanup()
 
   const stream = new ReadableStream({
     start(controller) {
@@ -215,6 +245,14 @@ export async function GET(req: Request): Promise<Response> {
         close: () => controller.close(),
       }
       connections.add(connection)
+
+      // Flush an initial comment so the runtime sends the response headers and
+      // first body byte immediately. Without it, the streamed Response stays
+      // unflushed until the first heartbeat (30s) or matching event, which
+      // delays the browser EventSource `open` event — clients that gate work on
+      // a "connected" signal would otherwise stall for up to 30s after mount.
+      // Comment lines (`:` prefix) are ignored by EventSource message parsing.
+      controller.enqueue(encoder.encode(': connected\n\n'))
 
       // Start heartbeat to keep connection alive
       heartbeatTimer = setInterval(() => {
@@ -239,10 +277,12 @@ export async function GET(req: Request): Promise<Response> {
       connections.delete(connection)
       connection = null
     }
+    // Detach from the request signal so reconnect churn does not accumulate
+    // listeners and closures on long-lived AbortSignals.
+    req.signal.removeEventListener('abort', onAbort)
   }
 
-  // Clean up when client disconnects
-  req.signal.addEventListener('abort', cleanup)
+  req.signal.addEventListener('abort', onAbort, { once: true })
 
   return new Response(stream, {
     status: 200,

@@ -10,10 +10,15 @@ import { resolveOrganizationScopeForRequest, type OrganizationScope } from '@ope
 import { serializeOperationMetadata } from '@open-mercato/shared/lib/commands/operationMetadata'
 import { parseBooleanToken } from '@open-mercato/shared/lib/boolean'
 import {
-  runCrudMutationGuardAfterSuccess,
-  validateCrudMutationGuard,
-  type CrudMutationGuardValidationResult,
-} from './mutation-guard'
+  runMutationGuards,
+  bridgeLegacyGuard,
+  type MutationGuard,
+  type MutationGuardAfterInput,
+} from './mutation-guard-registry'
+import { getAllMutationGuardInstances } from './mutation-guard-store'
+import { getAllSyncSubscribers } from './sync-subscriber-store'
+import { collectSyncSubscribers, runSyncBeforeEvent, runSyncAfterEvent } from './sync-event-runner'
+import type { SyncCrudEventPayload } from './sync-event-types'
 import type { RateLimitConfig } from '@open-mercato/shared/lib/ratelimit/types'
 import type {
   CrudEventAction,
@@ -25,13 +30,21 @@ import {
   extractCustomFieldValuesFromPayload,
   extractAllCustomFieldEntries,
   decorateRecordWithCustomFields,
+  applyCustomFieldsNormalization,
   loadCustomFieldDefinitionIndex,
 } from './custom-fields'
+import {
+  canReuseCustomFieldDefinitions,
+  resolveCfDefIndexOrgCandidates,
+  type CustomFieldDefinitionIndex,
+  type ResolvedCustomFieldDefinitions,
+} from './custom-field-definition-index'
 import { serializeExport, normalizeExportFormat, defaultExportFilename, ensureColumns, type CrudExportFormat, type PreparedExport } from './exporters'
-import { CrudHttpError } from './errors'
+import { CrudHttpError, isCrudHttpError } from './errors'
 import type { CommandBus, CommandLogMetadata } from '@open-mercato/shared/lib/commands'
 import type { EntityId } from '@open-mercato/shared/modules/entities'
 import type { EntityManager } from '@mikro-orm/postgresql'
+import type { CacheStrategy } from '@open-mercato/cache'
 import {
   buildCollectionTags,
   buildRecordTag,
@@ -49,8 +62,75 @@ import {
 import { deriveCrudSegmentTag } from './cache-stats'
 import { createProfiler, shouldEnableProfiler, type Profiler } from '@open-mercato/shared/lib/profiler'
 import { getTranslationOverlayPlugin } from '@open-mercato/shared/lib/localization/overlay-plugin'
-import { applyResponseEnrichers, applyResponseEnricherToRecord } from './enricher-runner'
+import { applyResponseEnrichers, applyResponseEnricherToRecord, resolveListCacheEnricherPlan, type ListCacheEnricherPlan } from './enricher-runner'
 import type { EnricherContext } from './response-enricher'
+import type { ApiInterceptorMethod, InterceptorRequest, InterceptorResponse } from './api-interceptor'
+import { runApiInterceptorsAfter, runApiInterceptorsBefore } from './interceptor-runner'
+import { mergeIdFilter, parseIdsParam, isIdsParamProvided } from './ids'
+import { mergeAdvancedFilters } from './advanced-filter-integration'
+import { parseExtensionHeaders } from '../umes/extension-headers'
+import { createGenericOptimisticLockReader } from './optimistic-lock'
+import { registerOptimisticLockReaderIfAbsent } from './optimistic-lock-store'
+import { createLogger } from '../logger'
+
+type RbacServiceLike = {
+  getGrantedFeatures: (userId: string, opts: { tenantId: string | null; organizationId: string | null }) => Promise<string[]>
+}
+
+const logger = createLogger('shared').child({ component: 'crud' })
+
+function resolveSortParams(queryParams: Record<string, unknown>) {
+  const rawSortField = queryParams.sortField ?? queryParams.sort ?? 'id'
+  const rawSortDir = queryParams.sortDir ?? queryParams.order ?? 'asc'
+  const sortField = typeof rawSortField === 'string' && rawSortField.trim().length > 0 ? rawSortField.trim() : 'id'
+  const normalizedDir = typeof rawSortDir === 'string' ? rawSortDir.trim().toLowerCase() : 'asc'
+  const sortDir = normalizedDir === 'desc' ? SortDir.Desc : SortDir.Asc
+  return { sortField, sortDir }
+}
+
+function normalizeSortFieldSelector(sortField: string): string {
+  if (sortField.startsWith('cf_')) return `cf:${sortField.slice(3)}`
+  return sortField
+}
+/**
+ * Translates column-name filter keys to MikroORM property names so the ORM
+ * fallback path can apply buildFilters correctly.  Without this, filters like
+ * `{ entity_id: { $eq: uuid } }` are silently ignored by MikroORM when the
+ * underlying property is a @ManyToOne relation named `entity`.
+ *
+ * Uses em.getMetadata() to build a fieldName -> propertyName map at runtime.
+ */
+function translateFiltersForOrm(
+  filters: Record<string, unknown>,
+  em: any,
+  entityClass: any,
+): Record<string, unknown> {
+  if (!filters || typeof filters !== 'object') return filters
+  try {
+    const metadata = em?.getMetadata?.()
+    if (!metadata) return filters
+    const meta = metadata.find?.(entityClass.name ?? entityClass)
+    if (!meta?.properties) return filters
+    const columnToProperty = new Map<string, string>()
+    for (const [propName, propMeta] of Object.entries<any>(meta.properties)) {
+      const fieldNames: string[] = propMeta.fieldNames ?? []
+      for (const fn of fieldNames) {
+        if (fn !== propName) {
+          columnToProperty.set(fn, propName)
+        }
+      }
+    }
+    if (columnToProperty.size === 0) return filters
+    const translated: Record<string, unknown> = {}
+    for (const [key, value] of Object.entries(filters)) {
+      const mappedKey = columnToProperty.get(key) ?? key
+      translated[mappedKey] = value
+    }
+    return translated
+  } catch {
+    return filters
+  }
+}
 
 export type CrudHooks<TCreate, TUpdate, TList> = {
   beforeList?: (q: TList, ctx: CrudCtx) => Promise<void> | void
@@ -65,6 +145,7 @@ export type CrudHooks<TCreate, TUpdate, TList> = {
 
 export type CrudMethodMetadata = {
   requireAuth?: boolean
+  /** @deprecated Use `requireFeatures` instead — role names are mutable and can be spoofed */
   requireRoles?: string[]
   requireFeatures?: string[]
   rateLimit?: RateLimitConfig
@@ -99,13 +180,25 @@ export type CustomFieldsConfig =
 export type CrudListCustomFieldDecorator = {
   entityIds: EntityId | EntityId[]
   resolveContext?: (item: any, ctx: CrudCtx) => { organizationId?: string | null; tenantId?: string | null }
+  /**
+   * When true, the factory removes raw `cf_*` and `cf:*` keys from each list
+   * item after extracting them into `customValues` / `customFields`. Recommended
+   * for new modules — produces the single canonical response shape requested in
+   * #1769. Defaults to `false` so existing callers that read `cf_*` from the
+   * top level keep working until they migrate.
+   */
+  stripPrefixedKeys?: boolean
 }
 
 export type ListConfig<TList> = {
   schema: z.ZodType<TList>
-  // Optional: use the QueryEngine when entityId + fields are provided
+  // Optional: use the QueryEngine when entityId + fields are provided.
+  // A function form lets a route narrow the projection per request — e.g. drop
+  // large detail-only JSONB columns from grid listings while still selecting
+  // them for single-document fetches (`?id=`). Returning fewer columns avoids
+  // fetching and decrypting blobs the list never renders (#2233).
   entityId?: any
-  fields?: any[]
+  fields?: any[] | ((query: TList, ctx: CrudCtx) => any[])
   sortFieldMap?: Record<string, any>
   buildFilters?: (query: TList, ctx: CrudCtx) => Where<any> | Promise<Where<any>>
   transformItem?: (item: any) => any
@@ -119,6 +212,24 @@ export type ListConfig<TList> = {
   customFieldSources?: QueryCustomFieldSource[]
   joins?: QueryJoinEdge[]
   decorateCustomFields?: CrudListCustomFieldDecorator
+  /**
+   * When true, LIST queries skip the default organization_id / tenant_id guards in both the
+   * query-engine path and the ORM-fallback path (including the empty-`organizationIds`
+   * short-circuit and the automatic scope injection into `buildScopedWhere`).
+   *
+   * `buildFilters` MUST fully encode row visibility (typically as `$or` of scoped branches) and
+   * MUST fail closed when the principal lacks a resolvable tenant/org.
+   *
+   * Scope: this flag only affects GET/list reads. Update and delete operations always keep
+   * their automatic tenant/org scoping in `buildScopedWhere` as a write-side safety guard, so
+   * callers cannot accidentally mutate rows outside the caller's tenant/org.
+   *
+   * With this flag, `HybridQueryEngine` delegates to the basic engine, so custom-field (`cf:*`)
+   * filters/sorts, `search_tokens` fulltext filtering, and vector-search branches are bypassed.
+   */
+  omitAutomaticTenantOrgScope?: boolean
+  /** When true, skip server-side CRUD GET cache for this list (avoids stale empty payloads after mutations). */
+  disableListCache?: boolean
 }
 
 export type CrudExportColumnConfig = {
@@ -341,8 +452,8 @@ export type CrudFactoryOptions<TCreate, TUpdate, TList> = {
   create?: CreateConfig<TCreate>
   update?: UpdateConfig<TUpdate>
   del?: DeleteConfig
-  events?: CrudEventsConfig
-  indexer?: CrudIndexerConfig
+  events?: CrudEventsConfig<any>
+  indexer?: CrudIndexerConfig<any>
   resolveIdentifiers?: CrudIdentifierResolver
   hooks?: CrudHooks<TCreate, TUpdate, TList>
   actions?: {
@@ -401,6 +512,14 @@ function json(data: any, init?: ResponseInit) {
   })
 }
 
+// Name of the selected-organization cookie (mirrors the directory module's
+// OrganizationSwitcher, which writes `om_selected_org=...; path=/; samesite=lax`).
+// Kept as a local literal so shared has no import dependency on a domain package.
+const SELECTED_ORG_COOKIE = 'om_selected_org'
+// Set-Cookie value that expires the stale selection so the next request falls
+// back to the caller's home org. Attributes mirror how the switcher sets it.
+const CLEAR_SELECTED_ORG_COOKIE = `${SELECTED_ORG_COOKIE}=; Path=/; Max-Age=0; SameSite=Lax`
+
 function attachOperationHeader(res: Response, logEntry: any) {
   if (!res || !(res instanceof Response)) return res
   if (!logEntry || typeof logEntry !== 'object') return res
@@ -431,20 +550,14 @@ function attachOperationHeader(res: Response, logEntry: any) {
   return res
 }
 
-function buildMutationGuardErrorResponse(validation: CrudMutationGuardValidationResult): Response | null {
-  if (validation.ok) return null
-  return json(validation.body, { status: validation.status })
-}
-
 function handleError(err: unknown): Response {
   if (err instanceof Response) return err
-  if (err instanceof CrudHttpError) return json(err.body, { status: err.status })
+  if (isCrudHttpError(err)) return json(err.body, { status: err.status })
   if (err instanceof z.ZodError) return json({ error: 'Invalid input', details: err.issues }, { status: 400 })
 
   const message = err instanceof Error ? err.message : undefined
   const stack = err instanceof Error ? err.stack : undefined
-  // eslint-disable-next-line no-console
-  console.error('[crud] unexpected error', { message, stack, err })
+  logger.error('Unexpected CRUD error', { message, stack, err })
   const body: Record<string, unknown> = {
     error: 'Internal server error',
     message: 'Something went wrong. Please try again later.',
@@ -452,28 +565,159 @@ function handleError(err: unknown): Response {
   return json(body, { status: 500 })
 }
 
+const LIFECYCLE_ACTION_MAP: Record<string, { before: string; after: string }> = {
+  created: { before: 'creating', after: 'created' },
+  updated: { before: 'updating', after: 'updated' },
+  deleted: { before: 'deleting', after: 'deleted' },
+}
+
+function deriveLifecycleEventIds(events: CrudEventsConfig | undefined, action: 'created' | 'updated' | 'deleted'): { beforeEventId: string | null; afterEventId: string | null; entity: string | null } {
+  if (!events?.module || !events?.entity) return { beforeEventId: null, afterEventId: null, entity: null }
+  const mapping = LIFECYCLE_ACTION_MAP[action]
+  if (!mapping) return { beforeEventId: null, afterEventId: null, entity: null }
+  const entity = `${events.module}.${events.entity}`
+  return {
+    beforeEventId: `${entity}.${mapping.before}`,
+    afterEventId: `${entity}.${mapping.after}`,
+    entity,
+  }
+}
+
+function buildSyncPayload(
+  base: {
+    eventId: string
+    entity: string
+    operation: 'create' | 'update' | 'delete'
+    timing: 'before' | 'after'
+    resourceId: string | null
+    userId: string
+    organizationId: string | null
+    tenantId: string
+    em: EntityManager
+    request: Request
+  },
+  extra?: {
+    payload?: Record<string, unknown>
+    previousData?: Record<string, unknown>
+    entityData?: Record<string, unknown>
+  },
+): SyncCrudEventPayload {
+  return {
+    ...base,
+    payload: extra?.payload,
+    previousData: extra?.previousData,
+    entityData: extra?.entityData,
+  }
+}
+
+function collectAndRunGuards(
+  container: AwilixContainer,
+): { allGuards: MutationGuard[] } {
+  const allGuards = [...getAllMutationGuardInstances()]
+  const legacyGuard = bridgeLegacyGuard(container)
+  if (legacyGuard) allGuards.push(legacyGuard)
+  return { allGuards }
+}
+
+async function runGuardAfterSuccessCallbacks(
+  callbacks: Array<{ guard: MutationGuard; metadata: Record<string, unknown> | null }>,
+  base: Omit<MutationGuardAfterInput, 'metadata'>,
+): Promise<void> {
+  for (const { guard, metadata: guardMeta } of callbacks) {
+    try {
+      await guard.afterSuccess!({ ...base, metadata: guardMeta })
+    } catch (error) {
+      logger.error('Mutation guard afterSuccess failed', { guardId: guard.id, err: error })
+    }
+  }
+}
+
+function snapshotEntity(entity: unknown): Record<string, unknown> | undefined {
+  if (!entity || typeof entity !== 'object') return undefined
+  return safeClone(entity) as Record<string, unknown>
+}
+
+function normalizeInterceptorRoutePath(request: Request): string {
+  try {
+    const pathname = new URL(request.url).pathname
+    if (pathname.startsWith('/api/')) return pathname.slice(5)
+    if (pathname === '/api') return ''
+    return pathname.replace(/^\/+/, '')
+  } catch {
+    return ''
+  }
+}
+
+function toInterceptorHeaders(headers: Headers): Record<string, string> {
+  const output: Record<string, string> = {}
+  headers.forEach((value, key) => {
+    output[key] = value
+  })
+  return output
+}
+
+function cleanInterceptorObject(
+  value: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  return Object.fromEntries(Object.entries(value).filter(([, current]) => current !== undefined))
+}
+
 function isUuid(v: any): v is string {
   return typeof v === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v)
 }
 
-type AccessLogServiceLike = { log: (input: any) => Promise<unknown> | unknown }
+type AccessLogServiceLike = {
+  log: (input: any) => Promise<unknown> | unknown
+  logMany?: (inputs: any[]) => Promise<unknown> | unknown
+  flush?: () => Promise<void> | void
+}
 
 function resolveAccessLogService(container: AwilixContainer): AccessLogServiceLike | null {
+  const registrations = (container as { registrations?: Record<string, unknown> }).registrations
+  if (registrations && !Object.prototype.hasOwnProperty.call(registrations, 'accessLogService')) {
+    return null
+  }
+
   try {
     const service = container.resolve?.('accessLogService') as AccessLogServiceLike | undefined
     if (service && typeof service.log === 'function') return service
-  } catch (err) {
-    try {
-      console.warn('[crud] accessLogService not available in container', err)
-    } catch {}
+  } catch {
+    return null
   }
   return null
 }
 
+function shouldBlockAccessLogWrites(): boolean {
+  return process.env.OM_CRUD_ACCESS_LOG_BLOCKING === '1'
+}
+
+// Module-level set of in-flight access-log writes started by the CRUD factory.
+// Sits alongside the same registry inside AccessLogService so callers without
+// the concrete service (or in tests with mocks) can still drain pending work
+// via `flushPendingCrudAccessLogs()`.
+const pendingCrudAccessLogPromises = new Set<Promise<unknown>>()
+
+function trackPendingCrudAccessLogPromise<T>(promise: Promise<T>): Promise<T> {
+  pendingCrudAccessLogPromises.add(promise as unknown as Promise<unknown>)
+  promise
+    .catch(() => undefined)
+    .finally(() => {
+      pendingCrudAccessLogPromises.delete(promise as unknown as Promise<unknown>)
+    })
+  return promise
+}
+
+export async function flushPendingCrudAccessLogs(): Promise<void> {
+  while (pendingCrudAccessLogPromises.size > 0) {
+    const snapshot = Array.from(pendingCrudAccessLogPromises)
+    await Promise.allSettled(snapshot)
+  }
+}
+
 function logForbidden(details: Record<string, unknown>) {
   try {
-    // eslint-disable-next-line no-console
-    console.warn('[crud] Forbidden request', details)
+    logger.warn('Forbidden request', details)
   } catch {}
 }
 
@@ -521,12 +765,18 @@ export type LogCrudAccessOptions = {
   fields?: string[]
 }
 
-export async function logCrudAccess(options: LogCrudAccessOptions) {
+export type LogCrudAccessResult = {
+  mode: 'batch' | 'fanout' | 'blocking' | 'skipped'
+  count: number
+  pending: number
+}
+
+export async function logCrudAccess(options: LogCrudAccessOptions): Promise<LogCrudAccessResult> {
   const { container, auth, request, items, resourceKind } = options
-  if (!auth) return
-  if (!Array.isArray(items) || items.length === 0) return
+  if (!auth) return { mode: 'skipped', count: 0, pending: pendingCrudAccessLogPromises.size }
+  if (!Array.isArray(items) || items.length === 0) return { mode: 'skipped', count: 0, pending: pendingCrudAccessLogPromises.size }
   const service = resolveAccessLogService(container)
-  if (!service) return
+  if (!service) return { mode: 'skipped', count: 0, pending: pendingCrudAccessLogPromises.size }
 
   const idField = options.idField || 'id'
   const tenantId = options.tenantId ?? auth.tenantId ?? null
@@ -552,7 +802,7 @@ export async function logCrudAccess(options: LogCrudAccessOptions) {
   }
 
   const uniqueIds = new Set<string>()
-  const tasks: Promise<unknown>[] = []
+  const payloads: Record<string, unknown>[] = []
   for (const item of items) {
     if (!item || typeof item !== 'object') continue
     const rawId = (item as any)[idField]
@@ -569,16 +819,41 @@ export async function logCrudAccess(options: LogCrudAccessOptions) {
     }
     if (fields.length > 0) payload.fields = fields
     if (Object.keys(context).length > 0) payload.context = context
-      tasks.push(
-        Promise.resolve(service.log(payload)).catch((err) => {
-          try {
-            console.error('[crud] failed to record access log', { err, payload })
-          } catch {}
-          return undefined
-        })
-      )
+    payloads.push(payload)
   }
-  if (tasks.length > 0) await Promise.all(tasks)
+  if (!payloads.length) return { mode: 'skipped', count: 0, pending: pendingCrudAccessLogPromises.size }
+
+  const blocking = shouldBlockAccessLogWrites()
+  const dispatchMode: 'batch' | 'fanout' = typeof service.logMany === 'function' ? 'batch' : 'fanout'
+  const writePromise = (async () => {
+    try {
+      if (typeof service.logMany === 'function') {
+        await service.logMany(payloads)
+      } else {
+        // Legacy fallback for service mocks/implementations without logMany.
+        await Promise.all(
+          payloads.map((payload) =>
+            Promise.resolve(service.log(payload)).catch((err) => {
+              try {
+                logger.error('Failed to record access log', { err, payload })
+              } catch {}
+              return undefined
+            }),
+          ),
+        )
+      }
+    } catch (err) {
+      try {
+        logger.error('Failed to record access logs (batch)', { err, count: payloads.length })
+      } catch {}
+    }
+  })()
+  trackPendingCrudAccessLogPromise(writePromise)
+  if (blocking) {
+    await writePromise
+    return { mode: 'blocking', count: payloads.length, pending: pendingCrudAccessLogPromises.size }
+  }
+  return { mode: dispatchMode, count: payloads.length, pending: pendingCrudAccessLogPromises.size }
 }
 
 type CrudCacheStoredValue = {
@@ -616,18 +891,23 @@ function serializeSearchParams(params: URLSearchParams): string {
     existing.push(value)
     grouped.set(key, existing)
   })
-  const normalized: Array<[string, string[]]> = Array.from(grouped.entries()).map(([key, values]) => [key, values.sort()])
+  const normalized: Array<[string, string[]]> = Array.from(grouped.entries()).map(([key, values]) => [key, values.sort((a, b) => a.localeCompare(b))])
   normalized.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
   return JSON.stringify(normalized)
 }
 
-function buildCrudCacheKey(resource: string, request: Request, ctx: CrudCtx): string {
+function buildCrudCacheKey(
+  resource: string,
+  request: Request,
+  ctx: CrudCtx,
+  enricherSignature = '',
+): string {
   const url = new URL(request.url)
   const scopeIds = collectScopeOrganizationIds(ctx)
   const scopeSegment = scopeIds.length
-    ? scopeIds.map((id) => normalizeTagSegment(id)).sort().join(',')
+    ? scopeIds.map((id) => normalizeTagSegment(id)).sort((a, b) => a.localeCompare(b)).join(',')
     : 'none'
-  return [
+  const segments = [
     'crud',
     normalizeTagSegment(resource),
     'GET',
@@ -636,7 +916,18 @@ function buildCrudCacheKey(resource: string, request: Request, ctx: CrudCtx): st
     `selectedOrg:${normalizeTagSegment(ctx.selectedOrganizationId ?? null)}`,
     `scope:${scopeSegment}`,
     `query:${serializeSearchParams(url.searchParams)}`,
-  ].join('|')
+  ]
+  // The cached list payload already embeds enricher output (enrichment runs before
+  // the cache store), so the cache key MUST partition by the set of enrichers a
+  // request's entitlements actually select. Two callers in the same tenant/org
+  // scope but with different active enrichers (e.g. one holding the enricher's
+  // gating feature and one not) get distinct entries, which lets the cache-hit
+  // path skip re-running enrichers without leaking ACL-gated fields across
+  // feature cohorts. Routes without enrichers pass '' and keep their key shape.
+  if (enricherSignature) {
+    segments.push(`enrichers:${normalizeTagSegment(enricherSignature)}`)
+  }
+  return segments.join('|')
 }
 
 function extractRecordIds(items: any[], idField: string): string[] {
@@ -665,6 +956,27 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
   const resourceKind = resourceInfo.primary
   const resourceAliases = resourceInfo.aliases
   const resourceTargets = expandResourceAliases(resourceKind, resourceAliases)
+
+  // OSS opt-in optimistic locking — auto-register a generic reader for every
+  // CRUD entity using the factory's own ORM config (Step 13.3 of the spec at
+  // .ai/specs/implemented/2026-05-25-oss-optimistic-locking.md). Hand-wired readers
+  // registered earlier via module DI (customers/sales) always win because we
+  // use the `IfAbsent` variant. Skipped silently when the route has no
+  // resolvable resourceKind or no ORM entity class (e.g. virtual routes).
+  if (ormCfg.entity && resourceKind && resourceKind !== 'resource') {
+    const genericReader = createGenericOptimisticLockReader({
+      entity: ormCfg.entity,
+      idField: ormCfg.idField ?? 'id',
+      tenantField: ormCfg.tenantField,
+      orgField: ormCfg.orgField,
+      softDeleteField: ormCfg.softDeleteField,
+    })
+    const keysToRegister: Record<string, typeof genericReader> = { [resourceKind]: genericReader }
+    for (const alias of resourceAliases) {
+      if (alias && alias !== resourceKind) keysToRegister[alias] = genericReader
+    }
+    registerOptimisticLockReaderIfAbsent(keysToRegister)
+  }
   const defaultIdentifierResolver: CrudIdentifierResolver = (entity, _action) => {
     const id = normalizeIdentifierValue((entity as any)[ormCfg.idField!])
     const orgId = ormCfg.orgField ? normalizeIdentifierValue((entity as any)[ormCfg.orgField]) : null
@@ -704,7 +1016,11 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
     return null
   }
 
-  const decorateItemsWithCustomFields = async (items: any[], ctx: CrudCtx): Promise<any[]> => {
+  const decorateItemsWithCustomFields = async (
+    items: any[],
+    ctx: CrudCtx,
+    precomputedDefinitions?: ResolvedCustomFieldDefinitions,
+  ): Promise<any[]> => {
     if (!listCustomFieldDecorator || !Array.isArray(items) || items.length === 0) return items
     const entityIds = Array.isArray(listCustomFieldDecorator.entityIds)
       ? listCustomFieldDecorator.entityIds
@@ -724,13 +1040,33 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
         Array.isArray(ctx.organizationIds) && ctx.organizationIds.length
           ? ctx.organizationIds
           : [ctx.selectedOrganizationId ?? null]
-      const definitionIndex = await loadCustomFieldDefinitionIndex({
-        em,
-        entityIds,
-        tenantId: ctx.auth?.tenantId ?? null,
-        organizationIds,
+      const tenantId = ctx.auth?.tenantId ?? null
+      // Reuse the index the query engine already resolved for this same scope
+      // (#2133) instead of issuing a second `custom_field_defs` round-trip.
+      const reusable = canReuseCustomFieldDefinitions(precomputedDefinitions, {
+        entityIds: entityIds.map(String),
+        tenantId,
+        organizationIds: resolveCfDefIndexOrgCandidates(ctx.organizationIds, ctx.selectedOrganizationId ?? null),
       })
-      cfProfiler.mark('definitions_loaded', { definitionCount: definitionIndex.size })
+      let definitionIndex: CustomFieldDefinitionIndex
+      if (reusable && precomputedDefinitions) {
+        definitionIndex = precomputedDefinitions.index
+        cfProfiler.mark('definitions_reused', { definitionCount: definitionIndex.size })
+      } else {
+        let cfDefCache: CacheStrategy | null = null
+        try {
+          cfDefCache = ctx.container.resolve('cache') as CacheStrategy
+        } catch {}
+        definitionIndex = await loadCustomFieldDefinitionIndex({
+          em,
+          entityIds,
+          tenantId,
+          organizationIds,
+          cache: cfDefCache ?? null,
+          requestScope: ctx,
+        })
+        cfProfiler.mark('definitions_loaded', { definitionCount: definitionIndex.size })
+      }
       const decoratedItems = items.map((raw) => {
         if (!raw || typeof raw !== 'object') return raw
         const item = raw as Record<string, unknown>
@@ -749,12 +1085,9 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
           organizationId: organizationId ?? null,
           tenantId: tenantId ?? null,
         })
-        const output = {
-          ...item,
-          customValues: decorated.customValues,
-          customFields: decorated.customFields,
-        }
-        return output
+        return applyCustomFieldsNormalization(item, decorated, {
+          stripPrefixedKeys: listCustomFieldDecorator.stripPrefixedKeys === true,
+        })
       })
       cfProfiler.mark('decorate_complete', { itemCount: decoratedItems.length })
       endProfile({
@@ -763,7 +1096,7 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
       })
       return decoratedItems
     } catch (err) {
-      console.warn('[crud] failed to decorate custom fields', err)
+      logger.warn('Failed to decorate custom fields', { err })
       endProfile({
         result: 'error',
         entityIds: entityIds.length,
@@ -771,6 +1104,36 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
       })
       return items
     }
+  }
+
+  // Phase 3 — per-request userFeatures memo. CrudCtx is a plain object that
+  // lives only for the duration of one HTTP request, so a WeakMap keyed on
+  // ctx is the right scope: interceptor + enricher + any future call site
+  // share one Promise<string[] | undefined> per request. The cache lifetime
+  // is bounded by the request and cannot desync from mid-request grant
+  // changes because RBAC grants never change mid-request.
+  const userFeaturesPromiseCache = new WeakMap<object, Promise<string[] | undefined>>()
+
+  function resolveUserFeaturesOnce(ctx: CrudCtx): Promise<string[] | undefined> {
+    if (!ctx.auth) return Promise.resolve(undefined)
+    const cached = userFeaturesPromiseCache.get(ctx)
+    if (cached) return cached
+    const promise = (async () => {
+      try {
+        const rbac = ctx.container.resolve('rbacService') as RbacServiceLike | undefined
+        if (rbac?.getGrantedFeatures) {
+          return await rbac.getGrantedFeatures(ctx.auth!.sub, {
+            tenantId: ctx.auth!.tenantId,
+            organizationId: ctx.selectedOrganizationId ?? ctx.auth!.orgId,
+          })
+        }
+      } catch {
+        // rbacService not available — enrichers without feature requirements still run
+      }
+      return undefined
+    })()
+    userFeaturesPromiseCache.set(ctx, promise)
+    return promise
   }
 
   /**
@@ -781,27 +1144,118 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
     if (!opts.enrichers?.entityId) return null
     if (!ctx.auth) return null
 
-    let userFeatures: string[] | undefined
-    try {
-      const rbac = (ctx.container.resolve('rbacService') as any)
-      if (rbac?.getGrantedFeatures) {
-        userFeatures = await rbac.getGrantedFeatures(ctx.auth.sub, {
-          tenantId: ctx.auth.tenantId,
-          organizationId: ctx.selectedOrganizationId ?? ctx.auth.orgId,
-        })
-      }
-    } catch {
-      // rbacService not available — enrichers without feature requirements still run
-    }
+    const userFeatures = await resolveUserFeaturesOnce(ctx)
 
     return {
       organizationId: ctx.selectedOrganizationId ?? ctx.auth.orgId ?? '',
       tenantId: ctx.auth.tenantId ?? '',
       userId: ctx.auth.sub,
-      em: ctx.container.resolve('em'),
+      em: ctx.container.resolve('em') as EntityManager,
       container: ctx.container,
       userFeatures,
     }
+  }
+
+  async function resolveUserFeatures(ctx: CrudCtx): Promise<string[] | undefined> {
+    return resolveUserFeaturesOnce(ctx)
+  }
+
+  const NO_ENRICHER_CACHE_PLAN: ListCacheEnricherPlan = { signature: '', skipEnrichersOnCacheHit: false }
+
+  /**
+   * Resolve whether this request's CRUD list cache may embed enricher output and
+   * the cache-key signature to partition by. Returns the no-op plan when no
+   * enrichers are configured or active — keeping the cache key identical to the
+   * pre-enricher shape and forcing enrichers (if any) to run on every request.
+   */
+  async function resolveListCachePlan(ctx: CrudCtx): Promise<ListCacheEnricherPlan> {
+    if (!opts.enrichers?.entityId) return NO_ENRICHER_CACHE_PLAN
+    const enricherCtx = await buildEnricherContext(ctx)
+    if (!enricherCtx) return NO_ENRICHER_CACHE_PLAN
+    return resolveListCacheEnricherPlan(opts.enrichers.entityId, enricherCtx)
+  }
+
+  const interceptorContextCache = new WeakMap<object, ReturnType<typeof buildInterceptorContextInner>>()
+
+  async function buildInterceptorContextInner(ctx: CrudCtx) {
+    if (!ctx.auth) return null
+    return {
+      userId: ctx.auth.sub,
+      organizationId: ctx.selectedOrganizationId ?? ctx.auth.orgId ?? '',
+      tenantId: ctx.auth.tenantId ?? '',
+      em: ctx.container.resolve('em') as EntityManager,
+      container: ctx.container,
+      userFeatures: await resolveUserFeatures(ctx),
+    }
+  }
+
+  function buildInterceptorContext(ctx: CrudCtx) {
+    const cached = interceptorContextCache.get(ctx)
+    if (cached) return cached
+    const promise = buildInterceptorContextInner(ctx)
+    interceptorContextCache.set(ctx, promise)
+    return promise
+  }
+
+  async function applyInterceptorsBefore(args: {
+    ctx: CrudCtx
+    request: Request
+    method: ApiInterceptorMethod
+    body?: Record<string, unknown>
+    query?: Record<string, unknown>
+  }): Promise<{ errorResponse: Response | null; requestPayload: InterceptorRequest; metadataByInterceptor: Record<string, Record<string, unknown> | undefined> }> {
+    const interceptorContext = await buildInterceptorContext(args.ctx)
+    const requestPayload: InterceptorRequest = {
+      method: args.method,
+      url: args.request.url,
+      body: cleanInterceptorObject(args.body),
+      query: cleanInterceptorObject(args.query),
+      headers: toInterceptorHeaders(args.request.headers),
+    }
+    if (!interceptorContext) {
+      return { errorResponse: null, requestPayload, metadataByInterceptor: {} }
+    }
+    const contextWithHeaders = {
+      ...interceptorContext,
+      extensionHeaders: parseExtensionHeaders(requestPayload.headers),
+    }
+    const result = await runApiInterceptorsBefore({
+      routePath: normalizeInterceptorRoutePath(args.request),
+      method: args.method,
+      request: requestPayload,
+      context: contextWithHeaders,
+    })
+    if (!result.ok) {
+      return { errorResponse: json(result.body, { status: result.statusCode }), requestPayload, metadataByInterceptor: {} }
+    }
+    return { errorResponse: null, requestPayload: result.request, metadataByInterceptor: result.metadataByInterceptor }
+  }
+
+  async function applyInterceptorsAfter(args: {
+    ctx: CrudCtx
+    request: Request
+    method: ApiInterceptorMethod
+    requestPayload: InterceptorRequest
+    metadataByInterceptor: Record<string, Record<string, unknown> | undefined>
+    statusCode: number
+    body: Record<string, unknown>
+    headers?: Record<string, string>
+  }): Promise<{ ok: boolean; statusCode: number; body: Record<string, unknown>; headers: Record<string, string> } | null> {
+    const interceptorContext = await buildInterceptorContext(args.ctx)
+    if (!interceptorContext) return { ok: true, statusCode: args.statusCode, body: args.body, headers: args.headers ?? {} }
+    const result = await runApiInterceptorsAfter({
+      routePath: normalizeInterceptorRoutePath(args.request),
+      method: args.method,
+      request: args.requestPayload,
+      response: {
+        statusCode: args.statusCode,
+        body: args.body,
+        headers: args.headers ?? {},
+      } satisfies InterceptorResponse,
+      context: interceptorContext,
+      metadataByInterceptor: args.metadataByInterceptor,
+    })
+    return result
   }
 
   /**
@@ -895,6 +1349,42 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
     return { container, auth: scopedAuth, organizationScope: scope, selectedOrganizationId, organizationIds, request }
   }
 
+  // The caller explicitly selected an organization (selected-org cookie) that no
+  // longer resolves to a real, accessible org — e.g. a stale cookie after a DB
+  // reset, or after the caller lost access to that org. Rather than silently
+  // acting against a fallback org the caller did not select (writes) or showing
+  // a different org's data than the one selected (reads), fail loud on every
+  // org-scoped record operation so the client re-selects. Recovery surfaces
+  // (org switcher, nav, profile) are custom routes, not this factory, so they
+  // keep working. Returns a 422 Response when rejected, otherwise null.
+  function rejectInvalidOrgSelection(ctx: CrudCtx, action: 'list' | 'create' | 'update' | 'delete'): Response | null {
+    if (!ormCfg.orgField) return null
+    if (!(ctx.organizationScope as OrganizationScope | null | undefined)?.selectionRejected) return null
+    logForbidden({
+      resourceKind,
+      action,
+      reason: 'organization_selection_invalid',
+      userId: ctx.auth?.sub ?? null,
+      tenantId: ctx.auth?.tenantId ?? null,
+      organizationIds: ctx.organizationIds,
+    })
+    // Self-heal reads: expire the stale selected-org cookie so the caller's next
+    // request falls back to their home org and the session recovers on its own
+    // (important for single-org users, who have no org switcher to re-select
+    // from). Writes intentionally do NOT clear it — a mutation must go through an
+    // explicit, valid re-selection, never silently target a fallback org.
+    const headers: Record<string, string> = action === 'list'
+      ? { 'set-cookie': CLEAR_SELECTED_ORG_COOKIE }
+      : {}
+    return json(
+      {
+        error: 'Your selected organization is no longer available. Please re-select an organization and try again.',
+        code: 'organization_selection_invalid',
+      },
+      { status: 422, headers },
+    )
+  }
+
   async function GET(request: Request) {
     const profiler = createCrudProfiler(resourceKind, 'list')
     const requestMeta: Record<string, unknown> = { method: request.method }
@@ -922,15 +1412,42 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
         finishProfile({ reason: 'unauthorized' })
         return json({ error: 'Unauthorized' }, { status: 401 })
       }
+      const listSelectionRejected = rejectInvalidOrgSelection(ctx, 'list')
+      if (listSelectionRejected) {
+        finishProfile({ reason: 'organization_selection_invalid' })
+        return listSelectionRejected
+      }
       if (!opts.list) {
         finishProfile({ reason: 'list_not_configured' })
         return json({ error: 'Not implemented' }, { status: 501 })
       }
       const url = new URL(request.url)
-      const queryParams = Object.fromEntries(url.searchParams.entries())
+      const rawQueryParams = Object.fromEntries(url.searchParams.entries())
       profiler.mark('query_parsed')
-      const validated = opts.list.schema.parse(queryParams)
+      let validated = opts.list.schema.parse(rawQueryParams)
       profiler.mark('query_validated')
+
+      const beforeInterceptors = await applyInterceptorsBefore({
+        ctx,
+        request,
+        method: 'GET',
+        query: (validated as Record<string, unknown>),
+      })
+      if (beforeInterceptors.errorResponse) {
+        finishProfile({ result: 'interceptor_before_blocked' })
+        return beforeInterceptors.errorResponse
+      }
+      const interceptorRequest = beforeInterceptors.requestPayload
+      const interceptorMetadata = beforeInterceptors.metadataByInterceptor
+      if (interceptorRequest.query) {
+        validated = opts.list.schema.parse(interceptorRequest.query)
+      }
+      const queryParams = {
+        ...rawQueryParams,
+        ...(interceptorRequest.query ?? {}),
+      } as Record<string, unknown>
+      const parsedIds = parseIdsParam(queryParams.ids)
+      const idsParamProvided = isIdsParamProvided(queryParams.ids)
 
       await opts.hooks?.beforeList?.(validated as any, ctx)
       profiler.mark('before_list_hook')
@@ -946,12 +1463,14 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
       const exportFullRequested = exportRequested && (exportScope === 'full' || parseBooleanToken((queryParams as any).full) === true)
       profiler.mark('export_configured', { exportRequested, exportFullRequested })
 
-      const cacheEnabled = isCrudCacheEnabled() && !exportRequested
+      const cacheEnabled =
+        isCrudCacheEnabled() && !exportRequested && !opts.list?.disableListCache
       const cacheTimerStart = cacheEnabled && isCrudCacheDebugEnabled()
         ? process.hrtime.bigint()
         : null
       const cache = cacheEnabled ? resolveCrudCache(ctx.container) : null
-      const cacheKey = cacheEnabled ? buildCrudCacheKey(resourceKind, request, ctx) : null
+      const enricherCachePlan = cacheEnabled ? await resolveListCachePlan(ctx) : NO_ENRICHER_CACHE_PLAN
+      const cacheKey = cacheEnabled ? buildCrudCacheKey(resourceKind, request, ctx, enricherCachePlan.signature) : null
       let cacheStatus: 'hit' | 'miss' = 'miss'
       let cachedValue: CrudCacheStoredValue | null = null
 
@@ -971,6 +1490,7 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
       const maybeStoreCrudCache = async (payload: any) => {
         if (!cacheEnabled || !cache || !cacheKey) return
         if (!payload || typeof payload !== 'object') return
+        if (Array.isArray(payload)) return
         const items = Array.isArray((payload as any).items) ? (payload as any).items : []
         const tags = new Set<string>()
         const scopeOrgIds = collectScopeOrganizationIds(ctx)
@@ -1007,6 +1527,25 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
         }
       }
 
+      // Enrich the (miss-path) payload and store it in the CRUD cache, honoring
+      // the request's enricher cache plan:
+      // - skipEnrichersOnCacheHit: every active enricher is record-pure and safe
+      //   to embed, so enrich first and cache the enriched payload (a later hit
+      //   serves it without re-running enrichers — the #2222 optimization).
+      // - otherwise: cache the PRE-enrichment payload, then enrich only the
+      //   response. A later hit re-runs enrichers against fresh data, and no live
+      //   enrichment is ever embedded in the shared cache entry (avoids stale
+      //   cross-module output and cross-cohort ACL leaks).
+      const enrichAndStorePayload = async (payload: any) => {
+        if (enricherCachePlan.skipEnrichersOnCacheHit) {
+          await enrichListPayload(payload, ctx, profiler)
+          await maybeStoreCrudCache(payload)
+          return
+        }
+        await maybeStoreCrudCache(payload)
+        await enrichListPayload(payload, ctx, profiler)
+      }
+
       const logCacheOutcome = (event: 'hit' | 'miss', itemCount: number) => {
         if (!cacheTimerStart) return
         const elapsedMs = Number(process.hrtime.bigint() - cacheTimerStart) / 1_000_000
@@ -1041,6 +1580,24 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
         cacheStatus = 'hit'
         profiler.mark('cache_hit', { generatedAt: cachedValue.generatedAt ?? null })
         const payload = safeClone(cachedValue.payload)
+        if (!payload || typeof payload !== 'object' || Array.isArray(payload) || !Array.isArray((payload as any).items)) {
+          cacheStatus = 'miss'
+          profiler.mark('cache_payload_invalid', {
+            payloadType: Array.isArray(payload) ? 'array' : typeof payload,
+          })
+          try {
+            if (cache && cacheKey && typeof cache.delete === 'function') {
+              await cache.delete(cacheKey)
+            }
+          } catch {
+            // ignore cache eviction failure
+          }
+          cachedValue = null
+        }
+      }
+
+      if (cachedValue) {
+        const payload = safeClone(cachedValue.payload)
         const items = Array.isArray((payload as any)?.items) ? (payload as any).items : []
         profiler.mark('cache_payload_ready', { itemCount: items.length })
         await logCrudAccess({
@@ -1055,7 +1612,38 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
           query: validated,
         })
         await opts.hooks?.afterList?.(payload, { ...ctx, query: validated as any })
-        await enrichListPayload(payload, ctx, profiler)
+        const cacheAfterInterceptors = await applyInterceptorsAfter({
+          ctx,
+          request,
+          method: 'GET',
+          requestPayload: interceptorRequest,
+          metadataByInterceptor: interceptorMetadata,
+          statusCode: 200,
+          body: payload as Record<string, unknown>,
+        })
+        if (!cacheAfterInterceptors) {
+          finishProfile({ result: 'interceptor_after_empty', cacheStatus })
+          return json({ error: 'Internal interceptor error' }, { status: 500 })
+        }
+        if (!cacheAfterInterceptors.ok) {
+          finishProfile({ result: 'interceptor_after_failed', cacheStatus })
+          return json(cacheAfterInterceptors.body, { status: cacheAfterInterceptors.statusCode, headers: cacheAfterInterceptors.headers })
+        }
+        Object.assign(payload, cacheAfterInterceptors.body)
+        if (enricherCachePlan.skipEnrichersOnCacheHit) {
+          // Every active enricher is record-pure: the cached payload already
+          // embeds their output and the cache key is partitioned by the active
+          // enricher signature, so the cached enrichment matches this caller's
+          // entitlements exactly. Skipping it removes the per-hit enricher cost
+          // (the ~15ms regression reported in #2222) while staying ACL-gated.
+          profiler.mark('enrichers_skipped_cache_hit', { enricherSignature: enricherCachePlan.signature || null })
+        } else {
+          // Live-mode enrichers (or none): the cached payload is the
+          // pre-enrichment base, so re-run enrichers against current data. This
+          // keeps cross-module / time-dependent enrichment (catalog images,
+          // pipeline state) fresh on cache hits.
+          await enrichListPayload(payload, ctx, profiler)
+        }
         logCacheOutcome('hit', items.length)
         const response = respondWithPayload(payload)
         finishProfile({ result: 'cache_hit', cacheStatus })
@@ -1067,19 +1655,28 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
         profiler.mark('query_engine_prepare')
         const qe = (ctx.container.resolve('queryEngine') as QueryEngine)
         profiler.mark('query_engine_resolved')
-        const sortFieldRaw = (queryParams as any).sortField || 'id'
-        const sortDirRaw = ((queryParams as any).sortDir || 'asc').toLowerCase() === 'desc' ? SortDir.Desc : SortDir.Asc
-        const sortField = (opts.list.sortFieldMap && opts.list.sortFieldMap[sortFieldRaw]) || sortFieldRaw
+        const { sortField: sortFieldRaw, sortDir: sortDirRaw } = resolveSortParams(queryParams as Record<string, unknown>)
+        const mappedSortField = (opts.list.sortFieldMap && opts.list.sortFieldMap[sortFieldRaw]) || sortFieldRaw
+        const sortField = typeof mappedSortField === 'string' ? normalizeSortFieldSelector(mappedSortField) : mappedSortField
         const sort: Sort[] = [{ field: sortField as any, dir: sortDirRaw } as any]
         const page: Page = exportRequested
           ? { page: 1, pageSize: exportPageSize }
           : { page: requestedPage, pageSize: requestedPageSize }
-        const filters = exportFullRequested
+        const baseFilters = exportFullRequested
           ? ({} as Where<any>)
           : (opts.list.buildFilters ? await opts.list.buildFilters(validated as any, ctx) : ({} as Where<any>))
+        const filters = exportFullRequested
+          ? baseFilters
+          : mergeAdvancedFilters(baseFilters as Record<string, unknown>, validated as Record<string, unknown>) as Where<any>
+        const mergedFilters = exportFullRequested ? filters : mergeIdFilter(filters, parsedIds, { idsParamProvided })
         const withDeleted = parseBooleanToken((queryParams as any).withDeleted) === true
         profiler.mark('filters_ready', { withDeleted })
-        if (ormCfg.orgField && ctx.organizationIds && ctx.organizationIds.length === 0) {
+        if (
+          ormCfg.orgField &&
+          ctx.organizationIds &&
+          ctx.organizationIds.length === 0 &&
+          !opts.list?.omitAutomaticTenantOrgScope
+        ) {
           profiler.mark('scope_blocked')
           logForbidden({
             resourceKind,
@@ -1091,18 +1688,39 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
           })
           const emptyPayload = { items: [], total: 0, page: page.page, pageSize: page.pageSize, totalPages: 0 }
           await opts.hooks?.afterList?.(emptyPayload, { ...ctx, query: validated as any })
+          const emptyAfterInterceptors = await applyInterceptorsAfter({
+            ctx,
+            request,
+            method: 'GET',
+            requestPayload: interceptorRequest,
+            metadataByInterceptor: interceptorMetadata,
+            statusCode: 200,
+            body: emptyPayload as Record<string, unknown>,
+          })
+          if (!emptyAfterInterceptors) {
+            finishProfile({ result: 'interceptor_after_empty', cacheStatus, itemCount: 0, total: 0 })
+            return json({ error: 'Internal interceptor error' }, { status: 500 })
+          }
+          if (!emptyAfterInterceptors.ok) {
+            finishProfile({ result: 'interceptor_after_failed', cacheStatus, itemCount: 0, total: 0 })
+            return json(emptyAfterInterceptors.body, { status: emptyAfterInterceptors.statusCode, headers: emptyAfterInterceptors.headers })
+          }
+          Object.assign(emptyPayload, emptyAfterInterceptors.body)
           await maybeStoreCrudCache(emptyPayload)
           logCacheOutcome(cacheStatus, emptyPayload.items.length)
           const response = respondWithPayload(emptyPayload)
           finishProfile({ result: 'empty_scope', cacheStatus, itemCount: 0, total: 0 })
           return response
         }
+        const resolvedListFields = typeof opts.list.fields === 'function'
+          ? (opts.list.fields as (query: any, ctx: CrudCtx) => any[])(validated as any, ctx)
+          : opts.list.fields
         const queryOpts: any = {
-          fields: opts.list.fields!,
+          fields: resolvedListFields!,
           includeCustomFields: true,
           sort,
           page,
-          filters,
+          filters: mergedFilters,
           withDeleted,
         }
         if (opts.list.customFieldSources) {
@@ -1116,6 +1734,9 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
           queryOpts.organizationId = ctx.selectedOrganizationId ?? undefined
           queryOpts.organizationIds = ctx.organizationIds ?? undefined
         }
+        if (opts.list.omitAutomaticTenantOrgScope) {
+          queryOpts.omitAutomaticTenantOrgScope = true
+        }
         const queryEntity = String(opts.list.entityId)
         profiler.mark('query_options_ready')
         const queryProfiler = profiler.child('query_engine', { entity: queryEntity })
@@ -1123,7 +1744,7 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
         const rawItems = res.items || []
         let transformedItems = rawItems.map(i => (opts.list!.transformItem ? opts.list!.transformItem(i) : i))
         profiler.mark('transform_complete', { itemCount: transformedItems.length })
-        transformedItems = await decorateItemsWithCustomFields(transformedItems, ctx)
+        transformedItems = await decorateItemsWithCustomFields(transformedItems, ctx, res.customFieldDefinitions)
         profiler.mark('custom_fields_complete', { itemCount: transformedItems.length })
 
         if (opts.list?.entityId && request) {
@@ -1142,12 +1763,12 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
               }
             }
           } catch (err) {
-            console.warn('[CRUD] Translation overlay failed:', err)
+            logger.warn('Translation overlay failed', { err })
           }
           profiler.mark('translation_overlays_complete', { itemCount: transformedItems.length })
         }
 
-        await logCrudAccess({
+        const accessLogResult = await logCrudAccess({
           container: ctx.container,
           auth: ctx.auth,
           request,
@@ -1158,7 +1779,7 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
           tenantId: ctx.auth.tenantId ?? null,
           query: validated,
         })
-        profiler.mark('access_logged')
+        profiler.mark('access_logged', accessLogResult)
 
         if (exportRequested && requestedExport) {
           const total = typeof res.total === 'number' ? res.total : rawItems.length
@@ -1181,7 +1802,7 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
               const nextItemsRaw = nextRes.items || []
               if (!nextItemsRaw.length) break
               let nextTransformed = nextItemsRaw.map(i => (opts.list!.transformItem ? opts.list!.transformItem(i) : i))
-              nextTransformed = await decorateItemsWithCustomFields(nextTransformed, ctx)
+              nextTransformed = await decorateItemsWithCustomFields(nextTransformed, ctx, nextRes.customFieldDefinitions)
               const nextExportItems = exportFullRequested
                 ? nextItemsRaw.map(normalizeFullRecordForExport)
                 : nextTransformed
@@ -1237,8 +1858,25 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
         }
         await opts.hooks?.afterList?.(payload, { ...ctx, query: validated as any })
         profiler.mark('after_list_hook')
-        await enrichListPayload(payload, ctx, profiler)
-        await maybeStoreCrudCache(payload)
+        const afterInterceptors = await applyInterceptorsAfter({
+          ctx,
+          request,
+          method: 'GET',
+          requestPayload: interceptorRequest,
+          metadataByInterceptor: interceptorMetadata,
+          statusCode: 200,
+          body: payload as Record<string, unknown>,
+        })
+        if (!afterInterceptors) {
+          finishProfile({ result: 'interceptor_after_empty', cacheStatus })
+          return json({ error: 'Internal interceptor error' }, { status: 500 })
+        }
+        if (!afterInterceptors.ok) {
+          finishProfile({ result: 'interceptor_after_failed', cacheStatus })
+          return json(afterInterceptors.body, { status: afterInterceptors.statusCode, headers: afterInterceptors.headers })
+        }
+        Object.assign(payload, afterInterceptors.body)
+        await enrichAndStorePayload(payload)
         profiler.mark('cache_store_attempt', { cacheEnabled })
         logCacheOutcome(cacheStatus, payload.items.length)
         const response = respondWithPayload(payload)
@@ -1256,7 +1894,12 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
       const em = (ctx.container.resolve('em') as any)
       const repo = em.getRepository(ormCfg.entity)
       profiler.mark('orm_repo_ready')
-      if (ormCfg.orgField && ctx.organizationIds && ctx.organizationIds.length === 0) {
+      if (
+        ormCfg.orgField &&
+        ctx.organizationIds &&
+        ctx.organizationIds.length === 0 &&
+        !opts.list?.omitAutomaticTenantOrgScope
+      ) {
         profiler.mark('fallback_scope_blocked')
         logForbidden({
           resourceKind,
@@ -1268,6 +1911,30 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
         })
         const emptyPayload = { items: [], total: 0 }
         await opts.hooks?.afterList?.(emptyPayload, { ...ctx, query: validated as any })
+        const fallbackEmptyAfterInterceptors = await applyInterceptorsAfter({
+          ctx,
+          request,
+          method: 'GET',
+          requestPayload: interceptorRequest,
+          metadataByInterceptor: interceptorMetadata,
+          statusCode: 200,
+          body: emptyPayload as Record<string, unknown>,
+        })
+        if (!fallbackEmptyAfterInterceptors) {
+          finishProfile({
+            result: 'interceptor_after_empty',
+            cacheStatus,
+            itemCount: 0,
+            total: 0,
+            branch: 'fallback',
+          })
+          return json({ error: 'Internal interceptor error' }, { status: 500 })
+        }
+        if (!fallbackEmptyAfterInterceptors.ok) {
+          finishProfile({ result: 'interceptor_after_failed', cacheStatus, itemCount: 0, total: 0, branch: 'fallback' })
+          return json(fallbackEmptyAfterInterceptors.body, { status: fallbackEmptyAfterInterceptors.statusCode, headers: fallbackEmptyAfterInterceptors.headers })
+        }
+        Object.assign(emptyPayload, fallbackEmptyAfterInterceptors.body)
         await maybeStoreCrudCache(emptyPayload)
         logCacheOutcome(cacheStatus, emptyPayload.items.length)
         const response = respondWithPayload(emptyPayload)
@@ -1280,12 +1947,27 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
         })
         return response
       }
+      const fallbackBaseFilters = exportFullRequested
+        ? ({} as Where<any>)
+        : (opts.list.buildFilters ? await opts.list.buildFilters(validated as any, ctx) : ({} as Where<any>))
+      const fallbackFilters = exportFullRequested
+        ? fallbackBaseFilters
+        : mergeAdvancedFilters(fallbackBaseFilters as Record<string, unknown>, validated as Record<string, unknown>) as Where<any>
+      const mergedFallbackFilters = exportFullRequested
+        ? fallbackFilters
+        : mergeIdFilter(fallbackFilters, parsedIds, { idsParamProvided })
+      const ormFilters = translateFiltersForOrm(
+        mergedFallbackFilters as Record<string, any>,
+        em,
+        ormCfg.entity,
+      )
+      const omitListScope = !!opts.list?.omitAutomaticTenantOrgScope
       const where: any = buildScopedWhere(
-        {},
+        ormFilters as Record<string, any>,
         {
-          organizationId: ormCfg.orgField ? (ctx.selectedOrganizationId ?? ctx.auth.orgId ?? null) : undefined,
-          organizationIds: ormCfg.orgField ? ctx.organizationIds ?? undefined : undefined,
-          tenantId: ormCfg.tenantField ? ctx.auth.tenantId : undefined,
+          organizationId: !omitListScope && ormCfg.orgField ? (ctx.selectedOrganizationId ?? ctx.auth.orgId ?? null) : undefined,
+          organizationIds: !omitListScope && ormCfg.orgField ? ctx.organizationIds ?? undefined : undefined,
+          tenantId: !omitListScope && ormCfg.tenantField ? ctx.auth.tenantId : undefined,
           orgField: ormCfg.orgField,
           tenantField: ormCfg.tenantField,
           softDeleteField: ormCfg.softDeleteField,
@@ -1312,12 +1994,12 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
             }
           }
         } catch (err) {
-          console.warn('[CRUD] Translation overlay (fallback) failed:', err)
+          logger.warn('Translation overlay (fallback) failed', { err })
         }
         profiler.mark('fallback_translation_overlays_complete', { itemCount: Array.isArray(list) ? list.length : 0 })
       }
 
-      await logCrudAccess({
+      const accessLogResult = await logCrudAccess({
         container: ctx.container,
         auth: ctx.auth,
         request,
@@ -1328,7 +2010,7 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
         tenantId: ctx.auth.tenantId ?? null,
         query: validated,
       })
-      profiler.mark('access_logged')
+      profiler.mark('access_logged', accessLogResult)
       if (exportRequested && requestedExport) {
         const exportItems = exportFullRequested ? list.map(normalizeFullRecordForExport) : list
         const prepared = exportFullRequested
@@ -1357,8 +2039,29 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
       const payload = { items: list, total: list.length }
       await opts.hooks?.afterList?.(payload, { ...ctx, query: validated as any })
       profiler.mark('after_list_hook')
-      await enrichListPayload(payload, ctx, profiler)
-      await maybeStoreCrudCache(payload)
+      const fallbackAfterInterceptors = await applyInterceptorsAfter({
+        ctx,
+        request,
+        method: 'GET',
+        requestPayload: interceptorRequest,
+        metadataByInterceptor: interceptorMetadata,
+        statusCode: 200,
+        body: payload as Record<string, unknown>,
+      })
+      if (!fallbackAfterInterceptors) {
+        finishProfile({
+          result: 'interceptor_after_empty',
+          cacheStatus,
+          branch: 'fallback',
+        })
+        return json({ error: 'Internal interceptor error' }, { status: 500 })
+      }
+      if (!fallbackAfterInterceptors.ok) {
+        finishProfile({ result: 'interceptor_after_failed', cacheStatus, branch: 'fallback' })
+        return json(fallbackAfterInterceptors.body, { status: fallbackAfterInterceptors.statusCode, headers: fallbackAfterInterceptors.headers })
+      }
+      Object.assign(payload, fallbackAfterInterceptors.body)
+      await enrichAndStorePayload(payload)
       profiler.mark('cache_store_attempt', { cacheEnabled })
       logCacheOutcome(cacheStatus, payload.items.length)
       const response = respondWithPayload(payload)
@@ -1382,6 +2085,8 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
       if (!opts.create && !useCommand) return json({ error: 'Not implemented' }, { status: 501 })
       const ctx = await withCtx(request)
       if (!ctx.auth) return json({ error: 'Unauthorized' }, { status: 401 })
+      const createSelectionRejected = rejectInvalidOrgSelection(ctx, 'create')
+      if (createSelectionRejected) return createSelectionRejected
       if (ormCfg.orgField && ctx.organizationIds && ctx.organizationIds.length === 0) {
         logForbidden({
           resourceKind,
@@ -1394,13 +2099,47 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
         return json({ error: 'Forbidden' }, { status: 403 })
       }
       const body = await request.json().catch(() => ({}))
+      let interceptorRequestPayload: InterceptorRequest | null = null
+      let interceptorMetadata: Record<string, Record<string, unknown> | undefined> = {}
 
       if (useCommand) {
         const commandBus = (ctx.container.resolve('commandBus') as CommandBus)
         const action = opts.actions!.create!
         const parsed = action.schema ? action.schema.parse(body) : body
-        const input = action.mapInput ? await action.mapInput({ parsed, raw: body, ctx }) : parsed
-        const userMetadata = action.metadata ? await action.metadata({ input, parsed, raw: body, ctx }) : null
+        const beforeInterceptors = await applyInterceptorsBefore({
+          ctx,
+          request,
+          method: 'POST',
+          body: parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : undefined,
+        })
+        if (beforeInterceptors.errorResponse) return beforeInterceptors.errorResponse
+        interceptorRequestPayload = beforeInterceptors.requestPayload
+        interceptorMetadata = beforeInterceptors.metadataByInterceptor
+        const interceptedBody = interceptorRequestPayload.body ?? {}
+        const reparsed = action.schema ? action.schema.parse(interceptedBody) : interceptedBody
+        let input = action.mapInput ? await action.mapInput({ parsed: reparsed, raw: interceptedBody, ctx }) : reparsed
+        const userMetadata = action.metadata ? await action.metadata({ input, parsed: reparsed, raw: interceptedBody, ctx }) : null
+
+        // Sync before-event (*.creating) — command path
+        const createLifecycleCmd = deriveLifecycleEventIds(opts.events as CrudEventsConfig | undefined, 'created')
+        if (createLifecycleCmd.beforeEventId && ctx.auth.tenantId) {
+          const syncSubs = collectSyncSubscribers(getAllSyncSubscribers(), createLifecycleCmd.beforeEventId)
+          if (syncSubs.length) {
+            const em = ctx.container.resolve('em') as EntityManager
+            const syncPayload = buildSyncPayload(
+              { eventId: createLifecycleCmd.beforeEventId, entity: createLifecycleCmd.entity!, operation: 'create', timing: 'before', resourceId: null, userId: ctx.auth.sub, organizationId: ctx.selectedOrganizationId ?? ctx.auth.orgId ?? null, tenantId: ctx.auth.tenantId!, em, request },
+              { payload: input && typeof input === 'object' ? (input as Record<string, unknown>) : undefined },
+            )
+            const syncResult = await runSyncBeforeEvent(syncSubs, syncPayload, ctx.container)
+            if (!syncResult.ok) {
+              return json(syncResult.errorBody ?? { error: 'Operation blocked' }, { status: syncResult.errorStatus ?? 422 })
+            }
+            if (syncResult.modifiedPayload && typeof input === 'object' && input) {
+              input = { ...input as Record<string, unknown>, ...syncResult.modifiedPayload }
+            }
+          }
+        }
+
         const baseMetadata: CommandLogMetadata = {
           tenantId: ctx.auth?.tenantId ?? null,
           organizationId: ctx.selectedOrganizationId ?? ctx.auth.orgId ?? null,
@@ -1409,8 +2148,37 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
         }
         const metadataToSend = mergeCommandMetadata(baseMetadata, userMetadata)
         const { result, logEntry } = await commandBus.execute(action.commandId, { input, ctx, metadata: metadataToSend })
+
+        // Sync after-event (*.created) — command path
+        if (createLifecycleCmd.afterEventId && ctx.auth.tenantId) {
+          const syncAfterSubs = collectSyncSubscribers(getAllSyncSubscribers(), createLifecycleCmd.afterEventId)
+          if (syncAfterSubs.length) {
+            const em = ctx.container.resolve('em') as EntityManager
+            const syncPayload = buildSyncPayload(
+              { eventId: createLifecycleCmd.afterEventId, entity: createLifecycleCmd.entity!, operation: 'create', timing: 'after', resourceId: (result as Record<string, unknown>)?.id as string ?? null, userId: ctx.auth.sub, organizationId: ctx.selectedOrganizationId ?? ctx.auth.orgId ?? null, tenantId: ctx.auth.tenantId!, em, request },
+              { payload: input && typeof input === 'object' ? (input as Record<string, unknown>) : undefined },
+            )
+            await runSyncAfterEvent(syncAfterSubs, syncPayload, ctx.container)
+          }
+        }
+
         const payload = action.response ? action.response({ result, logEntry, ctx }) : result
-        const resolvedPayload = await Promise.resolve(payload)
+        let resolvedPayload = await Promise.resolve(payload)
+        if (interceptorRequestPayload && resolvedPayload && typeof resolvedPayload === 'object' && !Array.isArray(resolvedPayload)) {
+          const afterInterceptors = await applyInterceptorsAfter({
+            ctx,
+            request,
+            method: 'POST',
+            requestPayload: interceptorRequestPayload,
+            metadataByInterceptor: interceptorMetadata,
+            statusCode: action.status ?? 201,
+            body: resolvedPayload as Record<string, unknown>,
+          })
+          if (afterInterceptors && !afterInterceptors.ok) {
+            return json(afterInterceptors.body, { status: afterInterceptors.statusCode, headers: afterInterceptors.headers })
+          }
+          if (afterInterceptors?.ok) resolvedPayload = afterInterceptors.body
+        }
         const status = action.status ?? 201
         const response = json(resolvedPayload, { status })
         attachOperationHeader(response, logEntry)
@@ -1424,8 +2192,68 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
       if (!createConfig) throw new Error('Create configuration missing')
 
       let input = createConfig.schema.parse(body)
+      const beforeInterceptors = await applyInterceptorsBefore({
+        ctx,
+        request,
+        method: 'POST',
+        body: input && typeof input === 'object' ? (input as Record<string, unknown>) : undefined,
+      })
+      if (beforeInterceptors.errorResponse) return beforeInterceptors.errorResponse
+      interceptorRequestPayload = beforeInterceptors.requestPayload
+      interceptorMetadata = beforeInterceptors.metadataByInterceptor
+      if (interceptorRequestPayload.body) {
+        input = createConfig.schema.parse(interceptorRequestPayload.body)
+      }
+
+      // Sync before-event (*.creating)
+      const createLifecycle = deriveLifecycleEventIds(opts.events as CrudEventsConfig | undefined, 'created')
+      const scopeOrganizationId = ctx.selectedOrganizationId ?? ctx.auth.orgId ?? null
+      if (createLifecycle.beforeEventId && ctx.auth.tenantId) {
+        const syncSubs = collectSyncSubscribers(getAllSyncSubscribers(), createLifecycle.beforeEventId)
+        if (syncSubs.length) {
+          const em = ctx.container.resolve('em') as EntityManager
+          const syncPayload = buildSyncPayload(
+            { eventId: createLifecycle.beforeEventId, entity: createLifecycle.entity!, operation: 'create', timing: 'before', resourceId: null, userId: ctx.auth.sub, organizationId: scopeOrganizationId, tenantId: ctx.auth.tenantId!, em, request },
+            { payload: input && typeof input === 'object' ? (input as Record<string, unknown>) : undefined },
+          )
+          const syncResult = await runSyncBeforeEvent(syncSubs, syncPayload, ctx.container)
+          if (!syncResult.ok) {
+            return json(syncResult.errorBody ?? { error: 'Operation blocked' }, { status: syncResult.errorStatus ?? 422 })
+          }
+          if (syncResult.modifiedPayload && typeof input === 'object' && input) {
+            input = createConfig.schema.parse({ ...input as Record<string, unknown>, ...syncResult.modifiedPayload })
+          }
+        }
+      }
+
       const modified = await opts.hooks?.beforeCreate?.(input as any, ctx)
       if (modified) input = modified
+
+      // Mutation guard registry (guards now run on create)
+      const userFeatures = await resolveUserFeatures(ctx)
+      const { allGuards } = collectAndRunGuards(ctx.container)
+      let createGuardAfterCallbacks: Array<{ guard: MutationGuard; metadata: Record<string, unknown> | null }> = []
+      if (allGuards.length && ctx.auth.tenantId) {
+        const guardResult = await runMutationGuards(allGuards, {
+          tenantId: ctx.auth.tenantId,
+          organizationId: scopeOrganizationId,
+          userId: ctx.auth.sub,
+          resourceKind,
+          resourceId: null,
+          operation: 'create',
+          requestMethod: request.method,
+          requestHeaders: request.headers,
+          mutationPayload: input && typeof input === 'object' ? (input as Record<string, unknown>) : null,
+        }, { userFeatures: userFeatures ?? [] })
+        if (!guardResult.ok) {
+          return json(guardResult.errorBody ?? { error: 'Operation blocked by guard' }, { status: guardResult.errorStatus ?? 422 })
+        }
+        if (guardResult.modifiedPayload && typeof input === 'object' && input) {
+          input = createConfig.schema.parse({ ...input as Record<string, unknown>, ...guardResult.modifiedPayload })
+        }
+        createGuardAfterCallbacks = guardResult.afterSuccessCallbacks
+      }
+
       const de = (ctx.container.resolve('dataEngine') as DataEngine)
       const entityData = createConfig.mapToEntity(input as any, ctx)
       // Inject org/tenant
@@ -1438,27 +2266,56 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
         if (!ctx.auth.tenantId) return json({ error: 'Tenant context is required' }, { status: 400 })
         entityData[ormCfg.tenantField] = ctx.auth.tenantId
       }
-      const entity = await de.createOrmEntity({ entity: ormCfg.entity, data: entityData })
+      const em = (ctx.container.resolve('em') as EntityManager)
+      const writeTenantId = ctx.auth.tenantId!
+      const entity = await em.transactional(async () => {
+        const created = await de.createOrmEntity({ entity: ormCfg.entity, data: entityData })
 
-      // Custom fields
-      if (createConfig.customFields && (createConfig.customFields as any).enabled) {
-        const cfc = createConfig.customFields as Exclude<CustomFieldsConfig, false>
-        const values = cfc.map
-          ? cfc.map(body)
-          : (cfc.pickPrefixed ? extractCustomFieldValuesFromPayload(body as Record<string, unknown>) : {})
-        if (values && Object.keys(values).length > 0) {
-          const de = (ctx.container.resolve('dataEngine') as DataEngine)
-          await de.setCustomFields({
-            entityId: cfc.entityId as any,
-            recordId: String((entity as any)[ormCfg.idField!]),
-            organizationId: targetOrgId,
-            tenantId: ctx.auth.tenantId!,
-            values,
-          })
+        // Custom fields
+        if (createConfig.customFields && (createConfig.customFields as any).enabled) {
+          const cfc = createConfig.customFields as Exclude<CustomFieldsConfig, false>
+          const values = cfc.map
+            ? cfc.map(body)
+            : (cfc.pickPrefixed ? extractCustomFieldValuesFromPayload(body as Record<string, unknown>) : {})
+          if (values && Object.keys(values).length > 0) {
+            const de = (ctx.container.resolve('dataEngine') as DataEngine)
+            await de.setCustomFields({
+              entityId: cfc.entityId as any,
+              recordId: String((created as any)[ormCfg.idField!]),
+              organizationId: targetOrgId,
+              tenantId: writeTenantId,
+              values,
+            })
+          }
         }
-      }
+
+        return created
+      })
 
       await opts.hooks?.afterCreate?.(entity, { ...ctx, input: input as any })
+
+      // Guard afterSuccess callbacks
+      const createdEntityId = String((entity as any)[ormCfg.idField!])
+      if (createGuardAfterCallbacks?.length && ctx.auth.tenantId) {
+        await runGuardAfterSuccessCallbacks(createGuardAfterCallbacks, {
+          tenantId: ctx.auth.tenantId, organizationId: scopeOrganizationId, userId: ctx.auth.sub,
+          resourceKind, resourceId: createdEntityId, operation: 'create',
+          requestMethod: request.method, requestHeaders: request.headers,
+        })
+      }
+
+      // Sync after-event (*.created)
+      if (createLifecycle.afterEventId && ctx.auth.tenantId) {
+        const syncAfterSubs = collectSyncSubscribers(getAllSyncSubscribers(), createLifecycle.afterEventId)
+        if (syncAfterSubs.length) {
+          const em = ctx.container.resolve('em') as EntityManager
+          const syncPayload = buildSyncPayload(
+            { eventId: createLifecycle.afterEventId, entity: createLifecycle.entity!, operation: 'create', timing: 'after', resourceId: createdEntityId, userId: ctx.auth.sub, organizationId: scopeOrganizationId, tenantId: ctx.auth.tenantId!, em, request },
+            { payload: input && typeof input === 'object' ? (input as Record<string, unknown>) : undefined, entityData: snapshotEntity(entity) },
+          )
+          await runSyncAfterEvent(syncAfterSubs, syncPayload, ctx.container)
+        }
+      }
 
       const identifiers = identifierResolver(entity, 'created')
       de.markOrmEntityChange({
@@ -1471,7 +2328,22 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
       await de.flushOrmEntityChanges()
       await invalidateCrudCache(ctx.container, resourceKind, identifiers, ctx.auth.tenantId ?? null, 'created', resourceTargets)
 
-      let payload = createConfig.response ? createConfig.response(entity) : { id: String((entity as any)[ormCfg.idField!]) }
+      let payload = createConfig.response ? createConfig.response(entity) : { id: createdEntityId }
+      if (interceptorRequestPayload && payload && typeof payload === 'object' && !Array.isArray(payload)) {
+        const afterInterceptors = await applyInterceptorsAfter({
+          ctx,
+          request,
+          method: 'POST',
+          requestPayload: interceptorRequestPayload,
+          metadataByInterceptor: interceptorMetadata,
+          statusCode: 201,
+          body: payload as Record<string, unknown>,
+        })
+        if (afterInterceptors && !afterInterceptors.ok) {
+          return json(afterInterceptors.body, { status: afterInterceptors.statusCode, headers: afterInterceptors.headers })
+        }
+        if (afterInterceptors?.ok) payload = afterInterceptors.body
+      }
       payload = await enrichSingleRecord(payload, ctx)
       return json(payload, { status: 201 })
     } catch (e) {
@@ -1485,6 +2357,8 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
       if (!opts.update && !useCommand) return json({ error: 'Not implemented' }, { status: 501 })
       const ctx = await withCtx(request)
       if (!ctx.auth) return json({ error: 'Unauthorized' }, { status: 401 })
+      const updateSelectionRejected = rejectInvalidOrgSelection(ctx, 'update')
+      if (updateSelectionRejected) return updateSelectionRejected
       if (ormCfg.orgField && ctx.organizationIds && ctx.organizationIds.length === 0) {
         logForbidden({
           resourceKind,
@@ -1498,17 +2372,58 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
       }
       const body = await request.json().catch(() => ({}))
       const scopeOrganizationId = ctx.selectedOrganizationId ?? ctx.auth.orgId ?? null
+      let interceptorRequestPayload: InterceptorRequest | null = null
+      let interceptorMetadata: Record<string, Record<string, unknown> | undefined> = {}
 
       if (useCommand) {
         const commandBus = (ctx.container.resolve('commandBus') as CommandBus)
         const action = opts.actions!.update!
         const parsed = action.schema ? action.schema.parse(body) : body
-        const input = action.mapInput ? await action.mapInput({ parsed, raw: body, ctx }) : parsed
-        const userMetadata = action.metadata ? await action.metadata({ input, parsed, raw: body, ctx }) : null
+        const beforeInterceptors = await applyInterceptorsBefore({
+          ctx,
+          request,
+          method: 'PUT',
+          body: parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : undefined,
+        })
+        if (beforeInterceptors.errorResponse) return beforeInterceptors.errorResponse
+        interceptorRequestPayload = beforeInterceptors.requestPayload
+        interceptorMetadata = beforeInterceptors.metadataByInterceptor
+        const interceptedBody = interceptorRequestPayload.body ?? {}
+        const reparsed = action.schema ? action.schema.parse(interceptedBody) : interceptedBody
+        let input = action.mapInput ? await action.mapInput({ parsed: reparsed, raw: interceptedBody, ctx }) : reparsed
+        const userMetadata = action.metadata ? await action.metadata({ input, parsed: reparsed, raw: interceptedBody, ctx }) : null
         const candidateId = normalizeIdentifierValue((input as Record<string, unknown> | null | undefined)?.id)
-        let mutationGuardValidation: CrudMutationGuardValidationResult | null = null
-        if (ctx.auth.tenantId && candidateId) {
-          mutationGuardValidation = await validateCrudMutationGuard(ctx.container, {
+
+        // Sync before-event (*.updating) — command path
+        const updateLifecycleCmd = deriveLifecycleEventIds(opts.events as CrudEventsConfig | undefined, 'updated')
+        let cmdUpdatePreviousData: Record<string, unknown> | undefined
+        if (updateLifecycleCmd.beforeEventId && ctx.auth.tenantId) {
+          const syncSubs = collectSyncSubscribers(getAllSyncSubscribers(), updateLifecycleCmd.beforeEventId)
+          if (syncSubs.length) {
+            const em = ctx.container.resolve('em') as EntityManager
+            if (candidateId) {
+              const prevEntity = await em.findOne(ormCfg.entity as any, { [ormCfg.idField!]: candidateId } as any)
+              if (prevEntity) cmdUpdatePreviousData = snapshotEntity(prevEntity)
+            }
+            const syncPayload = buildSyncPayload(
+              { eventId: updateLifecycleCmd.beforeEventId, entity: updateLifecycleCmd.entity!, operation: 'update', timing: 'before', resourceId: candidateId ?? null, userId: ctx.auth.sub, organizationId: scopeOrganizationId, tenantId: ctx.auth.tenantId!, em, request },
+              { payload: input && typeof input === 'object' ? (input as Record<string, unknown>) : undefined, previousData: cmdUpdatePreviousData },
+            )
+            const syncResult = await runSyncBeforeEvent(syncSubs, syncPayload, ctx.container)
+            if (!syncResult.ok) {
+              return json(syncResult.errorBody ?? { error: 'Operation blocked' }, { status: syncResult.errorStatus ?? 422 })
+            }
+            if (syncResult.modifiedPayload && typeof input === 'object' && input) {
+              input = { ...input as Record<string, unknown>, ...syncResult.modifiedPayload }
+            }
+          }
+        }
+
+        const updateUserFeatures = await resolveUserFeatures(ctx)
+        const { allGuards: updateAllGuards } = collectAndRunGuards(ctx.container)
+        let cmdUpdateGuardAfterCallbacks: Array<{ guard: MutationGuard; metadata: Record<string, unknown> | null }> = []
+        if (updateAllGuards.length && ctx.auth.tenantId && candidateId) {
+          const guardResult = await runMutationGuards(updateAllGuards, {
             tenantId: ctx.auth.tenantId,
             organizationId: scopeOrganizationId,
             userId: ctx.auth.sub,
@@ -1520,11 +2435,14 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
             mutationPayload: input && typeof input === 'object'
               ? (input as Record<string, unknown>)
               : null,
-          })
-          if (mutationGuardValidation) {
-            const response = buildMutationGuardErrorResponse(mutationGuardValidation)
-            if (response) return response
+          }, { userFeatures: updateUserFeatures ?? [] })
+          if (!guardResult.ok) {
+            return json(guardResult.errorBody ?? { error: 'Operation blocked by guard' }, { status: guardResult.errorStatus ?? 422 })
           }
+          if (guardResult.modifiedPayload && typeof input === 'object' && input) {
+            input = { ...input as Record<string, unknown>, ...guardResult.modifiedPayload }
+          }
+          cmdUpdateGuardAfterCallbacks = guardResult.afterSuccessCallbacks
         }
         const baseMetadata: CommandLogMetadata = {
           tenantId: ctx.auth?.tenantId ?? null,
@@ -1536,17 +2454,27 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
         const metadataToSend = mergeCommandMetadata(baseMetadata, userMetadata)
         const { result, logEntry } = await commandBus.execute(action.commandId, { input, ctx, metadata: metadataToSend })
         const payload = action.response ? action.response({ result, logEntry, ctx }) : result
-        const resolvedPayload = await Promise.resolve(payload)
+        let resolvedPayload = await Promise.resolve(payload)
+        if (interceptorRequestPayload && resolvedPayload && typeof resolvedPayload === 'object' && !Array.isArray(resolvedPayload)) {
+          const afterInterceptors = await applyInterceptorsAfter({
+            ctx,
+            request,
+            method: 'PUT',
+            requestPayload: interceptorRequestPayload,
+            metadataByInterceptor: interceptorMetadata,
+            statusCode: action.status ?? 200,
+            body: resolvedPayload as Record<string, unknown>,
+          })
+          if (afterInterceptors && !afterInterceptors.ok) {
+            return json(afterInterceptors.body, { status: afterInterceptors.statusCode, headers: afterInterceptors.headers })
+          }
+          if (afterInterceptors?.ok) resolvedPayload = afterInterceptors.body
+        }
         const status = action.status ?? 200
         const response = json(resolvedPayload, { status })
         attachOperationHeader(response, logEntry)
-        if (
-          mutationGuardValidation?.ok
-          && mutationGuardValidation.shouldRunAfterSuccess
-          && ctx.auth.tenantId
-          && candidateId
-        ) {
-          await runCrudMutationGuardAfterSuccess(ctx.container, {
+        if (cmdUpdateGuardAfterCallbacks.length && ctx.auth.tenantId && candidateId) {
+          await runGuardAfterSuccessCallbacks(cmdUpdateGuardAfterCallbacks, {
             tenantId: ctx.auth.tenantId,
             organizationId: scopeOrganizationId,
             userId: ctx.auth.sub,
@@ -1555,9 +2483,22 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
             operation: 'update',
             requestMethod: request.method,
             requestHeaders: request.headers,
-            metadata: mutationGuardValidation.metadata ?? null,
           })
         }
+
+        // Sync after-event (*.updated) — command path
+        if (updateLifecycleCmd.afterEventId && ctx.auth.tenantId) {
+          const syncAfterSubs = collectSyncSubscribers(getAllSyncSubscribers(), updateLifecycleCmd.afterEventId)
+          if (syncAfterSubs.length) {
+            const em = ctx.container.resolve('em') as EntityManager
+            const syncPayload = buildSyncPayload(
+              { eventId: updateLifecycleCmd.afterEventId, entity: updateLifecycleCmd.entity!, operation: 'update', timing: 'after', resourceId: candidateId ?? null, userId: ctx.auth.sub, organizationId: scopeOrganizationId, tenantId: ctx.auth.tenantId!, em, request },
+              { payload: input && typeof input === 'object' ? (input as Record<string, unknown>) : undefined, previousData: cmdUpdatePreviousData },
+            )
+            await runSyncAfterEvent(syncAfterSubs, syncPayload, ctx.container)
+          }
+        }
+
         // Note: side effects (events + indexing) are already flushed by CommandBus.execute()
         // via flushCrudSideEffects(). Calling markCommandResultForIndexing here would cause
         // duplicate event emissions.
@@ -1568,30 +2509,74 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
       if (!updateConfig) throw new Error('Update configuration missing')
 
       let input = updateConfig.schema.parse(body)
+      const beforeInterceptors = await applyInterceptorsBefore({
+        ctx,
+        request,
+        method: 'PUT',
+        body: input && typeof input === 'object' ? (input as Record<string, unknown>) : undefined,
+      })
+      if (beforeInterceptors.errorResponse) return beforeInterceptors.errorResponse
+      interceptorRequestPayload = beforeInterceptors.requestPayload
+      interceptorMetadata = beforeInterceptors.metadataByInterceptor
+      if (interceptorRequestPayload.body) {
+        input = updateConfig.schema.parse(interceptorRequestPayload.body)
+      }
+
+      // Sync before-event (*.updating)
+      const updateLifecycle = deriveLifecycleEventIds(opts.events as CrudEventsConfig | undefined, 'updated')
+      let updatePreviousData: Record<string, unknown> | undefined
+      if (updateLifecycle.beforeEventId && ctx.auth.tenantId) {
+        const syncSubs = collectSyncSubscribers(getAllSyncSubscribers(), updateLifecycle.beforeEventId)
+        if (syncSubs.length) {
+          const em = ctx.container.resolve('em') as EntityManager
+          const updateCandidateId = (input as Record<string, unknown>)?.id as string ?? null
+          if (updateCandidateId) {
+            const prevEntity = await em.findOne(ormCfg.entity as any, { [ormCfg.idField!]: updateCandidateId } as any)
+            if (prevEntity) updatePreviousData = snapshotEntity(prevEntity)
+          }
+          const syncPayload = buildSyncPayload(
+            { eventId: updateLifecycle.beforeEventId, entity: updateLifecycle.entity!, operation: 'update', timing: 'before', resourceId: updateCandidateId, userId: ctx.auth.sub, organizationId: scopeOrganizationId, tenantId: ctx.auth.tenantId!, em, request },
+            { payload: input && typeof input === 'object' ? (input as Record<string, unknown>) : undefined, previousData: updatePreviousData },
+          )
+          const syncResult = await runSyncBeforeEvent(syncSubs, syncPayload, ctx.container)
+          if (!syncResult.ok) {
+            return json(syncResult.errorBody ?? { error: 'Operation blocked' }, { status: syncResult.errorStatus ?? 422 })
+          }
+          if (syncResult.modifiedPayload && typeof input === 'object' && input) {
+            input = updateConfig.schema.parse({ ...input as Record<string, unknown>, ...syncResult.modifiedPayload })
+          }
+        }
+      }
+
       const modified = await opts.hooks?.beforeUpdate?.(input as any, ctx)
       if (modified) input = modified
 
       const id = updateConfig.getId ? updateConfig.getId(input as any) : (input as any).id
       if (!isUuid(id)) return json({ error: 'Invalid id' }, { status: 400 })
 
-      const mutationGuardValidation = ctx.auth.tenantId
-        ? await validateCrudMutationGuard(ctx.container, {
-            tenantId: ctx.auth.tenantId,
-            organizationId: scopeOrganizationId,
-            userId: ctx.auth.sub,
-            resourceKind,
-            resourceId: id,
-            operation: 'update',
-            requestMethod: request.method,
-            requestHeaders: request.headers,
-            mutationPayload: input && typeof input === 'object'
-              ? (input as Record<string, unknown>)
-              : null,
-          })
-        : null
-      if (mutationGuardValidation) {
-        const response = buildMutationGuardErrorResponse(mutationGuardValidation)
-        if (response) return response
+      // Mutation guard registry (multi-guard)
+      const updateUserFeatures = await resolveUserFeatures(ctx)
+      const { allGuards: updateAllGuards } = collectAndRunGuards(ctx.container)
+      let updateGuardAfterCallbacks: Array<{ guard: MutationGuard; metadata: Record<string, unknown> | null }> = []
+      if (updateAllGuards.length && ctx.auth.tenantId) {
+        const guardResult = await runMutationGuards(updateAllGuards, {
+          tenantId: ctx.auth.tenantId,
+          organizationId: scopeOrganizationId,
+          userId: ctx.auth.sub,
+          resourceKind,
+          resourceId: id,
+          operation: 'update',
+          requestMethod: request.method,
+          requestHeaders: request.headers,
+          mutationPayload: input && typeof input === 'object' ? (input as Record<string, unknown>) : null,
+        }, { userFeatures: updateUserFeatures ?? [] })
+        if (!guardResult.ok) {
+          return json(guardResult.errorBody ?? { error: 'Operation blocked by guard' }, { status: guardResult.errorStatus ?? 422 })
+        }
+        if (guardResult.modifiedPayload && typeof input === 'object' && input) {
+          input = updateConfig.schema.parse({ ...input as Record<string, unknown>, ...guardResult.modifiedPayload })
+        }
+        updateGuardAfterCallbacks = guardResult.afterSuccessCallbacks
       }
 
       const targetOrgId = ctx.selectedOrganizationId ?? ctx.auth.orgId ?? null
@@ -1609,32 +2594,62 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
           softDeleteField: ormCfg.softDeleteField,
         }
       )
-      const entity = await de.updateOrmEntity({
-        entity: ormCfg.entity,
-        where,
-        apply: (e: any) => updateConfig.applyToEntity(e, input as any, ctx),
+      const em = (ctx.container.resolve('em') as EntityManager)
+      const writeTenantId = ctx.auth.tenantId!
+      const entity = await em.transactional(async () => {
+        const updated = await de.updateOrmEntity({
+          entity: ormCfg.entity,
+          where,
+          apply: (e: any) => updateConfig.applyToEntity(e, input as any, ctx),
+        })
+        if (!updated) return null
+
+        // Custom fields
+        if (updateConfig.customFields && (updateConfig.customFields as any).enabled) {
+          const cfc = updateConfig.customFields as Exclude<CustomFieldsConfig, false>
+          const values = cfc.map
+            ? cfc.map(body)
+            : (cfc.pickPrefixed ? extractCustomFieldValuesFromPayload(body as Record<string, unknown>) : {})
+          if (values && Object.keys(values).length > 0) {
+            const de = (ctx.container.resolve('dataEngine') as DataEngine)
+            await de.setCustomFields({
+              entityId: cfc.entityId as any,
+              recordId: String((updated as any)[ormCfg.idField!]),
+              organizationId: targetOrgId,
+              tenantId: writeTenantId,
+              values,
+            })
+          }
+        }
+
+        return updated
       })
       if (!entity) return json({ error: 'Not found' }, { status: 404 })
 
-      // Custom fields
-      if (updateConfig.customFields && (updateConfig.customFields as any).enabled) {
-        const cfc = updateConfig.customFields as Exclude<CustomFieldsConfig, false>
-        const values = cfc.map
-          ? cfc.map(body)
-          : (cfc.pickPrefixed ? extractCustomFieldValuesFromPayload(body as Record<string, unknown>) : {})
-        if (values && Object.keys(values).length > 0) {
-          const de = (ctx.container.resolve('dataEngine') as DataEngine)
-          await de.setCustomFields({
-            entityId: cfc.entityId as any,
-            recordId: String((entity as any)[ormCfg.idField!]),
-            organizationId: targetOrgId,
-            tenantId: ctx.auth.tenantId!,
-            values,
-          })
+      await opts.hooks?.afterUpdate?.(entity, { ...ctx, input: input as any })
+
+      // Guard afterSuccess callbacks (multi)
+      if (updateGuardAfterCallbacks.length && ctx.auth.tenantId) {
+        await runGuardAfterSuccessCallbacks(updateGuardAfterCallbacks, {
+          tenantId: ctx.auth.tenantId, organizationId: scopeOrganizationId, userId: ctx.auth.sub,
+          resourceKind, resourceId: id, operation: 'update',
+          requestMethod: request.method, requestHeaders: request.headers,
+        })
+      }
+
+      // Sync after-event (*.updated)
+      if (updateLifecycle.afterEventId && ctx.auth.tenantId) {
+        const syncAfterSubs = collectSyncSubscribers(getAllSyncSubscribers(), updateLifecycle.afterEventId)
+        if (syncAfterSubs.length) {
+          const em = ctx.container.resolve('em') as EntityManager
+          const syncPayload = buildSyncPayload(
+            { eventId: updateLifecycle.afterEventId, entity: updateLifecycle.entity!, operation: 'update', timing: 'after', resourceId: id, userId: ctx.auth.sub, organizationId: scopeOrganizationId, tenantId: ctx.auth.tenantId!, em, request },
+            { payload: input && typeof input === 'object' ? (input as Record<string, unknown>) : undefined, previousData: updatePreviousData, entityData: snapshotEntity(entity) },
+          )
+          await runSyncAfterEvent(syncAfterSubs, syncPayload, ctx.container)
         }
       }
 
-      await opts.hooks?.afterUpdate?.(entity, { ...ctx, input: input as any })
       const identifiers = identifierResolver(entity, 'updated')
       de.markOrmEntityChange({
         action: 'updated',
@@ -1645,24 +2660,24 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
       })
       await de.flushOrmEntityChanges()
       await invalidateCrudCache(ctx.container, resourceKind, identifiers, ctx.auth.tenantId ?? null, 'updated', resourceTargets)
-      if (
-        mutationGuardValidation?.ok
-        && mutationGuardValidation.shouldRunAfterSuccess
-        && ctx.auth.tenantId
-      ) {
-        await runCrudMutationGuardAfterSuccess(ctx.container, {
-          tenantId: ctx.auth.tenantId,
-          organizationId: scopeOrganizationId,
-            userId: ctx.auth.sub,
-            resourceKind,
-            resourceId: id,
-            operation: 'update',
-            requestMethod: request.method,
-            requestHeaders: request.headers,
-            metadata: mutationGuardValidation.metadata ?? null,
-          })
-      }
       const payload = updateConfig.response ? updateConfig.response(entity) : { success: true }
+      if (interceptorRequestPayload && payload && typeof payload === 'object' && !Array.isArray(payload)) {
+        const afterInterceptors = await applyInterceptorsAfter({
+          ctx,
+          request,
+          method: 'PUT',
+          requestPayload: interceptorRequestPayload,
+          metadataByInterceptor: interceptorMetadata,
+          statusCode: 200,
+          body: payload as Record<string, unknown>,
+        })
+        if (afterInterceptors && !afterInterceptors.ok) {
+          return json(afterInterceptors.body, { status: afterInterceptors.statusCode, headers: afterInterceptors.headers })
+        }
+        if (afterInterceptors?.ok) {
+          return json(afterInterceptors.body, { status: 200, headers: afterInterceptors.headers })
+        }
+      }
       return json(payload)
     } catch (e) {
       return handleError(e)
@@ -1673,6 +2688,8 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
     try {
       const ctx = await withCtx(request)
       if (!ctx.auth) return json({ error: 'Unauthorized' }, { status: 401 })
+      const deleteSelectionRejected = rejectInvalidOrgSelection(ctx, 'delete')
+      if (deleteSelectionRejected) return deleteSelectionRejected
       if (ormCfg.orgField && ctx.organizationIds && ctx.organizationIds.length === 0) {
         logForbidden({
           resourceKind,
@@ -1687,23 +2704,63 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
       const useCommand = !!opts.actions?.delete
       const url = new URL(request.url)
       const scopeOrganizationId = ctx.selectedOrganizationId ?? ctx.auth.orgId ?? null
+      let interceptorRequestPayload: InterceptorRequest | null = null
+      let interceptorMetadata: Record<string, Record<string, unknown> | undefined> = {}
 
       if (useCommand) {
         const action = opts.actions!.delete!
         const body = await request.json().catch(() => ({}))
         const raw = { body, query: Object.fromEntries(url.searchParams.entries()) }
         const parsed = action.schema ? action.schema.parse(raw) : raw
-        const input = action.mapInput ? await action.mapInput({ parsed, raw, ctx }) : parsed
-        const userMetadata = action.metadata ? await action.metadata({ input, parsed, raw, ctx }) : null
+        const interceptorInput =
+          parsed && typeof parsed === 'object' && (parsed as Record<string, unknown>).body && typeof (parsed as Record<string, unknown>).body === 'object'
+            ? ((parsed as Record<string, unknown>).body as Record<string, unknown>)
+            : body
+        const beforeInterceptors = await applyInterceptorsBefore({
+          ctx,
+          request,
+          method: 'DELETE',
+          body: interceptorInput,
+        })
+        if (beforeInterceptors.errorResponse) return beforeInterceptors.errorResponse
+        interceptorRequestPayload = beforeInterceptors.requestPayload
+        interceptorMetadata = beforeInterceptors.metadataByInterceptor
+        const interceptedBody = interceptorRequestPayload.body ?? {}
+        const reparsedRaw = {
+          body: interceptedBody,
+          query: Object.fromEntries(url.searchParams.entries()),
+        }
+        const reparsed = action.schema ? action.schema.parse(reparsedRaw) : reparsedRaw
+        const input = action.mapInput ? await action.mapInput({ parsed: reparsed, raw: reparsedRaw, ctx }) : reparsed
+        const userMetadata = action.metadata ? await action.metadata({ input, parsed: reparsed, raw: reparsedRaw, ctx }) : null
         const commandBus = (ctx.container.resolve('commandBus') as CommandBus)
         const candidateId = normalizeIdentifierValue(
           (input as Record<string, unknown> | null | undefined)?.id
             ?? (raw.query as Record<string, unknown> | null | undefined)?.id
             ?? (raw.body as Record<string, unknown> | null | undefined)?.id
         )
-        let mutationGuardValidation: CrudMutationGuardValidationResult | null = null
-        if (ctx.auth.tenantId && candidateId) {
-          mutationGuardValidation = await validateCrudMutationGuard(ctx.container, {
+
+        // Sync before-event (*.deleting) — command path
+        const deleteLifecycleCmd = deriveLifecycleEventIds(opts.events as CrudEventsConfig | undefined, 'deleted')
+        if (deleteLifecycleCmd.beforeEventId && ctx.auth.tenantId) {
+          const syncSubs = collectSyncSubscribers(getAllSyncSubscribers(), deleteLifecycleCmd.beforeEventId)
+          if (syncSubs.length) {
+            const em = ctx.container.resolve('em') as EntityManager
+            const syncPayload = buildSyncPayload(
+              { eventId: deleteLifecycleCmd.beforeEventId, entity: deleteLifecycleCmd.entity!, operation: 'delete', timing: 'before', resourceId: candidateId ?? null, userId: ctx.auth.sub, organizationId: scopeOrganizationId, tenantId: ctx.auth.tenantId!, em, request },
+            )
+            const syncResult = await runSyncBeforeEvent(syncSubs, syncPayload, ctx.container)
+            if (!syncResult.ok) {
+              return json(syncResult.errorBody ?? { error: 'Operation blocked' }, { status: syncResult.errorStatus ?? 422 })
+            }
+          }
+        }
+
+        const deleteUserFeatures = await resolveUserFeatures(ctx)
+        const { allGuards: deleteAllGuards } = collectAndRunGuards(ctx.container)
+        let cmdDeleteGuardAfterCallbacks: Array<{ guard: MutationGuard; metadata: Record<string, unknown> | null }> = []
+        if (deleteAllGuards.length && ctx.auth.tenantId && candidateId) {
+          const guardResult = await runMutationGuards(deleteAllGuards, {
             tenantId: ctx.auth.tenantId,
             organizationId: scopeOrganizationId,
             userId: ctx.auth.sub,
@@ -1712,11 +2769,11 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
             operation: 'delete',
             requestMethod: request.method,
             requestHeaders: request.headers,
-          })
-          if (mutationGuardValidation) {
-            const response = buildMutationGuardErrorResponse(mutationGuardValidation)
-            if (response) return response
+          }, { userFeatures: deleteUserFeatures ?? [] })
+          if (!guardResult.ok) {
+            return json(guardResult.errorBody ?? { error: 'Operation blocked by guard' }, { status: guardResult.errorStatus ?? 422 })
           }
+          cmdDeleteGuardAfterCallbacks = guardResult.afterSuccessCallbacks
         }
         const baseMetadata: CommandLogMetadata = {
           tenantId: ctx.auth?.tenantId ?? null,
@@ -1728,17 +2785,27 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
         const metadataToSend = mergeCommandMetadata(baseMetadata, userMetadata)
         const { result, logEntry } = await commandBus.execute(action.commandId, { input, ctx, metadata: metadataToSend })
         const payload = action.response ? action.response({ result, logEntry, ctx }) : result
-        const resolvedPayload = await Promise.resolve(payload)
+        let resolvedPayload = await Promise.resolve(payload)
+        if (interceptorRequestPayload && resolvedPayload && typeof resolvedPayload === 'object' && !Array.isArray(resolvedPayload)) {
+          const afterInterceptors = await applyInterceptorsAfter({
+            ctx,
+            request,
+            method: 'DELETE',
+            requestPayload: interceptorRequestPayload,
+            metadataByInterceptor: interceptorMetadata,
+            statusCode: action.status ?? 200,
+            body: resolvedPayload as Record<string, unknown>,
+          })
+          if (afterInterceptors && !afterInterceptors.ok) {
+            return json(afterInterceptors.body, { status: afterInterceptors.statusCode, headers: afterInterceptors.headers })
+          }
+          if (afterInterceptors?.ok) resolvedPayload = afterInterceptors.body
+        }
         const status = action.status ?? 200
         const response = json(resolvedPayload, { status })
         attachOperationHeader(response, logEntry)
-        if (
-          mutationGuardValidation?.ok
-          && mutationGuardValidation.shouldRunAfterSuccess
-          && ctx.auth.tenantId
-          && candidateId
-        ) {
-          await runCrudMutationGuardAfterSuccess(ctx.container, {
+        if (cmdDeleteGuardAfterCallbacks.length && ctx.auth.tenantId && candidateId) {
+          await runGuardAfterSuccessCallbacks(cmdDeleteGuardAfterCallbacks, {
             tenantId: ctx.auth.tenantId,
             organizationId: scopeOrganizationId,
             userId: ctx.auth.sub,
@@ -1747,9 +2814,21 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
             operation: 'delete',
             requestMethod: request.method,
             requestHeaders: request.headers,
-            metadata: mutationGuardValidation.metadata ?? null,
           })
         }
+
+        // Sync after-event (*.deleted) — command path
+        if (deleteLifecycleCmd.afterEventId && ctx.auth.tenantId) {
+          const syncAfterSubs = collectSyncSubscribers(getAllSyncSubscribers(), deleteLifecycleCmd.afterEventId)
+          if (syncAfterSubs.length) {
+            const em = ctx.container.resolve('em') as EntityManager
+            const syncPayload = buildSyncPayload(
+              { eventId: deleteLifecycleCmd.afterEventId, entity: deleteLifecycleCmd.entity!, operation: 'delete', timing: 'after', resourceId: candidateId ?? null, userId: ctx.auth.sub, organizationId: scopeOrganizationId, tenantId: ctx.auth.tenantId!, em, request },
+            )
+            await runSyncAfterEvent(syncAfterSubs, syncPayload, ctx.container)
+          }
+        }
+
         // Note: side effects (events + indexing) are already flushed by CommandBus.execute()
         // via flushCrudSideEffects(). Calling markCommandResultForIndexing here would cause
         // duplicate event emissions.
@@ -1761,22 +2840,54 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
         ? url.searchParams.get('id')
         : (await request.json().catch(() => ({}))).id
       if (!isUuid(id)) return json({ error: 'ID is required' }, { status: 400 })
+      const beforeInterceptors = await applyInterceptorsBefore({
+        ctx,
+        request,
+        method: 'DELETE',
+        body: idFrom === 'query' ? undefined : ({ id } as Record<string, unknown>),
+        query: idFrom === 'query' ? ({ id } as Record<string, unknown>) : undefined,
+      })
+      if (beforeInterceptors.errorResponse) return beforeInterceptors.errorResponse
+      interceptorRequestPayload = beforeInterceptors.requestPayload
+      interceptorMetadata = beforeInterceptors.metadataByInterceptor
 
-      const mutationGuardValidation = ctx.auth.tenantId
-        ? await validateCrudMutationGuard(ctx.container, {
-            tenantId: ctx.auth.tenantId,
-            organizationId: scopeOrganizationId,
-            userId: ctx.auth.sub,
-            resourceKind,
-            resourceId: id,
-            operation: 'delete',
-            requestMethod: request.method,
-            requestHeaders: request.headers,
-          })
-        : null
-      if (mutationGuardValidation) {
-        const response = buildMutationGuardErrorResponse(mutationGuardValidation)
-        if (response) return response
+      // Sync before-event (*.deleting)
+      const deleteLifecycle = deriveLifecycleEventIds(opts.events as CrudEventsConfig | undefined, 'deleted')
+      if (deleteLifecycle.beforeEventId && ctx.auth.tenantId) {
+        const syncSubs = collectSyncSubscribers(getAllSyncSubscribers(), deleteLifecycle.beforeEventId)
+        if (syncSubs.length) {
+          const em = ctx.container.resolve('em') as EntityManager
+          const syncPayload = buildSyncPayload(
+            { eventId: deleteLifecycle.beforeEventId, entity: deleteLifecycle.entity!, operation: 'delete', timing: 'before', resourceId: id, userId: ctx.auth.sub, organizationId: scopeOrganizationId, tenantId: ctx.auth.tenantId!, em, request },
+          )
+          const syncResult = await runSyncBeforeEvent(syncSubs, syncPayload, ctx.container)
+          if (!syncResult.ok) {
+            return json(syncResult.errorBody ?? { error: 'Operation blocked' }, { status: syncResult.errorStatus ?? 422 })
+          }
+        }
+      }
+
+      await opts.hooks?.beforeDelete?.(id!, ctx)
+
+      // Mutation guard registry (multi-guard)
+      const deleteUserFeatures = await resolveUserFeatures(ctx)
+      const { allGuards: deleteAllGuards } = collectAndRunGuards(ctx.container)
+      let deleteGuardAfterCallbacks: Array<{ guard: MutationGuard; metadata: Record<string, unknown> | null }> = []
+      if (deleteAllGuards.length && ctx.auth.tenantId) {
+        const guardResult = await runMutationGuards(deleteAllGuards, {
+          tenantId: ctx.auth.tenantId,
+          organizationId: scopeOrganizationId,
+          userId: ctx.auth.sub,
+          resourceKind,
+          resourceId: id,
+          operation: 'delete',
+          requestMethod: request.method,
+          requestHeaders: request.headers,
+        }, { userFeatures: deleteUserFeatures ?? [] })
+        if (!guardResult.ok) {
+          return json(guardResult.errorBody ?? { error: 'Operation blocked by guard' }, { status: guardResult.errorStatus ?? 422 })
+        }
+        deleteGuardAfterCallbacks = guardResult.afterSuccessCallbacks
       }
 
       const targetOrgId = ctx.selectedOrganizationId ?? ctx.auth.orgId ?? null
@@ -1794,7 +2905,6 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
           softDeleteField: ormCfg.softDeleteField,
         }
       )
-      await opts.hooks?.beforeDelete?.(id!, ctx)
       const entity = await de.deleteOrmEntity({
         entity: ormCfg.entity,
         where,
@@ -1803,6 +2913,29 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
       })
       if (!entity) return json({ error: 'Not found' }, { status: 404 })
       await opts.hooks?.afterDelete?.(id!, ctx)
+
+      // Guard afterSuccess callbacks (multi)
+      if (deleteGuardAfterCallbacks.length && ctx.auth.tenantId) {
+        await runGuardAfterSuccessCallbacks(deleteGuardAfterCallbacks, {
+          tenantId: ctx.auth.tenantId, organizationId: scopeOrganizationId, userId: ctx.auth.sub,
+          resourceKind, resourceId: id, operation: 'delete',
+          requestMethod: request.method, requestHeaders: request.headers,
+        })
+      }
+
+      // Sync after-event (*.deleted)
+      if (deleteLifecycle.afterEventId && ctx.auth.tenantId) {
+        const syncAfterSubs = collectSyncSubscribers(getAllSyncSubscribers(), deleteLifecycle.afterEventId)
+        if (syncAfterSubs.length) {
+          const em = ctx.container.resolve('em') as EntityManager
+          const syncPayload = buildSyncPayload(
+            { eventId: deleteLifecycle.afterEventId, entity: deleteLifecycle.entity!, operation: 'delete', timing: 'after', resourceId: id, userId: ctx.auth.sub, organizationId: scopeOrganizationId, tenantId: ctx.auth.tenantId!, em, request },
+            { entityData: snapshotEntity(entity) },
+          )
+          await runSyncAfterEvent(syncAfterSubs, syncPayload, ctx.container)
+        }
+      }
+
       if (entity) {
         const identifiers = identifierResolver(entity, 'deleted')
         de.markOrmEntityChange({
@@ -1815,24 +2948,24 @@ export function makeCrudRoute<TCreate = any, TUpdate = any, TList = any>(opts: C
         await de.flushOrmEntityChanges()
         await invalidateCrudCache(ctx.container, resourceKind, identifiers, ctx.auth.tenantId ?? null, 'deleted', resourceTargets)
       }
-      if (
-        mutationGuardValidation?.ok
-        && mutationGuardValidation.shouldRunAfterSuccess
-        && ctx.auth.tenantId
-      ) {
-        await runCrudMutationGuardAfterSuccess(ctx.container, {
-          tenantId: ctx.auth.tenantId,
-          organizationId: scopeOrganizationId,
-            userId: ctx.auth.sub,
-            resourceKind,
-            resourceId: id,
-            operation: 'delete',
-            requestMethod: request.method,
-            requestHeaders: request.headers,
-            metadata: mutationGuardValidation.metadata ?? null,
-          })
-      }
       const payload = opts.del?.response ? opts.del.response(id) : { success: true }
+      if (interceptorRequestPayload && payload && typeof payload === 'object' && !Array.isArray(payload)) {
+        const afterInterceptors = await applyInterceptorsAfter({
+          ctx,
+          request,
+          method: 'DELETE',
+          requestPayload: interceptorRequestPayload,
+          metadataByInterceptor: interceptorMetadata,
+          statusCode: 200,
+          body: payload as Record<string, unknown>,
+        })
+        if (afterInterceptors && !afterInterceptors.ok) {
+          return json(afterInterceptors.body, { status: afterInterceptors.statusCode, headers: afterInterceptors.headers })
+        }
+        if (afterInterceptors?.ok) {
+          return json(afterInterceptors.body, { status: 200, headers: afterInterceptors.headers })
+        }
+      }
       return json(payload)
     } catch (e) {
       return handleError(e)

@@ -5,21 +5,27 @@ import { getAuthFromRequest } from '@open-mercato/shared/lib/auth/server'
 import { resolveOrganizationScopeForRequest } from '@open-mercato/core/modules/directory/utils/organizationScope'
 import type { CommandRuntimeContext } from '@open-mercato/shared/lib/commands'
 import { resolveTranslations, detectLocale } from '@open-mercato/shared/lib/i18n/server'
-import { CrudHttpError } from '@open-mercato/shared/lib/crud/errors'
+import { CrudHttpError, isCrudHttpError, notFound } from '@open-mercato/shared/lib/crud/errors'
 import type { OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
 import {
-  runCrudMutationGuardAfterSuccess,
-  validateCrudMutationGuard,
-  type CrudMutationGuardValidationResult,
-} from '@open-mercato/shared/lib/crud/mutation-guard'
+  bridgeLegacyGuard,
+  runMutationGuards,
+  type MutationGuard,
+  type MutationGuardInput,
+} from '@open-mercato/shared/lib/crud/mutation-guard-registry'
 import type { EntityManager } from '@mikro-orm/postgresql'
 import crypto from 'node:crypto'
 import { withScopedPayload } from '../../utils'
+import { hashAuthToken } from '../../../../auth/lib/tokenHash'
+import { findOneWithDecryption } from '@open-mercato/shared/lib/encryption/find'
 import { SalesQuote } from '../../../data/entities'
 import { quoteSendSchema } from '../../../data/validators'
 import { sendEmail } from '@open-mercato/shared/lib/email/send'
 import { resolveStatusEntryIdByValue } from '../../../lib/statusHelpers'
 import { QuoteSentEmail } from '../../../emails/QuoteSentEmail'
+import { createLogger } from '@open-mercato/shared/lib/logger'
+
+const logger = createLogger('sales')
 
 export const metadata = {
   POST: { requireAuth: true, requireFeatures: ['sales.quotes.manage'] },
@@ -29,9 +35,51 @@ type RequestContext = {
   ctx: CommandRuntimeContext
 }
 
-function buildMutationGuardErrorResponse(validation: CrudMutationGuardValidationResult): NextResponse | null {
-  if (validation.ok) return null
-  return NextResponse.json(validation.body, { status: validation.status })
+function resolveUserFeatures(auth: unknown): string[] {
+  const features = (auth as { features?: unknown })?.features
+  if (!Array.isArray(features)) return []
+  return features.filter((value): value is string => typeof value === 'string')
+}
+
+async function runGuards(
+  ctx: CommandRuntimeContext,
+  input: MutationGuardInput,
+): Promise<{
+  ok: boolean
+  errorBody?: Record<string, unknown>
+  errorStatus?: number
+  afterSuccessCallbacks: Array<{ guard: MutationGuard; metadata: Record<string, unknown> | null }>
+}> {
+  const legacyGuard = bridgeLegacyGuard(ctx.container)
+  if (!legacyGuard) {
+    return { ok: true, afterSuccessCallbacks: [] }
+  }
+
+  return runMutationGuards([legacyGuard], input, {
+    userFeatures: resolveUserFeatures(ctx.auth),
+  })
+}
+
+async function runGuardAfterSuccessCallbacks(
+  callbacks: Array<{ guard: MutationGuard; metadata: Record<string, unknown> | null }>,
+  input: {
+    tenantId: string
+    organizationId: string | null
+    userId: string
+    resourceKind: string
+    resourceId: string
+    operation: 'create' | 'update' | 'delete'
+    requestMethod: string
+    requestHeaders: Headers
+  },
+): Promise<void> {
+  for (const callback of callbacks) {
+    if (!callback.guard.afterSuccess) continue
+    await callback.guard.afterSuccess({
+      ...input,
+      metadata: callback.metadata ?? null,
+    })
+  }
 }
 
 async function resolveRequestContext(req: Request): Promise<RequestContext> {
@@ -85,7 +133,7 @@ export async function POST(req: Request) {
     const payload = await req.json().catch(() => ({}))
     const scoped = withScopedPayload(payload ?? {}, ctx, translate)
     const input = quoteSendSchema.parse(scoped)
-    const mutationGuardValidation = await validateCrudMutationGuard(ctx.container, {
+    const guardResult = await runGuards(ctx, {
       tenantId: ctx.auth?.tenantId ?? '',
       organizationId: ctx.selectedOrganizationId ?? ctx.auth?.orgId ?? null,
       userId: ctx.auth?.sub ?? '',
@@ -95,15 +143,15 @@ export async function POST(req: Request) {
       requestMethod: req.method,
       requestHeaders: req.headers,
     })
-    if (mutationGuardValidation) {
-      const lockErrorResponse = buildMutationGuardErrorResponse(mutationGuardValidation)
-      if (lockErrorResponse) return lockErrorResponse
+    if (!guardResult.ok) {
+      return NextResponse.json(guardResult.errorBody ?? { error: 'Operation blocked by guard' }, { status: guardResult.errorStatus ?? 422 })
     }
 
     const em = (ctx.container.resolve('em') as EntityManager).fork()
-    const quote = await em.findOne(SalesQuote, { id: input.quoteId, deletedAt: null })
+    const tenantScope = ctx.auth?.tenantId ? { tenantId: ctx.auth.tenantId } : undefined
+    const quote = await findOneWithDecryption(em, SalesQuote, { id: input.quoteId, deletedAt: null }, {}, tenantScope)
     if (!quote) {
-      throw new CrudHttpError(404, { error: translate('sales.documents.detail.error', 'Document not found or inaccessible.') })
+      throw notFound(translate('sales.documents.detail.error', 'Document not found or inaccessible.'))
     }
     if (quote.tenantId !== ctx.auth?.tenantId || quote.organizationId !== ctx.selectedOrganizationId) {
       throw new CrudHttpError(403, { error: translate('sales.documents.errors.forbidden', 'Forbidden') })
@@ -122,21 +170,27 @@ export async function POST(req: Request) {
     const validUntil = new Date(now)
     validUntil.setUTCDate(validUntil.getUTCDate() + input.validForDays)
 
-    quote.validUntil = validUntil
-    quote.acceptanceToken = crypto.randomUUID()
-    quote.sentAt = now
-    quote.status = 'sent'
-    quote.statusEntryId = await resolveStatusEntryIdByValue(em, {
-      tenantId: quote.tenantId,
-      organizationId: quote.organizationId,
-      value: 'sent',
+    const rawAcceptanceToken = crypto.randomUUID()
+
+    // Persist the send state (status/token/sentAt) atomically and commit it
+    // BEFORE the email goes out, so a customer never receives a link whose
+    // acceptance token was not durably stored.
+    await em.transactional(async (tx) => {
+      quote.validUntil = validUntil
+      quote.acceptanceToken = hashAuthToken(rawAcceptanceToken)
+      quote.sentAt = now
+      quote.status = 'sent'
+      quote.statusEntryId = await resolveStatusEntryIdByValue(tx, {
+        tenantId: quote.tenantId,
+        organizationId: quote.organizationId,
+        value: 'sent',
+      })
+      quote.updatedAt = now
+      tx.persist(quote)
     })
-    quote.updatedAt = now
-    em.persist(quote)
-    await em.flush()
 
     const appUrl = process.env.APP_URL || ''
-    const url = appUrl ? `${appUrl.replace(/\/$/, '')}/quote/${quote.acceptanceToken}` : `/quote/${quote.acceptanceToken}`
+    const url = appUrl ? `${appUrl.replace(/\/$/, '')}/quote/${rawAcceptanceToken}` : `/quote/${rawAcceptanceToken}`
 
     const locale = await detectLocale()
     const validUntilFormatted = validUntil.toLocaleDateString(locale, {
@@ -157,14 +211,15 @@ export async function POST(req: Request) {
       footer: translate('sales.quotes.email.footer', 'Open Mercato'),
     }
 
+    // Side effect after commit: an email failure must not roll back the send state.
     await sendEmail({
       to: email,
       subject: translate('sales.quotes.email.subject', 'Quote {quoteNumber}', { quoteNumber: quote.quoteNumber }),
       react: QuoteSentEmail({ url, copy }),
     })
 
-    if (mutationGuardValidation?.ok && mutationGuardValidation.shouldRunAfterSuccess) {
-      await runCrudMutationGuardAfterSuccess(ctx.container, {
+    if (guardResult.afterSuccessCallbacks.length) {
+      await runGuardAfterSuccessCallbacks(guardResult.afterSuccessCallbacks, {
         tenantId: ctx.auth?.tenantId ?? '',
         organizationId: ctx.selectedOrganizationId ?? ctx.auth?.orgId ?? null,
         userId: ctx.auth?.sub ?? '',
@@ -173,17 +228,16 @@ export async function POST(req: Request) {
         operation: 'update',
         requestMethod: req.method,
         requestHeaders: req.headers,
-        metadata: mutationGuardValidation.metadata ?? null,
       })
     }
 
     return NextResponse.json({ ok: true })
   } catch (err) {
-    if (err instanceof CrudHttpError) {
+    if (isCrudHttpError(err)) {
       return NextResponse.json(err.body, { status: err.status })
     }
     const { translate } = await resolveTranslations()
-    console.error('sales.quotes.send failed', err)
+    logger.error('sales.quotes.send failed', { err })
     return NextResponse.json(
       { error: translate('sales.quotes.send.failed', 'Failed to send quote.') },
       { status: 400 }

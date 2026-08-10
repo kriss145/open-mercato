@@ -2,12 +2,15 @@
 
 import * as React from 'react'
 import { flash } from '@open-mercato/ui/backend/FlashMessages'
+import { surfaceRecordConflict } from '../conflicts'
 import { LoadingMessage } from '@open-mercato/ui/backend/detail'
 import { createTranslatorWithFallback } from '@open-mercato/shared/lib/i18n/translate'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
 import AddressTiles, { type AddressInput, type AddressValue } from './AddressTiles'
 import type { AddressTypesAdapter } from './AddressEditor'
 import type { AddressFormatStrategy } from './addressFormat'
+import { ComponentReplacementHandles } from '@open-mercato/shared/modules/widgets/component-registry'
+import { useRegisteredComponent } from '../injection/useRegisteredComponent'
 
 type Translator = (key: string, fallback?: string, params?: Record<string, string | number>) => string
 
@@ -37,14 +40,17 @@ export type AddressSummary = {
   region?: string | null
   postalCode?: string | null
   country?: string | null
+  latitude?: number | null
+  longitude?: number | null
   isPrimary?: boolean
+  updatedAt?: string | null
 }
 
 export type AddressDataAdapter<C = unknown> = {
   list: (params: { entityId: string | null; context?: C }) => Promise<AddressSummary[]>
   create: (params: { entityId: string; payload: AddressInput; context?: C }) => Promise<{ id?: string } | void>
-  update: (params: { id: string; payload: AddressInput; context?: C }) => Promise<void>
-  delete: (params: { id: string; context?: C }) => Promise<void>
+  update: (params: { id: string; payload: AddressInput; updatedAt?: string | null; context?: C }) => Promise<void>
+  delete: (params: { id: string; updatedAt?: string | null; context?: C }) => Promise<void>
 }
 
 export type AddressesSectionProps<C = unknown> = {
@@ -62,6 +68,7 @@ export type AddressesSectionProps<C = unknown> = {
   loadFormat?: (context?: C) => Promise<AddressFormatStrategy>
   formatContext?: C
   labelPrefix?: string
+  showCoordinateFields?: boolean
 }
 
 function generateTempId() {
@@ -69,7 +76,7 @@ function generateTempId() {
   return `tmp_${Math.random().toString(36).slice(2)}`
 }
 
-export function AddressesSection<C = unknown>({
+function AddressesSectionImpl<C = unknown>({
   entityId,
   emptyLabel,
   addActionLabel,
@@ -84,6 +91,7 @@ export function AddressesSection<C = unknown>({
   loadFormat,
   formatContext,
   labelPrefix = 'customers.people.detail.addresses',
+  showCoordinateFields = false,
 }: AddressesSectionProps<C>) {
   const tHook = useT()
   const fallbackTranslator = React.useMemo<Translator>(() => createTranslatorWithFallback(tHook), [tHook])
@@ -172,6 +180,8 @@ export function AddressesSection<C = unknown>({
           region: payload.region ?? null,
           postalCode: payload.postalCode ?? null,
           country: payload.country ? payload.country.toUpperCase() : null,
+          latitude: payload.latitude ?? null,
+          longitude: payload.longitude ?? null,
           isPrimary: payload.isPrimary ?? false,
         }
         setAddresses((prev) => {
@@ -203,7 +213,8 @@ export function AddressesSection<C = unknown>({
       pushLoading()
       setIsSubmitting(true)
       try {
-        await dataAdapter.update({ id, payload, context: dataContext })
+        const addressUpdatedAt = addresses.find((address) => address.id === id)?.updatedAt ?? null
+        await dataAdapter.update({ id, payload, updatedAt: addressUpdatedAt, context: dataContext })
         setAddresses((prev) => {
           return prev.map((address) => {
             if (address.id !== id) {
@@ -222,12 +233,15 @@ export function AddressesSection<C = unknown>({
               region: payload.region ?? null,
               postalCode: payload.postalCode ?? null,
               country: payload.country ? payload.country.toUpperCase() : null,
+              latitude: payload.latitude ?? null,
+              longitude: payload.longitude ?? null,
               isPrimary: payload.isPrimary ?? false,
             }
           })
         })
         flash(label('success', 'Address saved.'), 'success')
       } catch (err) {
+        surfaceRecordConflict(err, t)
         const message =
           err instanceof Error && err.message ? err.message : label('error', 'Failed to save address.')
         const error = new Error(message) as Error & { details?: unknown }
@@ -240,7 +254,7 @@ export function AddressesSection<C = unknown>({
         popLoading()
       }
     },
-    [dataAdapter, dataContext, label, normalizedEntityId, popLoading, pushLoading],
+    [addresses, dataAdapter, dataContext, label, normalizedEntityId, popLoading, pushLoading, t],
   )
 
   const handleDelete = React.useCallback(
@@ -251,20 +265,21 @@ export function AddressesSection<C = unknown>({
       pushLoading()
       setIsSubmitting(true)
       try {
-        await dataAdapter.delete({ id, context: dataContext })
+        const addressUpdatedAt = addresses.find((address) => address.id === id)?.updatedAt ?? null
+        await dataAdapter.delete({ id, updatedAt: addressUpdatedAt, context: dataContext })
         setAddresses((prev) => prev.filter((address) => address.id !== id))
         flash(label('deleted', 'Address deleted.'), 'success')
       } catch (err) {
         const message =
           err instanceof Error && err.message ? err.message : label('error', 'Failed to delete address.')
-        flash(message, 'error')
+        if (!surfaceRecordConflict(err, t)) flash(message, 'error')
         throw err
       } finally {
         setIsSubmitting(false)
         popLoading()
       }
     },
-    [dataAdapter, dataContext, label, normalizedEntityId, popLoading, pushLoading],
+    [addresses, dataAdapter, dataContext, label, normalizedEntityId, popLoading, pushLoading, t],
   )
 
   const displayAddresses = React.useMemo<AddressValue[]>(() => {
@@ -281,6 +296,8 @@ export function AddressesSection<C = unknown>({
       region: address.region ?? undefined,
       postalCode: address.postalCode ?? undefined,
       country: address.country ?? undefined,
+      latitude: address.latitude ?? undefined,
+      longitude: address.longitude ?? undefined,
       isPrimary: address.isPrimary ?? false,
     }))
   }, [addresses])
@@ -333,12 +350,27 @@ export function AddressesSection<C = unknown>({
           emptyStateTitle={emptyState.title}
           emptyStateActionLabel={emptyState.actionLabel}
           labelPrefix={labelPrefix}
+          showCoordinateFields={showCoordinateFields}
           addressTypesAdapter={addressTypesAdapter}
           addressTypesContext={addressTypesContext}
           loadFormat={loadFormat}
           formatContext={formatContext}
         />
       )}
+    </div>
+  )
+}
+
+export function AddressesSection<C = unknown>(props: AddressesSectionProps<C>) {
+  const handle = ComponentReplacementHandles.section('ui.detail', 'AddressesSection')
+  const Resolved = useRegisteredComponent<AddressesSectionProps<C>>(
+    handle,
+    AddressesSectionImpl as React.ComponentType<AddressesSectionProps<C>>,
+  )
+
+  return (
+    <div data-component-handle={handle}>
+      <Resolved {...props} />
     </div>
   )
 }

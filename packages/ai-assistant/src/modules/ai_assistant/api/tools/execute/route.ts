@@ -1,10 +1,22 @@
+import { createLogger } from '@open-mercato/shared/lib/logger'
 import { NextResponse, type NextRequest } from 'next/server'
+import type { OpenApiRouteDoc } from '@open-mercato/shared/lib/openapi'
 import { getAuthFromRequest } from '@open-mercato/shared/lib/auth/server'
 import { createRequestContainer } from '@open-mercato/shared/lib/di/container'
 import { executeTool } from '../../../lib/tool-executor'
 import { loadAllModuleTools } from '../../../lib/tool-loader'
 import type { RbacService } from '@open-mercato/core/modules/auth/services/rbacService'
 import type { McpToolContext } from '../../../lib/types'
+
+const logger = createLogger('ai_assistant')
+
+export const openApi: OpenApiRouteDoc = {
+  tag: 'AI Assistant',
+  summary: 'Execute AI tool',
+  methods: {
+    POST: { summary: 'Execute a specific MCP tool by name' },
+  },
+}
 
 export const metadata = {
   POST: { requireAuth: true, requireFeatures: ['ai_assistant.view'] },
@@ -62,7 +74,7 @@ export async function POST(req: NextRequest) {
       result: result.result,
     })
   } catch (error) {
-    console.error('[AI Tools] Error executing tool:', error)
+    logger.error('AI Tools — Error executing tool', { err: error })
     return NextResponse.json(
       { success: false, error: 'Tool execution failed' },
       { status: 500 }
